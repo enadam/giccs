@@ -1,0 +1,53 @@
+pytype, pyright (MS), pyre (FB)
+build python3-cryptography with BoringSSL for faster AES-GCM-SIV
+
+args -> self
+DirEnt.volatile -> obj?
+configparser -> tomllib?
+
+upload/download: split plan and execution
+consider using clone sources when uploading
+consistency check of remote backups
+CmdFTPGet, CmdFTPPut: DryRunOptions, WetRunOptions, AutodeleteOptions?
+
+discover_local_snapshots(): from btrfs subvolume show -> Snapshot(s)
+	but it doesn't know about restored snapshots
+deprecate index list/delete (in favor of ftp commands)
+	we could also simplify delete remote
+CmdFTPGet: --no-keep-mtime
+
+dynamic discovery
+get, put
+put: upload from stdin/command
+cat [-c <bytes>], page?
+mkdir, rmdir
+rm -r: delete empty folders
+mv [--dir/--fname] (rename/move blob, rename folder)
+tabbing?
+
+overwrite:
+  * skip
+  * error
+  * ask (yes/no/abort)
+  * force
+overwrite-mode (download):
+  * truncate
+  * atomic
+
+document max blob size (5 TiB)
+document required permissions
+  * storage.objects.create
+  * storage.objects.update (for patch(), to update metadata)
+  * storage.buckets.list (for list buckets)
+  * storage.objects.list
+  * storage.objects.get
+document the use of gpg-agent
+document dependency on python3-glob2
+
+protect against:
+  * swapping entire blobs: authenticated data includes the blob UUID
+  * swapping chunks between blobs: same + end-to-end hash
+  * reordering chunks: PRNG nonces + end-to-end hash
+  * blob truncation: expected number of bytes + end-to-end hash
+  * traffic analysis: padding, latency-shaping
+external encryption must generate and verify the MAC
