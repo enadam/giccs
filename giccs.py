@@ -26,6 +26,7 @@
 #	protected: encrypted hash of all other metadata
 #	encrypted: none
 #
+# Snapshot.fname -> .name
 # delete local/remote --flush (--delete-full-delta --force-all)
 # consistency check of remote backups
 #
@@ -441,63 +442,104 @@ class CmdLineOptions: # {{{
 			self.dir = '.'
 		self.sections["positional"].add_argument("dir", nargs='?')
 
-	# If none of the @options are in @args, find the one set in @self.ini
-	# and move it to @args.
+	# Merge options from @args and @self.ini, determine which ones take
+	# precedence, and report conflicts.
+	#
+	# If @options is:
+	#	"geez",
+	#	("alpha", "beta", "gamma"),
+	#	("foo", "bar", "baz"),
+	# keys in the same group don't conflict, but keys across groups can
+	# conflict if they are specified through the command line or are in
+	# the same section of the config file.
 	def merge_options_from_ini(
 			self, args: argparse.Namespace,
-			*options: Sequence[str], tpe: type = str) -> None:
-		if self.ini is None:
-			return
+			*options: Sequence[Union[str, tuple[str]]],
+			tpe: type = str) -> None:
+		def effective_group(groups: Collection[Sequence[str]]) \
+				-> Optional[Sequence[str]]:
+			if not groups:
+				return None
+			elif len(groups) == 1:
+				# Return groups[0].
+				return next(iter(groups))
+
+			groups = [ '/'.join(keys) for keys in groups ]
+			last = groups.pop()
+			raise self.CmdLineError(
+				"conflicting options %s and %s"
+				% (", ".join(groups), last))
+
+		groups = { } # key -> ("group", "of", "key")
+		values = { } # key -> "value-of-key" | None
 
 		# Were any of the @options specified through the command line?
-		for key in options:
-			if getattr(args, key, None) is not None:
-				# Don't even look at @self.ini.  It is assumed
-				# that only one option is set in @args.
-				return
+		cmdline = [ ] # groups of keys set on the command line
+		for group in options:
+			if not isinstance(group, tuple):
+				group = (group,)
 
-		# Collect options set in the @default and @non_default sections
-		# of @self.ini.
-		default = { }
-		non_default = { }
-		for key in options:
-			try:
-				val = self.ini.get(self.config_section, key)
-			except configparser.NoSectionError as ex:
-				raise self.CmdLineError(
-					"%s: %s"
-					% (self.ini.filenames[0],
-						ex.message)) from ex
-			except configparser.NoOptionError:
-				continue
+			current = None
+			for key in group:
+				val = getattr(args, key, None)
+				if val is not None:
+					if current is None:
+						current = [ ]
+						cmdline.append(current)
+					current.append(key)
 
-			# @lst to add @val.
-			lst = default if self.ini.is_default(val) \
-					else non_default
+				groups[key] = group
+				values[key] = val
+		effective = effective_group(cmdline)
 
-			# Get the right @val based on @tpe.
-			if tpe is bool:
-				val = self.ini.getboolean(
+		if self.ini is not None:
+			# Collect options set in the @default and @non_default
+			# sections of @self.ini.
+			default = { }
+			non_default = { }
+			for key, val in values.items():
+				if val is not None:
+					# Option set on the @cmdline,
+					# ignore the config.
+					continue
+
+				# Retrieve the string @val:ue of @key.
+				try:
+					val = self.ini.get(
 						self.config_section, key)
-			elif tpe is int:
-				val = self.ini.getint(
+				except configparser.NoSectionError as ex:
+					raise self.CmdLineError(
+						"%s: %s"
+						% (self.ini.filenames[0],
+							ex.message)) from ex
+				except configparser.NoOptionError:
+					continue
+
+				# Add @key to @default or @non_default.
+				tier = default if self.ini.is_default(val) \
+						else non_default
+				tier.setdefault(groups[key], [ ]).append(key)
+
+				# Get the right @val based on @tpe.
+				if tpe is bool:
+					val = self.ini.getboolean(
 						self.config_section, key)
+				elif tpe is int:
+					val = self.ini.getint(
+						self.config_section, key)
+				values[key] = val
 
-			lst[key] = val
+			if effective is None:
+				effective = effective_group(non_default.values())
+			if effective is None:
+				effective = effective_group(default.values())
 
-		# Verify that the @default or @non_default section doesn't
-		# have conflicting (more than one) options.  It's OK to have
-		# one in the @default section being overridden by another in
-		# the @non_default.
-		effective = non_default or default
-		if len(effective) > 1:
-			raise self.CmdLineError(
-				"%s: conflicting options in section %s: %s"
-				% (self.ini.filenames[0], self.config_section,
-					", ".join(effective.keys())))
-		elif len(effective) == 1:
-			((key, val),) = effective.items()
-			setattr(args, key, val)
+		# Propagate the @effective options from the config to @args.
+		if effective is not None:
+			for key in groups[effective[0]]:
+				val = values[key]
+				if val is not None:
+					setattr(args, key, val)
 
 	# Verify that @val is positive.
 	def positive(self,
@@ -512,15 +554,19 @@ class CmdLineOptions: # {{{
 		return val
 
 	# Split @s with shlex.split().
-	def shlex_split(self, what: str, s: str) -> list[str]:
+	def shlex_split(self, what: str, s: str, empty_ok: bool = False) \
+			-> list[str]:
 		import shlex
 
+		what = what.replace('_', '-')
 		try:
-			return shlex.split(s)
+			lst = shlex.split(s)
 		except ValueError as ex:
-			raise self.CmdLineError(
-					"%s: %s"
-					% (what.replace('_', '-'), ex.args[0]))
+			raise self.CmdLineError(f"{what}: {ex.args[0]}")
+
+		if not lst and not empty_ok:
+			raise self.CmdLineError(f"{what}: missing value")
+		return lst
 
 	# Public methods.
 	# Add the options declared in @self.sections to @parser.
@@ -1275,9 +1321,11 @@ class CompressionOptions(CmdLineOptions): # {{{
 						self.DFLT_DECOMPRESSOR)
 # }}}
 
-# Add --encryption-key, --encryption-command etc.
+# Add --encryption-command/--encryption-key/--encryption-key-command/etc.
 class EncryptionOptions(CmdLineOptions): # {{{
-	cipher_command:		Optional[Sequence[str]] = None
+	encryption_command:	Optional[Sequence[str]] = None
+	decryption_command:	Optional[Sequence[str]] = None
+
 	encryption_key:		Optional[bytes] = None
 	encryption_key_command:	Optional[Sequence[str]] = None
 	encryption_key_per_uuid: bool = False
@@ -1290,75 +1338,67 @@ class EncryptionOptions(CmdLineOptions): # {{{
 
 	subvolume: Optional[str] = None
 
+	def encrypt_internal(self) -> bool:
+		return self.encryption_key is not None \
+			or self.encryption_key_command is not None
+
+	def encrypt_external(self) -> bool:
+		return bool(self.encryption_command or self.decryption_command)
+
 	@property
 	def encrypt(self) -> bool:
-		return	self.cipher_command is not None \
-			or self.encryption_key is not None \
-			or self.encryption_key_command is not None
+		return self.encrypt_internal() or self.encrypt_external()
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
 		section = self.sections["encryption"]
+		section.add_argument("--subvolume", "-V")
+
+		section.add_argument("--encryption-command", "--encrypt")
 		mutex = section.add_mutually_exclusive_group()
-		if isinstance(self, UploadBlobOptions):
-			mutex.add_disable_flag_no_dflt("--no-encrypt")
-			mutex.add_argument("--encryption-command", "--encrypt")
-			if isinstance(self, CmdUpload):
-				section.add_enable_flag_no_dflt(
-						"--cleartext-index")
-		else:
-			flags = [ "--no-decrypt", "--no-encrypt" ]
-			if isinstance(self, CmdGetIndex):
-				flags.append("--cleartext-index")
-			mutex.add_disable_flag_no_dflt(*flags, dest="encrypt")
-			mutex.add_argument("--decryption-command", "--decrypt")
+		mutex.add_argument("--decryption-command", "--decrypt")
 		mutex.add_argument("--encryption-key", "--key")
 		mutex.add_argument("--encryption-key-command", "--key-cmd")
 		section.add_enable_flag_no_dflt("--encryption-key-per-uuid")
+
+		if isinstance(self, (CmdUpload, CmdGetIndex)):
+			section.add_enable_flag_no_dflt("--cleartext-index")
 
 		section.add_disable_flag_no_dflt("--no-encrypt-metadata")
 		section.add_disable_flag_no_dflt("--no-verify-blob-size")
 		section.add_disable_flag_no_dflt("--no-blob-header")
 
-		section.add_argument("--subvolume", "-V")
-
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
 
-		if args.encrypt is False:
-			# Disabled with --no-encrypt or --no-decrypt,
-			# ignore all options, even if they are conflicting.
-			return
+		self.merge_options_from_ini(args, "subvolume")
+		self.subvolume = args.subvolume
 
-		self.merge_options_from_ini(args, "cleartext_index", tpe=bool)
-		self.encrypt_index = not getattr(args, "cleartext_index", None)
-		if isinstance(self, CmdGetIndex) and not self.encrypt_index:
-			# Like above.
-			assert not self.encrypt
-			return
-
-		if isinstance(self, CmdUpload):
-			self.merge_options_from_ini(args,
-				"encryption_command",
-				"encryption_key",
-				"encryption_key_command")
-			if args.encryption_command is not None:
-				self.cipher_command = \
-					self.shlex_split(
-						"encryption-command",
-						args.encryption_command)
-		else:
-			self.merge_options_from_ini(args,
-				"decryption_command",
-				"encryption_key",
-				"encryption_key_command")
-			if args.decryption_command is not None:
-				self.cipher_command = \
-					self.shlex_split(
-						"decryption-command",
-						args.decryption_command)
-
+		self.merge_options_from_ini(args,
+			("encryption_command", "decryption_command"),
+			"encryption_key",
+			"encryption_key_command")
+		if args.encryption_command is not None:
+			if args.decryption_command is None:
+				raise self.CmdLineError(
+					"--encryption-command must be used "
+					"together with --decryption-command")
+			self.encryption_command = \
+				self.shlex_split(
+					"encryption-command",
+					args.encryption_command)
+		if args.decryption_command is not None:
+			if args.encryption_command is None \
+					and isinstance(
+						self, UploadBlobOptions):
+				raise self.CmdLineError(
+					"--decryption-command must be used "
+					"together with --encryption-command")
+			self.decryption_command = \
+				self.shlex_split(
+					"decryption-command",
+					args.decryption_command)
 		if args.encryption_key is not None:
 			try:
 				self.encryption_key = base64.b64decode(
@@ -1379,6 +1419,8 @@ class EncryptionOptions(CmdLineOptions): # {{{
 			self.encryption_key_per_uuid = \
 				args.encryption_key_per_uuid
 
+		self.merge_options_from_ini(args, "cleartext_index", tpe=bool)
+		self.encrypt_index = not getattr(args, "cleartext_index", None)
 		self.encrypt_index &= self.encrypt
 
 		self.merge_options_from_ini(args, "encrypt_metadata", tpe=bool)
@@ -1394,14 +1436,11 @@ class EncryptionOptions(CmdLineOptions): # {{{
 		self.merge_options_from_ini(args, "blob_header", tpe=bool)
 		if args.blob_header is not False:
 			self.add_header_to_blob = self.encrypt
-		elif self.encryption_key_command is None:
+		elif not self.encrypt_external():
 			# InternalEncrypt always writes a header.
 			raise self.CmdLineError(
-				"--no-blob-header only makes sense "
-				"with --encryption-key-command")
-
-		self.merge_options_from_ini(args, "subvolume")
-		self.subvolume = args.subvolume
+				"--no-blob-header only makes sense with "
+				"--encryption-command/--decryption-command")
 
 class EncryptedBucketOptions(BucketOptions, EncryptionOptions):
 	# Initialize @self.subvolume if it hasn't been set explicitly.
@@ -2036,7 +2075,7 @@ class MetaCipher:
 	# no key has been cached.
 	key_cache: Union[dict[Optional[uuid.UUID], bytes], bytes, None] = None
 
-	# Like InternalCipher.header_st, but for is_external() encryption.
+	# Like InternalCipher.header_st, but for external encryption.
 	external_header_st: Final[struct.Struct] = \
 		struct.Struct(f"B{BTRFS_UUID_SIZE}s")
 
@@ -2077,7 +2116,7 @@ class MetaCipher:
 
 		# Retrieve the @key.
 		assert self.args.encryption_key_command is not None
-		key = subprocess.check_output(
+		key = subprocess_check_output(
 				self.args.encryption_key_command,
 				env=self.get_cipher_cmd_env())
 
@@ -2092,15 +2131,11 @@ class MetaCipher:
 
 		return key
 
-	def is_internal(self) -> bool:
-		return self.args.encrypt \
-			and self.args.encryption_command is None
-
 	CipherClass = TypeVar("CipherClass", bound=InternalCipher)
 	def internal_cipher(self, cipher_class: CipherClass,
 				data_type: DataType, wrapped: BinaryIO) \
 				-> CipherClass:
-		assert self.is_internal()
+		assert self.args.encrypt_internal()
 		return cipher_class(self.get_encryption_key(),
 					data_type.value, self.blob_uuid,
 					wrapped=wrapped)
@@ -2113,20 +2148,17 @@ class MetaCipher:
 				-> InternalDecrypt:
 		return self.internal_cipher(InternalDecrypt, data_type, dst)
 
-	def is_external(self) -> bool:
-		return self.args.encrypt \
-			and self.args.encryption_command is not None
-
-	def external(self) -> dict[str, Any]:
-		assert self.is_external()
+	def external(self, cipher_cmd: Optional[Sequence[str]]) \
+			-> dict[str, Any]:
+		assert cipher_cmd is not None
 		return {
-			"args": self.args.cipher_command,
+			"args": cipher_cmd,
 			"env": self.get_cipher_cmd_env(),
 		}
 
 	def encrypt(self, data_type: DataType, cleartext: bytes) \
 			-> Union[memoryview, bytearray, bytes]:
-		if self.is_internal():
+		if self.args.encrypt_internal():
 			return self.internal_encrypt(
 					data_type,
 					io.BytesIO(cleartext)).read()
@@ -2135,13 +2167,13 @@ class MetaCipher:
 			header = self.external_header_st.pack(
 					data_type.value,
 					ensure_uuid(self.blob_uuid).bytes)
-			return subprocess.check_output(
-					**self.external(),
-					input=header + cleartext)
+			return subprocess_check_output(
+				**self.external(self.args.encryption_command),
+				input=header + cleartext)
 
 	def decrypt(self, data_type: DataType, ciphertext: bytes) \
 			-> memoryview:
-		if self.is_internal():
+		if self.args.encrypt_internal():
 			cleartext = io.BytesIO()
 			cipher = self.internal_decrypt(data_type, cleartext)
 			cipher.write(ciphertext)
@@ -2152,10 +2184,10 @@ class MetaCipher:
 
 			return cleartext.getbuffer()
 
-		# is_external()
-		cleartext = memoryview(subprocess.check_output(
-					**self.external(),
-					input=ciphertext))
+		# External encryption.
+		cleartext = memoryview(subprocess_check_output(
+				**self.external(self.args.decryption_command),
+				input=ciphertext))
 
 		# Verify the header.
 		if len(cleartext) < self.external_header_st.size:
@@ -2197,18 +2229,82 @@ class MetaBlob(MetaCipher):
 	snapshot_uuid: uuid.UUID
 	parent_uuid: Optional[uuid.UUID]
 
-	def new(self, args: EncryptedBucketOptions,
-			blob_uuid: uuid.UUID,
-			blob_type: BlobType,
-			snapshot: Snapshot,
-			parent: Optional[Snapshot]) -> "MetaBlob":
-		pass
+	# Whether metadata has changed.
+	dirty: bool
 
 	def __init__(self, args: EncryptedBucketOptions,
-			blob: google.cloud.storage.Blob, blob_name: str):
+			blob_type: BlobType,
+			snapshot: Snapshot,
+			parent: Optional[Snapshot],
+			remote_backups: Optional[Container[uuid.UUID]] = None):
 		super().__init__(args)
-		self.blob = blob
 
+		if args.encrypt_metadata:
+			# Generate a random @self.blob_uuid not in use yet.
+			while True:
+				self.blob_uuid = uuid.uuid4()
+				blob_name = str(self.blob_uuid)
+				if args.prefix is not None:
+					blob_name = "%s/%s" % (args.prefix,
+								blob_name)
+				self.blob = args.bucket.blob(blob_name)
+
+				if remote_backups is None:
+					if self.blob.exists():
+						continue
+				elif self.blob_uuid in remote_backups:
+					continue
+				break
+		else:
+			blob_name = "%s/%s" % (snapshot.fname,
+						blob_type.name.lower())
+			if args.prefix is not None:
+				blob_name = f"{args.prefix}/{blob_name}"
+			self.blob = args.bucket.blob(blob_name)
+
+			# Like above, generate a random @self.blob_uuid
+			# not in use yet.
+			while args.encrypt:
+				self.blob_uuid = uuid.uuid4()
+				if remote_backups is None:
+					# We can't determine.
+					break
+				elif self.blob_uuid not in remote_backups:
+					break
+
+		self.blob_type = self.set_metadata(
+					self.DataType.BLOB_TYPE, blob_type)
+		self.blob_size = None
+
+		self.subvolume = self.set_metadata(
+					self.DataType.SUBVOLUME,
+					args.subvolume)
+		self.snapshot_name = self.set_metadata(
+					self.DataType.SNAPSHOT_NAME,
+					snapshot.fname)
+		self.snapshot_uuid = self.set_metadata(
+					self.DataType.SNAPSHOT_UUID,
+					snapshot.uuid)
+
+		if blob_type == BlobType.DELTA:
+			assert parent is not None
+			self.parent_uuid = self.set_metadata(
+						self.DataType.PARENT_UUID,
+						parent.uuid)
+		else:
+			assert parent is None
+			self.parent_uuid = None
+
+		self.update_signature()
+		self.dirty = False
+
+	@classmethod
+	def init(cls, args: EncryptedBucketOptions,
+			blob: google.cloud.storage.Blob) -> "MetaBlob":
+		self = super().__new__(cls)
+		super().__init__(args)
+
+		self.blob = blob
 		blob_name = blob.name
 		if args.prefix is not None:
 			prefix = args.prefix + '/'
@@ -2225,26 +2321,19 @@ class MetaBlob(MetaCipher):
 					f"{blob.name} has invalid UUID "
 					f"({blob_uuid})") from ex
 
-			blob_type = self.get_integer_metadata(
-					self.DataType.BLOB_TYPE, 2)
-			try:
-				self.blob_type = self.BlobType(blob_type)
-			except ValueError as ex:
-				raise SecurityError(
-					f"{blob.name} has invalid blob_type "
-					f"({blob_type})") from ex
-
-			self.snapshot_name = self.get_text_metadata(
-					self.DataType.SNAPSHOT_NAME)
+			self.blob_type = self.get_metadata(
+						self.DataType.BLOB_TYPE)
+			self.snapshot_name = self.get_metadata(
+						self.DataType.SNAPSHOT_NAME)
 		else:
-			if self.args.encrypt:
+			if args.encrypt:
 				# Retrieving the metadata should set
 				# @self.blob_uuid.  It's safe to use
 				# an encrypted hash as a MAC as long as
 				# the underlying cipher is non-malleable,
 				# which is the case with InternalCipher,
 				# being AEAD.
-				signature = self.get_binary_metadata(
+				signature = self.get_metadata(
 						self.DataType.SIGNATURE)
 				assert self.blob_uuid is not None
 
@@ -2265,12 +2354,12 @@ class MetaBlob(MetaCipher):
 					f"{blob.name} has unknown blob_type "
 					f"({blob_type})")
 
-		self.subvolume = self.get_text_metadata(self.DataType.SUBVOLUME)
+		self.subvolume = self.get_metadata(self.DataType.SUBVOLUME)
 
-		self.snapshot_uuid = self.get_uuid_metadata(
+		self.snapshot_uuid = self.get_metadata(
 						self.DataType.SNAPSHOT_UUID)
-		if self.blob_type == self.BlobType.INDEX:
-			self.parent_uuid = self.get_uuid_metadata(
+		if self.blob_type == self.BlobType.DELTA:
+			self.parent_uuid = self.get_metadata(
 						self.DataType.PARENT_UUID)
 		elif self.has_metadata(self.DataType.PARENT_UUID):
 			raise ConsistencyError(
@@ -2282,7 +2371,7 @@ class MetaBlob(MetaCipher):
 
 		if args.verify_blob_size or self.has_metadata(
 						self.DataType.BLOB_SIZE):
-			self.blob_size = self.get_integer_metadata(
+			self.blob_size = self.get_metadata(
 						self.DataType.BLOB_SIZE)
 			if blob.size != self.blob_size:
 				raise SecurityError(
@@ -2297,13 +2386,21 @@ class MetaBlob(MetaCipher):
 				raise SecurityError(
 					f"{blob.name} has invalid signature")
 		elif self.has_metadata(self.DataType.SIGNATURE):
+			# Possible misconfiguration.
 			raise ConsistencyError(
 				"%s[%s]: unexpected metadata"
 				% (blob.name, self.DataType.SIGNATURE.field()))
 
+		# Return None if @blob doesn't belong to the backups
+		# of @args.subsystem after all.
+		if self.subvolume != args.subvolume:
+			return None
+		return self
+
 	def calc_signature(self) -> bytes:
 		import hashlib
 
+		# SHA-256 is fast and secure.
 		hasher = hashlib.sha256()
 		hasher.update(self.args.subvolume.encode())
 		hasher.update(b'\0')
@@ -2322,7 +2419,7 @@ class MetaBlob(MetaCipher):
 		return self.blob.metadata \
 			and data_type.field() in self.blob.metadata
 
-	def get_metadata(self, data_type: MetaCipher.DataType) -> str:
+	def get_raw_metadata(self, data_type: MetaCipher.DataType) -> str:
 		# TypeError is raised if self.blob.metadata is None.
 		try:
 			return self.blob.metadata[data_type.field()]
@@ -2330,6 +2427,13 @@ class MetaBlob(MetaCipher):
 			raise SecurityError(
 				"%s[%s]: missing metadata"
 				% (self.blob.name, data_type.field()))
+
+	def set_raw_metadata(self, data_type: MetaCipher.DataType,
+				metadata: str) -> None:
+		if self.blob.metadata is None:
+			self.blob.metadata = { }
+		self.blob.metadata[data_type.field()] = metadata
+		self.dirty = True
 
 	def decode_metadata(self, data_type: MetaCipher.DataType,
 				metadata: str) -> bytes:
@@ -2339,6 +2443,10 @@ class MetaBlob(MetaCipher):
 			raise SecurityError(
 				"%s[%s]: couldn't decode metadata"
 				% (self.blob.name, data_type.field())) from ex
+
+	def encode_metadata(self, data_type: MetaCipher.DataType,
+				metadata: bytes) -> str:
+		return base64.b64encode(data).decode()
 
 	def decrypt_metadata(self, data_type: MetaCipher.DataType,
 				metadata: str) -> bytes:
@@ -2351,15 +2459,32 @@ class MetaBlob(MetaCipher):
 						data_type.field()),
 				*ex.args) from ex
 
+	def encrypt_metadata(self, data_type: MetaCipher.DataType,
+				metadata: bytes) -> str:
+		return self.encode_metadata(
+			data_type, self.encrypt(data_type, metadata))
+
 	def get_binary_metadata(self, data_type: MetaCipher.DataType) -> bytes:
-		metadata = self.get_metadata(data_type)
-		if not self.args.encrypt_metadata:
+		# The signature is always encrypted.
+		metadata = self.get_raw_metadata(data_type)
+		if not self.args.encrypt_metadata \
+				and data_type != self.DataType.SIGNATURE:
 			return self.decode_metadata(data_type, metadata)
 		else:
 			return self.decrypt_metadata(data_type, metadata)
 
+	def set_binary_metadata(self, data_type: MetaCipher.DataType,
+				value: bytes) -> None:
+		# Like above.
+		if not self.args.encrypt_metadata \
+				and data_type != self.DataType.SIGNATURE:
+			metadata = self.encode_metadata(data_type, value)
+		else:
+			metadata = self.encrypt_metadata(data_type, value)
+		self.set_raw_metadata(data_type, metadata)
+
 	def get_text_metadata(self, data_type: MetaCipher.DataType) -> str:
-		metadata = self.get_metadata(data_type)
+		metadata = self.get_raw_metadata(data_type)
 		if not self.args.encrypt_metadata:
 			return metadata
 
@@ -2371,9 +2496,18 @@ class MetaBlob(MetaCipher):
 				"%s[%s]: invalid metadata"
 				% (self.blob.name, data_type.field())) from ex
 
+	def set_text_metadata(self, data_type: MetaCipher.DataType,
+				value: str) -> None:
+		if not self.args.encrypt_metadata:
+			metadata = value
+		else:
+			metadata = self.encrypt_metadata(
+					data_type, value.encode())
+		self.set_raw_metadata(data_type, metadata)
+
 	def get_integer_metadata(self, data_type: MetaCipher.DataType,
 					width: int = 8) -> int:
-		metadata = self.get_metadata(data_type)
+		metadata = self.get_raw_metadata(data_type)
 
 		if not self.args.encrypt_metadata:
 			try:
@@ -2392,9 +2526,18 @@ class MetaBlob(MetaCipher):
 					len(metadata), width))
 		return int.from_bytes(metadata, "big")
 
+	def set_integer_metadata(self, data_type: MetaCipher.DataType,
+					value: int, width: int = 8) -> None:
+		if not self.args.encrypt_metadata:
+			metadata = str(value)
+		else:
+			metadata = self.encrypt_metadata(
+					data_type, value.to_bytes(width, "big"))
+		self.set_raw_metadata(data_type, metadata)
+
 	def get_uuid_metadata(self, data_type: MetaCipher.DataType) \
 				-> uuid.UUID:
-		metadata = self.get_metadata(data_type)
+		metadata = self.get_raw_metadata(data_type)
 
 		if not self.args.encrypt_metadata:
 			try:
@@ -2414,16 +2557,73 @@ class MetaBlob(MetaCipher):
 				% (self.blob.name, data_type.field())) \
 				from ex
 
-	def set_metadata(self,
-			blob: google.cloud.storage.Blob,
-			data_type: MetaCipher.DataType, data: bytes) -> None:
-		if self.args.encrypt:
-			data = self.encrypt(data_type, data)
+	def set_uuid_metadata(self, data_type: MetaCipher.DataType,
+			value: uuid.UUID) -> None:
+		if not self.args.encrypt_metadata:
+			metadata = str(value)
+		else:
+			metadata = self.encrypt_metadata(
+					data_type, value.bytes)
+		self.set_raw_metadata(data_type, metadata)
 
-		if blob.metadata is None:
-			blob.metadata = { }
-		blob.metadata[data_type.field()] = \
-			base64.b64encode(data).decode()
+	def get_metadata(self, data_type: MetaCipher.DataType) -> Any:
+		if data_type == self.DataType.SIGNATURE:
+			return self.get_binary_metadata(data_type)
+		elif data_type == self.DataType.SUBVOLUME:
+			return self.get_text_metadata(data_type)
+		elif data_type == self.DataType.BLOB_TYPE:
+			blob_type = self.get_integer_metadata(
+					data_type, width=2)
+			try:
+				return self.BlobType(blob_type)
+			except ValueError as ex:
+				raise SecurityError(
+					f"{self.blob.name} has invalid "
+					f"blob_type ({blob_type})") from ex
+		elif data_type == self.DataType.BLOB_SIZE:
+			return self.get_integer_metadata(data_type)
+		elif data_type == self.DataType.SNAPSHOT_NAME:
+			return self.get_text_metadata(data_type)
+		elif data_type == self.DataType.SNAPSHOT_UUID:
+			return self.get_uuid_metadata(data_type)
+		elif data_type == self.DataType.PARENT_UUID:
+			return self.get_uuid_metadata(data_type)
+		else:
+			assert False
+
+	T = TypeVar("T")
+	def set_metadata(self, data_type: MetaCipher.DataType, value: T) -> T:
+		if data_type == self.DataType.SIGNATURE:
+			self.set_binary_metadata(data_type, value)
+		elif data_type == self.DataType.SUBVOLUME:
+			self.set_text_metadata(data_type, value)
+		elif data_type == self.DataType.BLOB_TYPE:
+			self.set_integer_metadata(data_type, value.value,
+							width=2)
+		elif data_type == self.DataType.BLOB_SIZE:
+			if args.verify_blob_size:
+				self.set_integer_metadata(data_type, value)
+		elif data_type == self.DataType.SNAPSHOT_NAME:
+			self.set_text_metadata(data_type, value)
+		elif data_type == self.DataType.SNAPSHOT_UUID:
+			self.set_uuid_metadata(data_type, value)
+		elif data_type == self.DataType.PARENT_UUID:
+			self.set_uuid_metadata(data_type, value)
+		else:
+			assert False
+		return value
+
+	def update_signature(self):
+		if args.encrypt and not args.encrypt_metadata:
+			self.set_metadata(
+					self.DataType.SIGNATURE,
+					self.calc_signature())
+
+	def sync_metadata(self):
+		if self.dirty:
+			self.update_signature()
+			self.blob.patch()
+			self.dirty = False
 
 # A class that reads from or writes to a wrapped file-like object, printing
 # the progress periodically, keeping track of the @bytes_transferred, and if
@@ -2638,6 +2838,15 @@ def ensure_uuid(u: Union[None, uuid.UUID, bytes]) -> uuid.UUID:
 		return u
 	else:
 		return uuid.UUID(bytes=u)
+
+# Wrapper around subprocess.check_output() that handles exceptions.
+def subprocess_check_output(*args, **kwargs) -> bytes:
+	try:
+		return subprocess.check_output(*args, **kwargs)
+	except subprocess.CalledProcessError as ex:
+		# Conceal the arguments, they might be sensitive.
+		ex.cmd = ex.cmd[0]
+		raise FatalError(str(ex)) from ex
 
 # Wait for a subprocess and raise a FatalError if it exited with non-0 status.
 def wait_proc(proc: subprocess.Popen) -> None:
@@ -2992,23 +3201,30 @@ def get_cipher(args: EncryptionOptions, cipher_class: CipherClass,
 	if not args.encrypt:
 		return None
 
-	# Add environment variables that allow the external programs to retrieve
-	# blob-specific keys.
+	# Add environment variables that allow the external programs
+	# to retrieve blob-specific keys.
 	env = os.environ.copy()
 	env["GICCS_SUBVOLUME"] = args.subvolume
 	env["GICCS_BLOB_UUID"] = str(blob_uuid)
 
-	if args.cipher_command is not None:
-		return { "args": args.cipher_command, "env": env }
+	if args.encrypt_external():
+		if cipher_class is InternalEncrypt:
+			cmd = args.encryption_command
+		else:
+			cmd = args.decryption_command
+		assert cmd is not None
+
+		return { "args": cmd, "env": env }
 
 	if args.encryption_key is not None:
 		key = args.encryption_key
 	else:
 		assert args.encryption_key_command is not None
-		key = subprocess.check_output(args.encryption_key_command, env=env)
+		key = subprocess_check_output(args.encryption_key_command,
+						env=env)
 
 	return cipher_class(key,
-		blob_type.data_type_id(EncryptedDataType.PAYLOAD),
+			blob_type.data_type_id(EncryptedDataType.PAYLOAD),
 			blob_uuid)
 
 def encrypt_metadata(args: EncryptionOptions,
@@ -3022,7 +3238,7 @@ def encrypt_metadata(args: EncryptionOptions,
 	else:	# Metadata always have a header.
 		header = encryption_header_st.pack(
 				data_type_id, blob_uuid.bytes)
-		ciphertext = subprocess.check_output(**cipher,
+		ciphertext = subprocess_check_output(**cipher,
 				input=header + cleartext)
 
 	return base64.b64encode(ciphertext).decode()
@@ -3043,7 +3259,7 @@ def decrypt_metadata(args: EncryptionOptions,
 		return cleartext.getbuffer()
 
 	# @cipher is non-InternalCipher.
-	cleartext = memoryview(subprocess.check_output(
+	cleartext = memoryview(subprocess_check_output(
 				**cipher, input=ciphertext))
 
 	# Verify the header.
