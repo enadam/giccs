@@ -1,12 +1,13 @@
 #!/usr/bin/python3
 #
 # TODO: {{{
-# blob.name
 # consistency check of remote backups
 # calculate/verify hash?
 #
 # upload/download: split plan and execution
 # consider using clone sources when uploading
+#
+# CmdFTPGet, CmdFTPPut: DryRunOptions, WetRunOptions, AutodeleteOptions?
 #
 # globbing
 # cd, pwd
@@ -74,6 +75,9 @@ import google.oauth2.service_account
 # }}}
 
 # Constants and structures {{{
+# A generic-purpose type variable.
+T = TypeVar("T")
+
 # A cached singleton.
 UUID0 = uuid.UUID(int=0)
 
@@ -635,24 +639,24 @@ class CmdLineCommand(CmdLineOptions): # {{{
 
 # Add options common to leaf-level commands.
 class CmdLeaf(CmdLineCommand): # {{{
-	debug: Optional[bool] = None
+	_debug: Optional[bool] = None
 
-	def __init__(self):
-		super().__init__()
+	@property
+	def debug(self) -> bool:
+		if self._debug is not None:
+			return self._debug
 
-		# Initialize @self.debug from the environment.
 		debug = os.environ.get("GICCS_DEBUG")
 		if debug is None:
-			return
+			self._debug = False
+			return self._debug
 
 		try:
-			self.debug = int(debug) > 0
+			self._debug = int(debug) > 0
 		except ValueError:
-			debug = debug.lower()
-			if debug in ("true", "yes", "on"):
-				self.debug = True
-			elif debug in ("false", "no", "off"):
-				self.debug = False
+			self._debug = debug.lower() in ("true", "yes", "on")
+
+		return self._debug
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
@@ -663,50 +667,8 @@ class CmdLeaf(CmdLineCommand): # {{{
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		# Enable debugging as early as possible.
 		if args.debug is not None:
-			self.debug = args.debug
+			self._debug = args.debug
 		super().pre_validate(args)
-
-	def post_validate(self, args: argparse.Namespace) -> None:
-		# Likewise.
-		self.merge_options_from_ini(args, "debug", tpe=bool)
-		if self.debug is None and args.debug is not None:
-			self.debug = args.debug
-
-		super().post_validate(args)
-# }}}
-
-# Add --show-uuid and --no-color.
-class ShowUUIDOptions(CmdLineOptions): # {{{
-	color: bool = True
-	show_uuid: Optional[bool] = None
-
-	def declare_arguments(self) -> None:
-		super().declare_arguments()
-
-		section = self.sections["display"]
-		section.add_disable_flag_no_dflt("--no-color")
-
-		# If we wouldn't add --uuid, add it as an alias to --show-uuid.
-		flags = [ "--show-uuid" ]
-		if not isinstance(self, SelectionOptions):
-			flags.append("--uuid")
-		section.add_enable_flag_no_dflt(*flags, "-u")
-
-	def post_validate(self, args: argparse.Namespace) -> None:
-		super().post_validate(args)
-
-		self.merge_options_from_ini(args, "color", tpe=bool)
-		if args.color is not None:
-			self.color = args.color
-		else:
-			self.color = os.isatty(sys.stdout.fileno())
-		if self.color:
-			Snapshot.emphasize_uuid_in_fmt = True
-
-		self.merge_options_from_ini(args, "show_uuid", tpe=bool)
-		self.show_uuid = args.show_uuid
-		if self.show_uuid:
-			Snapshot.include_uuid_in_fmt = True
 # }}}
 
 # Add --config and --section.  The config is actually loaded by CmdLineOptions.
@@ -957,7 +919,7 @@ class WetRunOptions(DryRunOptions): # {{{
 # }}}
 
 # Add options to select snapshots or backups with --first/--from/--to/--exact.
-class SelectionOptions(ShowUUIDOptions): # {{{
+class SelectionOptions(CmdLineOptions): # {{{
 	# Should be provided by subclasses.
 	selection_section: str
 
@@ -1022,12 +984,6 @@ class SelectionOptions(ShowUUIDOptions): # {{{
 			self.to = to_uuid("to", args.to)
 		for exact in args.exact:
 			self.exact.append(to_uuid("exact", exact))
-
-	def post_validate(self, args: argparse.Namespace) -> None:
-		super().post_validate(args)
-
-		if self.show_uuid is None:
-			self.show_uuid = self.use_uuid
 # }}}
 
 # Adjust @self.dir based on the local snapshots selected.
@@ -1330,9 +1286,10 @@ class EncryptionOptions(CmdLineOptions): # {{{
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
-		section = self.sections["encryption"]
+		section = self.sections["bucket"]
 		section.add_argument("--subvolume", "-V")
 
+		section = self.sections["encryption"]
 		section.add_argument("--encryption-command", "--encrypt")
 		mutex = section.add_mutually_exclusive_group()
 		mutex.add_argument("--decryption-command", "--decrypt")
@@ -1413,7 +1370,7 @@ class EncryptionOptions(CmdLineOptions): # {{{
 				"--no-blob-header only makes sense with "
 				"--encryption-command/--decryption-command")
 
-class EncryptedBucketOptions(BucketOptions, EncryptionOptions):
+class EncryptedBucketOptions(EncryptionOptions, BucketOptions):
 	# Initialize @self.subvolume if it hasn't been set explicitly.
 	def find_bucket(self) -> google.cloud.storage.Bucket:
 		bucket = super().find_bucket()
@@ -1514,6 +1471,21 @@ class CommonOptions(EncryptedBucketOptions, AccountOptions, ConfigFileOptions):
 class DeleteOptions(CommonOptions, DryRunOptions, DeleteSelectionOptions):
 	pass
 
+# Add --uuid.
+class ShowUUIDOptions(CmdLineOptions): # {{{
+	show_uuid: Optional[bool] = None
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["display"]
+		section.add_enable_flag_no_dflt("--uuid", "-u")
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.show_uuid = args.uuid
+# }}}
+
 # Add --verbose.
 class ListRemoteOptions(CommonOptions, ShowUUIDOptions): # {{{
 	bucket_required = True
@@ -1566,13 +1538,6 @@ class Snapshot: # {{{
 	seq:		Optional[int] = dataclasses.field(init=False)
 	tag:		Optional[str] = dataclasses.field(init=False)
 
-	# Allow these fields to be overwritten at the class level
-	# because they are influenced by the command line options.
-	include_uuid_in_fmt: bool = dataclasses.field(init=False,
-							default=False)
-	emphasize_uuid_in_fmt: bool = dataclasses.field(init=False,
-							default=False)
-
 	@classmethod
 	def parse(self, snapshot_name: str) -> Optional[re.Match]:
 		return self.snapshot_name_fmt.fullmatch(snapshot_name)
@@ -1595,16 +1560,7 @@ class Snapshot: # {{{
 			return self.snapshot_name == what
 
 	def __str__(self) -> str:
-		if not self.include_uuid_in_fmt:
-			return self.snapshot_name
-		elif not self.emphasize_uuid_in_fmt:
-			return f"{self.snapshot_name} ({self.snapshot_uuid})"
-		else:	# Make the UUID bold.
-			return "%s (%s%s%s)" % (
-					self.snapshot_name,
-					"\x1b[1m",
-					self.snapshot_uuid,
-					"\x1b[0m")
+		return self.snapshot_name
 
 	def __eq__(self, other: Union[Snapshot, uuid.UUID]) -> bool:
 		if isinstance(other, Snapshot):
@@ -1636,9 +1592,9 @@ class Snapshot: # {{{
 
 @dataclasses.dataclass
 class Backup(Snapshot): # {{{
-	index:	Optional[MetaBlob] = None
-	full:	Optional[MetaBlob] = None
-	delta:	Optional[MetaBlob] = None
+	index:	Optional[BackupBlob] = None
+	full:	Optional[BackupBlob] = None
+	delta:	Optional[BackupBlob] = None
 
 	# Used by Backups.restorable().
 	restorable: Optional[bool] = None
@@ -1649,12 +1605,12 @@ class Backup(Snapshot): # {{{
 			if self.delta is not None \
 			else None
 
-	def __init__(self, blob: MetaBlob):
+	def __init__(self, blob: BackupBlob):
 		super().__init__(blob.snapshot_name, blob.snapshot_uuid)
 		self.add_blob(blob)
 
 	# Set one of @self.index, @self.full or @self.delta.
-	def add_blob(self, blob: MetaBlob) -> None:
+	def add_blob(self, blob: BackupBlob) -> None:
 		if blob.snapshot_name != self.snapshot_name:
 			raise ConsistencyError(
 				"%s has unexpected snapshot name (%s != %s)"
@@ -1667,30 +1623,32 @@ class Backup(Snapshot): # {{{
 				% (blob.name, blob.snapshot_uuid,
 					self.snapshot_uuid))
 
-		existing = getattr(self, blob.blob_type.field())
+		existing = getattr(self, blob.payload_type.field())
 		if existing is not None:
 			raise ConsistencyError(
 				"%s has duplicate %s blobs (%s and %s)"
-				% (self, blob.blob_type.field(),
+				% (self, blob.payload_type.field(),
 					existing.name, blob.name))
 
-		setattr(self, blob.blob_type.field(), blob)
+		setattr(self, blob.payload_type.field(), blob)
 
-	def clear_blob(self, which: Union[MetaBlob.BlobType, MetaBlob]) \
+	def clear_blob(self,
+			which: Union[BackupBlob.PayloadType, BackupBlob]) \
 			-> None:
-		if isinstance(which, MetaBlob):
-			which = which.blob_type
+		if isinstance(which, BackupBlob):
+			which = which.payload_type
 		setattr(self, which.field(), None)
 
-	def all_blobs(self) -> Iterable[MetaBlob]:
-		return filter(None, (getattr(self, blob_type.field())
-					for blob_type in MetaBlob.BlobType))
+	def all_blobs(self) -> Iterable[BackupBlob]:
+		return filter(None, (getattr(self, payload_type.field())
+					for payload_type
+		       			in BackupBlob.PayloadType))
 
 	def orphaned(self) -> bool:
-		for blob in self.all_blobs():
-			if blob.blob_type != MetaBlob.BlobType.INDEX:
-				return False
-		return True
+		return not any(
+			blob.payload_type != BackupBlob.PayloadType.INDEX
+			for blob in self.all_blobs()
+		)
 # }}}
 
 # A collection of Snapshot:s.
@@ -1753,10 +1711,10 @@ class Snapshots(dict[uuid.UUID, Snapshot]): # {{{
 class Backups(Snapshots): # {{{
 	where: Final[str] = "remotely"
 
-	_blobs: Optional[dict[uuid.UUID, MetaBlob]] = None
+	_blobs: Optional[dict[uuid.UUID, BackupBlob]] = None
 
 	@property
-	def blobs(self) -> dict[uuid.UUID, MetaBlob]:
+	def blobs(self) -> dict[uuid.UUID, BackupBlob]:
 		# This method is only supposed to be called if encryption
 		# is on, so all blobs should have a @blob.blob_uuid.
 		if self._blobs is None:
@@ -2135,8 +2093,8 @@ class MetaCipher: # {{{
 		PAYLOAD		= 0
 		SIGNATURE	= 1
 		SUBVOLUME	= 2
-		BLOB_TYPE	= 3
-		BLOB_SIZE	= 4
+		BLOB_SIZE	= 3
+		PAYLOAD_TYPE	= 4
 		SNAPSHOT_NAME	= 5
 		SNAPSHOT_UUID	= 6
 		PARENT_UUID	= 7
@@ -2303,23 +2261,18 @@ class MetaCipher: # {{{
 
 # A GCS blob with metadata.
 class MetaBlob(MetaCipher): # {{{
-	@enum.unique
-	class BlobType(enum.IntEnum):
-		INDEX	= 0
-		FULL	= 1
-		DELTA	= 2
+	# hashlib doesn't define an abstract base class, let's have our own.
+	class Hasher(Protocol):
+		def update(self, data: bytes) -> None:
+			...
 
-		def field(self):
-			return self.name.lower()
+		def digest(self) -> bytes:
+			...
 
 	gcs_blob: google.cloud.storage.Blob
-	blob_type: BlobType
-	blob_size: Optional[int]
 
 	subvolume: str
-	snapshot_name: str
-	snapshot_uuid: uuid.UUID
-	parent_uuid: Optional[uuid.UUID]
+	blob_size: Optional[int]
 
 	# Whether metadata has changed.
 	dirty: bool
@@ -2328,11 +2281,15 @@ class MetaBlob(MetaCipher): # {{{
 	def name(self) -> str:
 		return self.gcs_blob.name
 
-	def __str__(self):
-		return "%s/%s" % (self.snapshot_name, self.blob_type.field())
+	def __init__(self):
+		raise AssertionError(
+			"Subclasses should implement __init__() "
+			"and call new() instead of super().__init__().")
 
-	def __init__(self, args: EncryptedBucketOptions, blob_type: BlobType,
-			snapshot: Snapshot, parent: Optional[Snapshot]):
+	# This is a context manager, so we can perform things post-__init__().
+	@contextlib.contextmanager
+	def new(self, args: EncryptedBucketOptions, path: str,
+			backups: Optional[Backups] = None):
 		super().__init__(args)
 
 		while True:
@@ -2343,41 +2300,36 @@ class MetaBlob(MetaCipher): # {{{
 			if args.encrypt_metadata:
 				blob_name = str(self.blob_uuid)
 			else:
-				blob_name = "%s/%s" % (snapshot.snapshot_name,
-							blob_type.field())
+				blob_name = path
 			if args.prefix is not None:
 				blob_name = f"{args.prefix}/{blob_name}"
 
 			self.gcs_blob = args.bucket.blob(blob_name)
-			if args.encrypt_metadata and self.gcs_blob.exists():
-				# Regenerate @self.blob_uuid.
+			if not args.encrypt_metadata:
+				break
+			elif backups is not None \
+					and self.blob_uuid in backups.blobs:
+				# The generated @self.blob_uuid conflicts
+				# with an existing one.
+				continue
+			elif backups is None and self.gcs_blob.exists():
+				# Likewise.
 				continue
 			else:
 				break
 
-		self.set_metadata(self.DataType.BLOB_TYPE, blob_type)
 		self.blob_size = None
-
 		self.set_metadata(self.DataType.SUBVOLUME, args.subvolume)
-		self.set_metadata(
-			self.DataType.SNAPSHOT_NAME, snapshot.snapshot_name)
-		self.set_metadata(
-			self.DataType.SNAPSHOT_UUID, snapshot.snapshot_uuid)
 
-		if blob_type == self.BlobType.DELTA:
-			assert parent is not None
-			self.set_metadata(self.DataType.PARENT_UUID,
-						parent.snapshot_uuid)
-		else:
-			assert parent is None
-			self.parent_uuid = None
+		# Return control to the caller.
+		yield
 
 		self.update_signature()
 		self.dirty = False
 
 	@classmethod
-	def init(cls, args: EncryptedBucketOptions,
-			gcs_blob: google.cloud.storage.Blob) -> MetaBlob:
+	def init(cls: type[T], args: EncryptedBucketOptions,
+			gcs_blob: google.cloud.storage.Blob) -> T:
 		self = super().__new__(cls)
 		super().__init__(self, args)
 
@@ -2388,25 +2340,21 @@ class MetaBlob(MetaCipher): # {{{
 				raise ConsistencyError(
 					f"{self.name} doesn't start with "
 					f"{prefix}")
-			basename = self.name.removeprefix(prefix)
+			prefixless = self.name.removeprefix(prefix)
 		else:
-			basename = self.name
+			prefixless = self.name
 
 		signature = None
 		if args.encrypt_metadata:
-			blob_uuid = basename
+			blob_uuid, path = prefixless, None
 			try:
 				self.blob_uuid = uuid.UUID(blob_uuid)
 			except ValueError as ex:
 				raise ConsistencyError(
 					f"{self.name} has invalid UUID "
 					f"({blob_uuid})") from ex
-
-			self.blob_type = self.get_metadata(
-						self.DataType.BLOB_TYPE)
-			self.snapshot_name = self.get_metadata(
-						self.DataType.SNAPSHOT_NAME)
 		else:
+			path = prefixless
 			if args.encrypt:
 				# Retrieving the metadata should set
 				# @self.blob_uuid.  It's safe to use
@@ -2418,37 +2366,9 @@ class MetaBlob(MetaCipher): # {{{
 						self.DataType.SIGNATURE)
 				assert self.blob_uuid is not None
 
-			self.snapshot_name, per, blob_type = \
-					basename.rpartition('/')
-			if not per:
-				raise ConsistencyError(
-					f"{self.name} is missing blob_type")
-
-			if not blob_type.islower():
-				raise ConsistencyError(
-					f"{self.name} has invalid blob_type")
-			blob_type = blob_type.upper()
-			try:
-				self.blob_type = self.BlobType[blob_type]
-			except KeyError:
-				raise ConsistencyError(
-					f"{self.name} has unknown blob_type "
-					f"({blob_type})")
+		self.setup(path)
 
 		self.subvolume = self.get_metadata(self.DataType.SUBVOLUME)
-
-		self.snapshot_uuid = self.get_metadata(
-						self.DataType.SNAPSHOT_UUID)
-		if self.blob_type == self.BlobType.DELTA:
-			self.parent_uuid = self.get_metadata(
-						self.DataType.PARENT_UUID)
-		elif self.has_metadata(self.DataType.PARENT_UUID):
-			raise ConsistencyError(
-				"%s[%s]: unexpected metadata"
-				% (self.name,
-					self.DataType.PARENT_UUID.field()))
-		else:
-			self.parent_uuid = None
 
 		if args.verify_blob_size or self.has_metadata(
 						self.DataType.BLOB_SIZE):
@@ -2463,7 +2383,7 @@ class MetaBlob(MetaCipher): # {{{
 			self.blob_size = None
 
 		if signature is not None:
-			if signature != self.calc_signature():
+			if signature != self.calc_signature().digest():
 				raise SecurityError(
 					f"{self.name} has invalid signature")
 		elif self.has_metadata(self.DataType.SIGNATURE):
@@ -2478,23 +2398,22 @@ class MetaBlob(MetaCipher): # {{{
 			return None
 		return self
 
-	def calc_signature(self) -> bytes:
+	def setup(self, path: Optional[str] = None) -> None:
+		pass
+
+	def calc_signature(self) -> Hasher:
 		import hashlib
 
 		# SHA-256 is fast and secure.
 		hasher = hashlib.sha256()
+
 		hasher.update(self.args.subvolume.encode())
 		hasher.update(b'\0')
-		hasher.update(self.blob_type.value.to_bytes(2, "big"))
-		if self.blob_size is not None:
-			hasher.update(self.blob_size.to_bytes(8, "big"))
-		else:
-			hasher.update((0).to_bytes(8, "big"))
-		hasher.update(self.snapshot_name.encode())
-		hasher.update(b'\0')
-		hasher.update(self.snapshot_uuid.bytes)
-		hasher.update(ensure_uuid(self.parent_uuid).bytes)
-		return hasher.digest()
+
+		blob_size = self.blob_size if self.blob_size is not None else 0
+		hasher.update(blob_size.to_bytes(8, "big"))
+
+		return hasher
 
 	def has_metadata(self, data_type: MetaCipher.DataType) -> bool:
 		return self.gcs_blob.metadata \
@@ -2656,17 +2575,142 @@ class MetaBlob(MetaCipher): # {{{
 			return self.get_binary_metadata(data_type)
 		elif data_type == self.DataType.SUBVOLUME:
 			return self.get_text_metadata(data_type)
-		elif data_type == self.DataType.BLOB_TYPE:
-			blob_type = self.get_integer_metadata(
+		elif data_type == self.DataType.BLOB_SIZE:
+			return self.get_integer_metadata(data_type)
+		else:
+			assert False
+
+	def set_metadata(self, data_type: MetaCipher.DataType, value: T) -> T:
+		if data_type == self.DataType.SIGNATURE:
+			self.set_binary_metadata(data_type, value)
+		elif data_type == self.DataType.SUBVOLUME:
+			self.set_text_metadata(data_type, value)
+			self.subvolume = value
+		elif data_type == self.DataType.BLOB_SIZE:
+			if self.args.verify_blob_size:
+				self.set_integer_metadata(data_type, value)
+				self.blob_size = value
+		else:
+			assert False
+		return value
+
+	def update_signature(self):
+		if self.args.encrypt and not self.args.encrypt_metadata:
+			self.set_metadata(
+					self.DataType.SIGNATURE,
+					self.calc_signature().digest())
+
+	def sync_metadata(self):
+		if self.dirty:
+			self.update_signature()
+			self.gcs_blob.patch()
+			self.dirty = False
+# }}}
+
+# A MetaBlob of a Backup.
+class BackupBlob(MetaBlob): # {{{
+	@enum.unique
+	class PayloadType(enum.IntEnum):
+		INDEX	= 0
+		FULL	= 1
+		DELTA	= 2
+
+		def field(self):
+			return self.name.lower()
+
+	payload_type: PayloadType
+	snapshot_name: str
+	snapshot_uuid: uuid.UUID
+	parent_uuid: Optional[uuid.UUID]
+
+	def __str__(self):
+		return "%s/%s" % (self.snapshot_name,
+		    			self.payload_type.field())
+
+	def __init__(self, args: EncryptedBucketOptions,
+	      		payload_type: PayloadType,
+			snapshot: Snapshot, parent: Optional[Snapshot],
+	      		backups: Backups):
+		with self.new(args, "%s/%s" % (snapshot.snapshot_name,
+						 payload_type.field()),
+				backups):
+			self.set_metadata(self.DataType.PAYLOAD_TYPE,
+		     				payload_type)
+			self.set_metadata(self.DataType.SNAPSHOT_NAME,
+		     				snapshot.snapshot_name)
+			self.set_metadata(self.DataType.SNAPSHOT_UUID,
+		     				snapshot.snapshot_uuid)
+
+			if payload_type == self.PayloadType.DELTA:
+				assert parent is not None
+				self.set_metadata(self.DataType.PARENT_UUID,
+							parent.snapshot_uuid)
+			else:
+				assert parent is None
+				self.parent_uuid = None
+
+	def setup(self, path: Optional[str] = None) -> None:
+		if path is not None:
+			self.snapshot_name, per, payload_type = \
+					path.rpartition('/')
+			if not per:
+				raise ConsistencyError(
+					f"{self.name} is missing "
+					"payload_type")
+
+			if not payload_type.islower():
+				raise ConsistencyError(
+					f"{self.name} has invalid "
+					"payload_type")
+			payload_type = payload_type.upper()
+			try:
+				self.payload_type = \
+					self.PayloadType[payload_type]
+			except KeyError:
+				raise ConsistencyError(
+					f"{self.name} has unknown "
+					f"payload_type ({payload_type})")
+		else:
+			self.payload_type = self.get_metadata(
+						self.DataType.PAYLOAD_TYPE)
+			self.snapshot_name = self.get_metadata(
+						self.DataType.SNAPSHOT_NAME)
+
+		self.snapshot_uuid = self.get_metadata(
+						self.DataType.SNAPSHOT_UUID)
+		if self.payload_type == self.PayloadType.DELTA:
+			self.parent_uuid = self.get_metadata(
+						self.DataType.PARENT_UUID)
+		elif self.has_metadata(self.DataType.PARENT_UUID):
+			raise ConsistencyError(
+				"%s[%s]: unexpected metadata"
+				% (self.name,
+					self.DataType.PARENT_UUID.field()))
+		else:
+			self.parent_uuid = None
+
+	def calc_signature(self) -> MetaBlob.Hasher:
+		hasher = super().calc_signature()
+
+		hasher.update(self.payload_type.value.to_bytes(2, "big"))
+		hasher.update(self.snapshot_name.encode())
+		hasher.update(b'\0')
+		hasher.update(self.snapshot_uuid.bytes)
+		hasher.update(ensure_uuid(self.parent_uuid).bytes)
+
+		return hasher
+
+	def get_metadata(self, data_type: MetaCipher.DataType) -> Any:
+		if data_type == self.DataType.PAYLOAD_TYPE:
+			payload_type = self.get_integer_metadata(
 					data_type, width=2)
 			try:
-				return self.BlobType(blob_type)
+				return self.PayloadType(payload_type)
 			except ValueError as ex:
 				raise SecurityError(
 					f"{self.name} has invalid "
-					f"blob_type ({blob_type})") from ex
-		elif data_type == self.DataType.BLOB_SIZE:
-			return self.get_integer_metadata(data_type)
+					f"payload_type ({payload_type})") \
+					from ex
 		elif data_type == self.DataType.SNAPSHOT_NAME:
 			return self.get_text_metadata(data_type)
 		elif data_type == self.DataType.SNAPSHOT_UUID:
@@ -2674,23 +2718,13 @@ class MetaBlob(MetaCipher): # {{{
 		elif data_type == self.DataType.PARENT_UUID:
 			return self.get_uuid_metadata(data_type)
 		else:
-			assert False
+			return super().get_metadata(data_type)
 
-	T = TypeVar("T")
 	def set_metadata(self, data_type: MetaCipher.DataType, value: T) -> T:
-		if data_type == self.DataType.SIGNATURE:
-			self.set_binary_metadata(data_type, value)
-		elif data_type == self.DataType.SUBVOLUME:
-			self.set_text_metadata(data_type, value)
-			self.subvolume = value
-		elif data_type == self.DataType.BLOB_TYPE:
+		if data_type == self.DataType.PAYLOAD_TYPE:
 			self.set_integer_metadata(data_type, value.value,
 							width=2)
-			self.blob_type = value
-		elif data_type == self.DataType.BLOB_SIZE:
-			if self.args.verify_blob_size:
-				self.set_integer_metadata(data_type, value)
-				self.blob_size = value
+			self.payload_type = value
 		elif data_type == self.DataType.SNAPSHOT_NAME:
 			if self.args.encrypt:
 				self.set_text_metadata(data_type, value)
@@ -2702,20 +2736,8 @@ class MetaBlob(MetaCipher): # {{{
 			self.set_uuid_metadata(data_type, value)
 			self.parent_uuid = value
 		else:
-			assert False
+			return super().set_metadata(data_type, value)
 		return value
-
-	def update_signature(self):
-		if self.args.encrypt and not self.args.encrypt_metadata:
-			self.set_metadata(
-					self.DataType.SIGNATURE,
-					self.calc_signature())
-
-	def sync_metadata(self):
-		if self.dirty:
-			self.update_signature()
-			self.gcs_blob.patch()
-			self.dirty = False
 # }}}
 
 # A class that reads from or writes to a wrapped file-like object, printing
@@ -3081,7 +3103,7 @@ def discover_remote_backups(args: EncryptedBucketOptions,
 	by_name = { }
 	by_uuid = Backups()
 	for blob in args.find_bucket().list_blobs(prefix=prefix):
-		blob = MetaBlob.init(args, blob)
+		blob = BackupBlob.init(args, blob)
 		if blob is None:
 			continue
 
@@ -3191,7 +3213,7 @@ def choose_snapshots(args: SelectionOptions, snapshots: Snapshots) \
 # }}}
 
 # Blob-related functions {{{
-# Write @blob_type and @blob_uuid as binary to @sys.stdout.
+# Write @blob.blob_uuid as binary to @sys.stdout.
 def write_header(blob: MetaBlob) -> Callable[[], None]:
 	def write_header():
 		# Redirect this function's stdout to stderr, so it doesn't
@@ -3213,10 +3235,9 @@ def write_header(blob: MetaBlob) -> Callable[[], None]:
 def upload_blob(args: UploadBlobOptions,
 		blob: MetaBlob, command: Sequence[str]) -> int:
 	if args.encrypt_external() and args.add_header_to_blob:
-		# Write @blob_type and @blob_uuid into the pipeline
-		# before the @command is executed.  We rely on the pipe
-		# having capacity for ~16 bytes, otherwise there will be
-		# a deadlock.
+		# Write @blob_uuid into the pipeline before the @command
+		# is executed.  We rely on the pipe having capacity for
+		# ~16 bytes, otherwise there will be a deadlock.
 		#
 		# If we're using InternalEncrypt, it will add the headers
 		# itself.
@@ -3471,12 +3492,19 @@ class CmdListLocal(CmdLeaf, CommonOptions, ShowUUIDOptions):
 def cmd_list_local(args: CmdListLocal) -> None:
 	backups = discover_remote_backups(args) if args.check_remote else None
 	for snapshot in discover_local_snapshots(args.dir).ordered:
+		line = [ ]
+		if args.show_uuid:
+			line.append(snapshot.snapshot_uuid)
+		line.append(snapshot)
+
 		if backups is None:
-			print(snapshot)
+			pass
 		elif snapshot in backups:
-			print(f"{snapshot}: present remotely")
+			line.append("(present remotely)")
 		else:
-			print(f"{snapshot}: absent remotely")
+			line.append("(absent remotely)")
+
+		print(*line)
 # }}}
 
  # The list remote subcommand {{{
@@ -3501,23 +3529,31 @@ def cmd_list_remote(args: CmdListRemote) -> None:
 	nbytes = 0
 	nbackups = 0
 	for backup in discover_remote_backups(args).ordered:
+		line = [ ]
+		if args.show_uuid:
+			line.append(backup.snapshot_uuid)
+		line.append(backup)
+
 		if snapshots is None:
-			print(backup)
+			pass
 		elif backup in snapshots:
-			print(f"{backup}: present locally")
+			line.append("(present locally)")
 		else:
-			print(f"{backup}: absent locally")
+			line.append("(absent locally)")
+
+		print(*line)
 
 		for blob in backup.all_blobs():
-			if blob.blob_type in (blob.BlobType.FULL,
-						blob.BlobType.DELTA):
+			if blob.payload_type in (
+					blob.PayloadType.FULL,
+					blob.PayloadType.DELTA):
 				nbackups += 1
 				nbytes += blob.gcs_blob.size
 
 			if args.verbose:
 				created = blob.gcs_blob \
 						.time_created.timestamp()
-				print("", blob.blob_type.field(),
+				print("", blob.payload_type.field(),
 					time.strftime("%Y-%m-%d %H:%M:%S",
 						time.localtime(created)),
 					humanize_size(blob.gcs_blob.size),
@@ -3773,7 +3809,7 @@ def cmd_delete_remote(args: CmdDeleteRemote) -> None:
 		# 		elif not restorable from @backup.delta:
 		# 			delete @backup.delta (broken)
 		# }}}
-		which_to_delete: list[tuple[Optional[MetaBlob], str]] = [ ]
+		which_to_delete: list[tuple[Optional[BackupBlob], str]] = [ ]
 		if args.force_all or backup in snapshots:
 			# --force or --force-all
 			reason = "snapshot is present locally" \
@@ -3804,10 +3840,7 @@ def cmd_delete_remote(args: CmdDeleteRemote) -> None:
 			ndeleted += 1
 			deleted_bytes += blob.gcs_blob.size
 
-			details = [ ]
-			if args.show_uuid:
-				details.append(str(backup.snapshot_uuid))
-			details.append(humanize_size(blob.gcs_blob.size))
+			details = [ humanize_size(blob.gcs_blob.size) ]
 			if reason is not None:
 				details.append(reason)
 			details = ", ".join(details)
@@ -3835,6 +3868,230 @@ def cmd_delete_remote(args: CmdDeleteRemote) -> None:
 			% (woulda(args, "deleted"), ndeleted,
 				humanize_size(deleted_bytes)))
 	else:
+		print("Would not have deleted anything.")
+# }}}
+
+ # The index list subcommand {{{
+class CmdListIndex(CmdLeaf, IndexSelectionOptions, ListRemoteOptions):
+	cmd = "list"
+	help = "TODO"
+
+	def execute(self) -> None:
+		cmd_list_index(self)
+
+def cmd_list_index(args: CmdListIndex) -> None:
+	backups = discover_remote_backups(args, keep_index_only=True)
+
+	nbytes = 0
+	nindexes = 0
+	for backup in backups.ordered:
+		orphaned = backup.orphaned()
+		if args.orphaned and not orphaned:
+			continue
+
+		if orphaned and not args.orphaned:
+			print(f"{backup}: orphaned")
+		else:
+			print(backup)
+
+		nindexes += 1
+		nbytes += backup.index.gcs_blob.size
+
+		if args.verbose:
+			created = backup.index.gcs_blob \
+					.time_created.timestamp()
+			print("",
+				time.strftime("%Y-%m-%d %H:%M:%S",
+					time.localtime(created)),
+				humanize_size(backup.index.gcs_blob.size),
+				sep="\t")
+
+	if args.verbose and nindexes > 1:
+		print()
+		print("%d indexes in %s." % (nindexes, humanize_size(nbytes)))
+# }}}
+
+# The index get subcommand {{{
+class CmdGetIndex(CmdLeaf, CommonOptions, DownloadBlobOptions,
+			SelectionOptions):
+	cmd = "get"
+	help = "TODO"
+
+	selection_section = "indexsel"
+
+	output: Optional[str] = None
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["transfer"]
+		section.add_argument("--output", "-o")
+
+		self.add_dir()
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+
+		if args.output is not None and args.output != '-':
+			self.output = args.output
+
+	def post_validate(self, args: argparse.Namespace) -> None:
+		super().post_validate(args)
+
+		if self.output is None:
+			self.progress = None
+
+	def execute(self) -> None:
+		cmd_get_index(self)
+
+def cmd_get_index(args: CmdGetIndex) -> None:
+	backups = discover_remote_backups(args, keep_index_only=True)
+
+	# Figure out what @to_retrieve.
+	to_retrieve = choose_snapshots(args, backups)
+	if not to_retrieve:
+		print("Nothing to retrieve.",
+			file=sys.stderr if self.output is None else sys.stdout)
+		return
+
+	output_dir = output = None
+	if args.output is not None:
+		print("Retrieving the index of:")
+		for i in to_retrieve:
+			print(f"  {backups[i]}")
+		print()
+
+		try:
+			output = open(args.output, 'w')
+		except IsADirectoryError:
+			output_dir = args.output
+	else:	# sys.stdout is text, but the index could be binary.
+		# Just pass it through.
+		output = os.fdopen(sys.stdout.fileno(), "wb", closefd=False)
+
+	bytes_transferred = 0
+	started = time.monotonic()
+	for i in to_retrieve:
+		backup = backups[i]
+		assert backup.index is not None
+
+		if args.output is not None:
+			# @output is not sys.stdout.
+			print(f"Retrieving {backup}'s index...",
+				end="", flush=True)
+		try:
+			if output_dir is not None:
+				assert output is None
+				output_fname = f"{backup.snapshot_name}.lst"
+				output_path = \
+					os.path.join(output_dir, output_fname)
+				output = open(output_path, 'w')
+
+			bytes_transferred += download_blob(
+						args, backup.index,
+						pipeline_stdout=output)
+
+			if output_dir is not None:
+				output.close()
+				output = None
+		finally:
+			if args.output is not None:
+				print()
+
+	if output is not None:
+		output.close()
+
+	if len(to_retrieve) > 1 and args.output is not None:
+		duration = time.monotonic() - started
+
+		print()
+		print("Retrieved %d indexes (%s) in %s."
+			% (len(to_retrieve),
+				humanize_size(bytes_transferred),
+				humanize_duration(duration)))
+# }}}
+
+# The index delete subcommand {{{
+class CmdDeleteIndex(CmdLeaf, DeleteOptions, IndexSelectionOptions):
+	cmd = "delete"
+	help = "TODO"
+
+	bucket_required = True
+	selection_section = "indexsel"
+
+	force: bool = False
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["force"]
+		section.add_enable_flag("--force")
+
+		self.add_dir()
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+
+		if self.orphaned and self.exact:
+			raise self.CmdLineError(
+				"cannot specify --exact with --orphaned")
+
+		self.force = args.force
+
+	def execute(self) -> None:
+		cmd_delete_index(self)
+
+def cmd_delete_index(args: CmdDeleteIndex) -> None:
+	snapshots = discover_local_snapshots(args.dir) \
+			if not args.force else None
+
+	backups = discover_remote_backups(args, keep_index_only=True)
+	if args.orphaned:
+		filter_dict(backups, lambda backup: backup.orphaned())
+
+	# Figure out what @to_delete.
+	to_delete = choose_snapshots(args, backups)
+	if not to_delete:
+		print("Nothing to delete.")
+		return
+
+	print("Considering to delete the indexes of:")
+	for i in to_delete:
+		print(f"  {backups[i]}")
+	print()
+
+	# Delete indexes.
+	ndeleted = 0
+	deleted_bytes = 0
+	for i in to_delete:
+		backup = backups[i]
+		blob = backup.index
+		assert blob is not None
+
+		if snapshots is not None and backup not in snapshots:
+			print(f"{backup} is not present locally.")
+			continue
+
+		ndeleted += 1
+		deleted_bytes += blob.gcs_blob.size
+		details = humanize_size(blob.gcs_blob.size)
+
+		if args.dry_run:
+			print(f"Would delete {blob} ({details}).")
+			continue
+
+		print(f"Deleting {blob} ({details})...")
+		blob.gcs_blob.delete()
+		backup.clear_blob(blob)
+
+	if ndeleted > 0:
+		print()
+		print("%s %d indexes (%s)."
+			% (woulda(args, "deleted"), ndeleted,
+				humanize_size(deleted_bytes)))
+	else:
+		if to_delete:
+			print()
 		print("Would not have deleted anything.")
 # }}}
 
@@ -3905,8 +4162,8 @@ def upload_index(args: CmdUpload, snapshot: Snapshot, backups: Backups) \
 		if backup is not None and backup.index is not None:
 			blob = backup.index
 		else:
-			blob = MetaBlob(args, MetaBlob.BlobType.INDEX,
-					snapshot, None)
+			blob = BackupBlob(args, BackupBlob.PayloadType.INDEX,
+						snapshot, None, backups)
 
 		# Substitute {snapshot_dir} and {index_fmt} in args.indexer.
 		snapshot_dir = os.path.join(args.dir, snapshot.snapshot_name)
@@ -3938,8 +4195,8 @@ def upload_full(args: CmdUpload, snapshot: Snapshot, backups: Backups) -> int:
 		if backup is not None and backup.full is not None:
 			blob = backup.full
 		else:
-			blob = MetaBlob(args, MetaBlob.BlobType.FULL,
-					snapshot, None)
+			blob = BackupBlob(args, BackupBlob.PayloadType.FULL,
+						snapshot, None, backups)
 
 		cmd = ("btrfs", "-q", "send", os.path.join(
 			args.dir, snapshot.snapshot_name))
@@ -3960,8 +4217,8 @@ def upload_delta(args: CmdUpload, snapshot: Snapshot, parent: Snapshot,
 		if backup is not None and backup.delta is not None:
 			blob = backup.delta
 		else:
-			blob = MetaBlob(args, MetaBlob.BlobType.DELTA,
-					snapshot, parent)
+			blob = BackupBlob(args, BackupBlob.PayloadType.DELTA,
+						snapshot, parent, backups)
 
 		cmd = ("btrfs", "-q", "send",
 			"-p", os.path.join(args.dir, parent.snapshot_name),
@@ -4217,7 +4474,7 @@ def download_backup(args: CmdDownload, fname: str,
 	if not args.wet_run:
 		# We'll need to parse @btrfs_recv's output.
 		btrfs_recv = { "args": btrfs_recv }
-		if blob.blob_type == blob.BlobType.FULL:
+		if blob.payload_type == blob.PayloadType.FULL:
 			# @btrfs_recv prints "At subvol ..." on stderr.
 			btrfs_recv["stderr"] = subprocess.PIPE
 		else:	# @btrfs_recv prints "At snapshot ..." on stdout.
@@ -4239,7 +4496,7 @@ def download_backup(args: CmdDownload, fname: str,
 		assert len(pipeline) > 0
 
 		# The message is different if we restore from delta or not.
-		if blob.blob_type == blob.BlobType.FULL:
+		if blob.payload_type == blob.PayloadType.FULL:
 			fin = pipeline[-1].stderr
 			fout = sys.stderr
 			pattern = re.compile("^At subvol (.+)\n")
@@ -4445,234 +4702,35 @@ def cmd_download(args: CmdDownload) -> None:
 		print("%s." % ' '.join(msg))
 # }}}
 
- # The index list subcommand {{{
-class CmdListIndex(CmdLeaf, IndexSelectionOptions, ListRemoteOptions):
-	cmd = "list"
+class CmdFTP(CmdLineCommand):
+	cmd = "ftp"
 	help = "TODO"
 
-	def execute(self) -> None:
-		cmd_list_index(self)
+	def get_subcommands(self) -> Sequence[CmdLineCommand]:
+		return (CmdFTPGet(),)
 
-def cmd_list_index(args: CmdListIndex) -> None:
-	backups = discover_remote_backups(args, keep_index_only=True)
-
-	nbytes = 0
-	nindexes = 0
-	for backup in backups.ordered:
-		orphaned = backup.orphaned()
-		if args.orphaned and not orphaned:
-			continue
-
-		if orphaned and not args.orphaned:
-			print(f"{backup}: orphaned")
-		else:
-			print(backup)
-
-		nindexes += 1
-		nbytes += backup.index.gcs_blob.size
-
-		if args.verbose:
-			created = backup.index.gcs_blob \
-					.time_created.timestamp()
-			print("",
-				time.strftime("%Y-%m-%d %H:%M:%S",
-					time.localtime(created)),
-				humanize_size(backup.index.gcs_blob.size),
-				sep="\t")
-
-	if args.verbose and nindexes > 1:
-		print()
-		print("%d indexes in %s." % (nindexes, humanize_size(nbytes)))
-# }}}
-
-# The index get subcommand {{{
-class CmdGetIndex(CmdLeaf, CommonOptions, DownloadBlobOptions,
-			SelectionOptions):
+class CmdFTPGet(CmdLeaf, CommonOptions, DownloadBlobOptions):
 	cmd = "get"
 	help = "TODO"
 
-	selection_section = "indexsel"
-
-	output: Optional[str] = None
-
-	def declare_arguments(self) -> None:
-		super().declare_arguments()
-
-		section = self.sections["transfer"]
-		section.add_argument("--output", "-o")
-
-		self.add_dir()
-
-	def pre_validate(self, args: argparse.Namespace) -> None:
-		super().pre_validate(args)
-
-		if args.output is not None and args.output != '-':
-			self.output = args.output
-
-	def post_validate(self, args: argparse.Namespace) -> None:
-		super().post_validate(args)
-
-		if self.output is None:
-			self.progress = None
-
-	def execute(self) -> None:
-		cmd_get_index(self)
-
-def cmd_get_index(args: CmdGetIndex) -> None:
-	backups = discover_remote_backups(args, keep_index_only=True)
-
-	# Figure out what @to_retrieve.
-	to_retrieve = choose_snapshots(args, backups)
-	if not to_retrieve:
-		print("Nothing to retrieve.",
-			file=sys.stderr if self.output is None else sys.stdout)
-		return
-
-	output_dir = output = None
-	if args.output is not None:
-		print("Retrieving the index of:")
-		for i in to_retrieve:
-			print(f"  {backups[i]}")
-		print()
-
-		try:
-			output = open(args.output, 'w')
-		except IsADirectoryError:
-			output_dir = args.output
-	else:	# sys.stdout is text, but the index could be binary.
-		# Just pass it through.
-		output = os.fdopen(sys.stdout.fileno(), "wb", closefd=False)
-
-	bytes_transferred = 0
-	started = time.monotonic()
-	for i in to_retrieve:
-		backup = backups[i]
-		assert backup.index is not None
-
-		if args.output is not None:
-			# @output is not sys.stdout.
-			print(f"Retrieving {backup}'s index...",
-				end="", flush=True)
-		try:
-			if output_dir is not None:
-				assert output is None
-				output_fname = f"{backup.snapshot_name}.lst"
-				output_path = \
-					os.path.join(output_dir, output_fname)
-				output = open(output_path, 'w')
-
-			bytes_transferred += download_blob(
-						args, backup.index,
-						pipeline_stdout=output)
-
-			if output_dir is not None:
-				output.close()
-				output = None
-		finally:
-			if args.output is not None:
-				print()
-
-	if output is not None:
-		output.close()
-
-	if len(to_retrieve) > 1 and args.output is not None:
-		duration = time.monotonic() - started
-
-		print()
-		print("Retrieved %d indexes (%s) in %s."
-			% (len(to_retrieve),
-				humanize_size(bytes_transferred),
-				humanize_duration(duration)))
-# }}}
-
-# The index delete subcommand {{{
-class CmdDeleteIndex(CmdLeaf, DeleteOptions, IndexSelectionOptions):
-	cmd = "delete"
-	help = "TODO"
-
-	bucket_required = True
-	selection_section = "indexsel"
-
-	force: bool = False
+	remote: list[str]
+	local: Optional[str]
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
-		section = self.sections["force"]
-		section.add_enable_flag("--force")
-
-		self.add_dir()
+		self.sections["positional"].add_argument("files", nargs='+')
 
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
 
-		if self.orphaned and self.exact:
-			raise self.CmdLineError(
-				"cannot specify --exact with --orphaned")
-
-		self.force = args.force
+		self.local = args.files.pop() if len(args.files) > 1 else None
+		self.remote = args.files
 
 	def execute(self) -> None:
-		cmd_delete_index(self)
-
-def cmd_delete_index(args: CmdDeleteIndex) -> None:
-	snapshots = discover_local_snapshots(args.dir) \
-			if not args.force else None
-
-	backups = discover_remote_backups(args, keep_index_only=True)
-	if args.orphaned:
-		filter_dict(backups, lambda backup: backup.orphaned())
-
-	# Figure out what @to_delete.
-	to_delete = choose_snapshots(args, backups)
-	if not to_delete:
-		print("Nothing to delete.")
-		return
-
-	print("Considering to delete the indexes of:")
-	for i in to_delete:
-		print(f"  {backups[i]}")
-	print()
-
-	# Delete indexes.
-	ndeleted = 0
-	deleted_bytes = 0
-	for i in to_delete:
-		backup = backups[i]
-		blob = backup.index
-		assert blob is not None
-
-		if snapshots is not None and backup not in snapshots:
-			print(f"{backup} is not present locally.")
-			continue
-
-		ndeleted += 1
-		deleted_bytes += blob.gcs_blob.size
-
-		details = [ ]
-		if args.show_uuid:
-			details.append(str(backup.snapshot_uuid))
-		details.append(humanize_size(blob.gcs_blob.size))
-		details = ", ".join(details)
-
-		if args.dry_run:
-			print(f"Would delete {blob} ({details}).")
-			continue
-
-		print(f"Deleting {blob} ({details})...")
-		blob.gcs_blob.delete()
-		backup.clear_blob(blob)
-
-	if ndeleted > 0:
-		print()
-		print("%s %d indexes (%s)."
-			% (woulda(args, "deleted"), ndeleted,
-				humanize_size(deleted_bytes)))
-	else:
-		if to_delete:
-			print()
-		print("Would not have deleted anything.")
-# }}}
+		print(self.remote)
+		print(self.local)
+		pass
 
 # Non-leaf-level subcommands {{{
 class CmdList(CmdLineCommand):
@@ -4701,8 +4759,8 @@ class CmdTop(CmdLineCommand):
 	description = "TODO"
 
 	def get_subcommands(self) -> Sequence[CmdLineCommand]:
-		return (CmdList(), CmdDelete(), CmdUpload(), CmdDownload(),
-			CmdIndex())
+		return (CmdList(), CmdDelete(), CmdIndex(),
+	  		CmdUpload(), CmdDownload(), CmdFTP())
 
 	def parse(self) -> CmdLeaf:
 		parser = argparse.ArgumentParser(
