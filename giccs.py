@@ -1,6 +1,10 @@
 #!/usr/bin/python3
 #
 # TODO: {{{
+# args -> self
+# DirEnt.volatile -> obj?
+# maybe load glob2 on-demand
+#
 # consistency check of remote backups
 # calculate/verify hash?
 #
@@ -8,14 +12,11 @@
 # consider using clone sources when uploading
 #
 # CmdFTPGet, CmdFTPPut: DryRunOptions, WetRunOptions, AutodeleteOptions?
+# CmdFTPGet: --no-keep-mtime
 #
-# globbing
-# cd, pwd
-# lcd, lpwd
-# !shell
-# dir, get, put
-# cat [-c <bytes>]
-# rm [-r]
+# tabbing?
+# get, put
+# cat [-c <bytes>], page?
 # mv [--dir/--fname]
 # mkdir, rmdir?
 #
@@ -39,6 +40,7 @@
 #   * storage.objects.list
 #   * storage.objects.get
 # document the use of gpg-agent
+# document dependency on python3-glob2
 #
 # protect against:
 #   * blob swapping: header
@@ -51,22 +53,23 @@
 # Modules {{{
 from __future__ import annotations
 
-from typing import	TypeVar, Final, Protocol, \
-			Any, Union, Optional, \
-			Generator, Iterable, Callable, \
+from typing import	TypeVar, Protocol, Self, \
+			Any, Union, Optional, Final, \
+			Generator, Iterator, Iterable, Callable, \
 			Container, Collection, Sequence, \
-			BinaryIO, ByteString
+			TextIO, BinaryIO, ByteString
 
 import sys, os
-import io, fcntl
+import io, fcntl, stat
 import subprocess
+import pathlib, glob2
 import time, datetime
 import re, bisect, uuid
 import base64, binascii
 import random, secrets
 import argparse, configparser
 import enum, dataclasses, struct
-import contextlib
+import contextlib, functools
 
 import btrfs
 
@@ -252,6 +255,21 @@ class CmdLineOptions: # {{{
 		def add_disable_flag_no_dflt(self, *flags, **kw) -> None:
 			self.add_disable_flag(*flags, **kw, default=None)
 
+		# Called by CmdLineOptions.remove_argument() to remove an
+		# argument from @self.options if it's declared in this section.
+		def remove_argument(self, flag: str) -> bool:
+			for i, option in enumerate(self.options):
+				if isinstance(option, CmdLineOptions.Mutex):
+					if option.remove_argument(flag):
+						return True
+				elif flag in option[0]:
+					break
+			else:
+				return False
+
+			del self.options[i]
+			return True
+
 		# Called by CmdLineOptions.add_arguments() to add @self.options
 		# to @parser.
 		def add_arguments(self, parser: argparse.ArgumentParser) \
@@ -295,6 +313,9 @@ class CmdLineOptions: # {{{
 
 	# The positional argument.  Can be set by pre_validate() of subclasses.
 	dir: Optional[str] = None
+
+	# Has setup() been called?
+	_setup: bool = False
 
 	# Set by override_flags() and used by __getattribute__().
 	_overrides: Optional[dict[str, Any]] = None
@@ -546,6 +567,13 @@ class CmdLineOptions: # {{{
 		return lst
 
 	# Public methods.
+	# Remove a previously declared argument.
+	def remove_argument(self, flag: str) -> bool:
+		for section in self.sections.values():
+			if section.remove_argument(flag):
+				return True
+		return False
+
 	# Add the options declared in @self.sections to @parser.
 	def add_arguments(self, parser: argparse.ArgumentParser) -> None:
 		for section in self.sections.values():
@@ -553,6 +581,10 @@ class CmdLineOptions: # {{{
 
 	# Set up the object state from command-line arguments.
 	def setup(self, args: argparse.Namespace) -> None:
+		if self._setup:
+			return
+		self._setup = True
+
 		self.pre_validate(args)
 		self.load_config()
 		self.post_validate(args)
@@ -571,27 +603,51 @@ class CmdLineOptions: # {{{
 # Represents a top-, sub- or leaf-level command, which may also have
 # CmdLineOptions.
 class CmdLineCommand(CmdLineOptions): # {{{
-	cmd: str
+	cmd: Union[str, Sequence[str]]
+
 	help: str
 	description: Optional[str] = None
 
-	_subcommands: Optional[Sequence["CmdLineCommand"]] = None
+	# Proxy property accesses to this object.
+	parent: Optional[CmdLineOptions] = None
 
-	def get_subcommands(self) -> Sequence["CmdLineCommand"]:
+	def __init__(self, parent: Optional[CmdLineOptions] = None):
+		super().__init__()
+		self.parent = parent
+
+	def __getattr__(self, attr: str) -> Any:
+		if self.parent is not None:
+			try:
+				return getattr(self.parent, attr)
+			except AttributeError:
+				pass
+
+		# Raise an authentic AttributeError.
+		self.__getattribute__(attr)
+		assert False
+
+	def isa(self, what: str) -> bool:
+		if isinstance(self.cmd, str):
+			return self.cmd == what
+		else:
+			return what in self.cmd
+
+	def aliases(self) -> Sequence[str]:
+		if isinstance(self.cmd, str):
+			return (self.cmd,)
+		else:
+			return self.cmd
+
+	# Subclasses should cache the list with @functools.cached_property
+	# so we have a single instance of the subcommands.
+	@property
+	def subcommands(self) -> Sequence["CmdLineCommand"]:
 		# By default commands don't have subcommands.
 		return ()
 
-	@property
-	def subcommands(self) -> Sequence["CmdLineCommand"]:
-		# Memoize self.get_subcommands(), so we have a single instance
-		# of subcommands.
-		if self._subcommands is None:
-			self._subcommands = self.get_subcommands()
-		return self._subcommands
-
 	def find_subcommand(self, cmd: str) -> CmdLineCommand:
 		for subcommand in self.subcommands:
-			if subcommand.cmd == cmd:
+			if subcommand.isa(cmd):
 				return subcommand
 		raise KeyError(f"{cmd}: subcommand not found")
 
@@ -603,9 +659,15 @@ class CmdLineCommand(CmdLineOptions): # {{{
 		super().add_arguments(parser)
 
 	def build_for_subparser(self, subparser, level: int = 1) -> None:
+		if isinstance(self.cmd, str):
+			cmd, aliases = self.cmd, ()
+		else:
+			cmd, *aliases = self.cmd
+
 		self.build_for_parser(
 				subparser.add_parser(
-					self.cmd,
+					cmd,
+					aliases=aliases,
 					help=self.help,
 					description=self.description,
 					add_help=False),
@@ -620,7 +682,7 @@ class CmdLineCommand(CmdLineOptions): # {{{
 			return
 
 		subparser = parser.add_subparsers(
-					required=True,
+					required=not isinstance(self, CmdExec),
 					metavar="subcommand",
 					dest=f"sub{level}command")
 		for subcommand in self.subcommands:
@@ -628,47 +690,95 @@ class CmdLineCommand(CmdLineOptions): # {{{
 					subparser, level + 1)
 
 	def setup(self, args: argparse.Namespace) -> None:
-		# Should only be called on leaf-level subcommands.
-		assert not self.subcommands
-		super().setup(args)
-
-	def execute(self) -> None:
-		# Leaf-level subcommand must implement it.
-		raise NotImplementedError
+		if self.parent is not None:
+			self.parent.setup(args)
+		if isinstance(self, CmdExec):
+			super().setup(args)
 # }}}
 
-# Add options common to leaf-level commands.
-class CmdLeaf(CmdLineCommand): # {{{
-	_debug: Optional[bool] = None
-
-	@property
-	def debug(self) -> bool:
-		if self._debug is not None:
-			return self._debug
-
-		debug = os.environ.get("GICCS_DEBUG")
-		if debug is None:
-			self._debug = False
-			return self._debug
-
-		try:
-			self._debug = int(debug) > 0
-		except ValueError:
-			self._debug = debug.lower() in ("true", "yes", "on")
-
-		return self._debug
-
+# An executable (usually leaf-level) subcommand.
+class CmdExec(CmdLineCommand): # {{{
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
 		section = self.sections["common"]
 		section.add_enable_flag_no_dflt("--debug")
 
-	def pre_validate(self, args: argparse.Namespace) -> None:
-		# Enable debugging as early as possible.
-		if args.debug is not None:
-			self._debug = args.debug
-		super().pre_validate(args)
+	def execute(self) -> None:
+		# Subclasses must implement it.
+		raise NotImplementedError
+# }}}
+
+# An entry point to the command line parser tree.
+class CmdTop(CmdLineCommand): # {{{
+	# Can be overridden by subclasses.
+	class ArgumentParser(argparse.ArgumentParser): pass
+
+	@functools.cached_property
+	def debug(self) -> bool:
+		debug = os.environ.get("GICCS_DEBUG")
+		if debug is None:
+			return False
+
+		try:
+			return int(debug) > 0
+		except ValueError:
+			return debug.lower() in ("true", "yes", "on")
+
+	def parse(self, cmdline: Optional[Sequence[str]] = None) -> CmdExec:
+		parser = self.ArgumentParser(
+				description=self.description,
+				add_help=False)
+		self.build_for_parser(parser)
+		args = parser.parse_args(cmdline)
+
+		if getattr(args, "debug", None):
+			# Make sure all future instances of this class
+			# has debugging enabled.
+			__class__.debug = self.debug = True
+
+		# Find which leaf-level CmdLineCommand was called.
+		cmd = self
+		level = 1
+		while True:
+			subcommand = getattr(args, f"sub{level}command", None)
+			if subcommand is None:
+				break
+			cmd = cmd.find_subcommand(subcommand)
+			level += 1
+		assert isinstance(cmd, CmdExec)
+
+		try:
+			cmd.setup(args)
+		except CmdLineOptions.CmdLineError as ex:
+			if self.debug:
+				raise
+			parser.error(ex.args[0])
+
+		return cmd
+
+	def run(self, cmdline: Optional[Sequence[str]] = None) -> bool:
+		try:
+			self.parse(cmdline).execute()
+		except KeyboardInterrupt:
+			print("Interrupted.", file=sys.stderr)
+			raise
+		except (FatalError, UserError,
+				Globber.MatchError, FileNotFoundError,
+				NotADirectoryError, IsADirectoryError) as ex:
+			if self.debug:
+				# Print the backtrace when debugging.
+				import traceback
+				traceback.print_exc()
+			else:
+				msg = ex.args
+				if isinstance(msg, (tuple, list)):
+					msg = ' '.join(map(str, msg))
+				print("%s: %s" % (type(ex).__name__, msg),
+	  				file=sys.stderr)
+			return False
+		else:
+			return True
 # }}}
 
 # Add --config and --section.  The config is actually loaded by CmdLineOptions.
@@ -1312,6 +1422,8 @@ class EncryptionOptions(CmdLineOptions): # {{{
 			"encryption_key",
 			"encryption_key_command")
 		if args.encryption_command is not None:
+			# Ensure that neither --encryption-key
+			# nor --encryption-key-command is used.
 			if args.decryption_command is None:
 				raise self.CmdLineError(
 					"--encryption-command must be used "
@@ -1321,6 +1433,8 @@ class EncryptionOptions(CmdLineOptions): # {{{
 					"encryption-command",
 					args.encryption_command)
 		if args.decryption_command is not None:
+			# For downloads it doesn't matter
+			# if --encryption-command is set.
 			if args.encryption_command is None \
 					and isinstance(
 						self, UploadBlobOptions):
@@ -1655,13 +1769,9 @@ class Backup(Snapshot): # {{{
 class Snapshots(dict[uuid.UUID, Snapshot]): # {{{
 	where: Final[str] = "locally"
 
-	_ordered: Optional[list[Snapshot]] = None
-
-	@property
+	@functools.cached_property
 	def ordered(self) -> list[Snapshot]:
-		if self._ordered is None:
-			self._ordered = sorted(self.values())
-		return self._ordered
+		return sorted(self.values())
 
 	def __contains__(self, other: Union[Snapshot, uuid.UUID]) -> bool:
 		if isinstance(other, Snapshot):
@@ -1676,11 +1786,15 @@ class Snapshots(dict[uuid.UUID, Snapshot]): # {{{
 
 	def __setitem__(self, key: uuid.UUID, val: Snapshot) -> None:
 		super().__setitem__(key, val)
-		self._ordered = None
+
+		# The property doesn't exist until it's read first.
+		try: del self.ordered
+		except AttributeError: pass
 
 	def __delitem__(self, key: uuid.UUID) -> None:
 		super().__delitem__(key)
-		self._ordered = None
+		try: del self.ordered
+		except AttributeError: pass
 
 	def add(self, snapshot: Snapshot) -> None:
 		self[snapshot.snapshot_uuid] = snapshot
@@ -1711,20 +1825,16 @@ class Snapshots(dict[uuid.UUID, Snapshot]): # {{{
 class Backups(Snapshots): # {{{
 	where: Final[str] = "remotely"
 
-	_blobs: Optional[dict[uuid.UUID, BackupBlob]] = None
-
-	@property
+	@functools.cached_property
 	def blobs(self) -> dict[uuid.UUID, BackupBlob]:
 		# This method is only supposed to be called if encryption
 		# is on, so all blobs should have a @blob.blob_uuid.
-		if self._blobs is None:
-			self._blobs = {
-				blob.blob_uuid: blob
-				for backup in self.values()
-				for blob in backup.all_blobs()
-				if blob.blob_uuid is not None
-			}
-		return self._blobs
+		return {
+			blob.blob_uuid: blob
+			for backup in self.values()
+			for blob in backup.all_blobs()
+			if blob.blob_uuid is not None
+		}
 
 	# Does the Backup identified by its UUID or any of its parents have
 	# a full backup?
@@ -2093,11 +2203,10 @@ class MetaCipher: # {{{
 		PAYLOAD		= 0
 		SIGNATURE	= 1
 		SUBVOLUME	= 2
-		BLOB_SIZE	= 3
-		PAYLOAD_TYPE	= 4
-		SNAPSHOT_NAME	= 5
-		SNAPSHOT_UUID	= 6
-		PARENT_UUID	= 7
+		BLOB_PATH	= 3
+		BLOB_SIZE	= 4
+		SNAPSHOT_UUID	= 5
+		PARENT_UUID	= 6
 
 		def field(self):
 			return self.name.lower()
@@ -2261,6 +2370,8 @@ class MetaCipher: # {{{
 
 # A GCS blob with metadata.
 class MetaBlob(MetaCipher): # {{{
+	T = TypeVar("MetaBlobType", bound=Self)
+
 	# hashlib doesn't define an abstract base class, let's have our own.
 	class Hasher(Protocol):
 		def update(self, data: bytes) -> None:
@@ -2271,7 +2382,7 @@ class MetaBlob(MetaCipher): # {{{
 
 	gcs_blob: google.cloud.storage.Blob
 
-	subvolume: str
+	blob_path: str
 	blob_size: Optional[int]
 
 	# Whether metadata has changed.
@@ -2280,6 +2391,10 @@ class MetaBlob(MetaCipher): # {{{
 	@property
 	def name(self) -> str:
 		return self.gcs_blob.name
+
+	@property
+	def subvolume(self) -> str:
+		return self.args.subvolume
 
 	def __init__(self):
 		raise AssertionError(
@@ -2305,27 +2420,35 @@ class MetaBlob(MetaCipher): # {{{
 				blob_name = f"{args.prefix}/{blob_name}"
 
 			self.gcs_blob = args.bucket.blob(blob_name)
-			if not args.encrypt_metadata:
+			if not args.encrypt:
+				assert self.blob_uuid is None
 				break
 			elif backups is not None \
 					and self.blob_uuid in backups.blobs:
 				# The generated @self.blob_uuid conflicts
 				# with an existing one.
 				continue
-			elif backups is None and self.gcs_blob.exists():
+			elif backups is None and args.encrypt_metadata \
+					and self.gcs_blob.exists():
 				# Likewise.
 				continue
 			else:
 				break
 
+		self.set_metadata(self.DataType.SUBVOLUME, self.subvolume)
+		self.set_metadata(self.DataType.BLOB_PATH, path)
 		self.blob_size = None
-		self.set_metadata(self.DataType.SUBVOLUME, args.subvolume)
 
 		# Return control to the caller.
 		yield
 
 		self.update_signature()
 		self.dirty = False
+
+	# Shouldn't be called from subclasses.
+	def __init__(self, args: EncryptedBucketOptions, path: str):
+		with self.new(args, path):
+			pass
 
 	@classmethod
 	def init(cls: type[T], args: EncryptedBucketOptions,
@@ -2346,29 +2469,34 @@ class MetaBlob(MetaCipher): # {{{
 
 		signature = None
 		if args.encrypt_metadata:
-			blob_uuid, path = prefixless, None
+			blob_uuid = prefixless
 			try:
 				self.blob_uuid = uuid.UUID(blob_uuid)
 			except ValueError as ex:
 				raise ConsistencyError(
 					f"{self.name} has invalid UUID "
 					f"({blob_uuid})") from ex
+
+			self.blob_path = self.get_metadata(
+						self.DataType.BLOB_PATH)
+		elif args.encrypt:
+			# Retrieving the metadata should set @self.blob_uuid.
+			# It's safe to use an encrypted hash as a MAC as long
+			# as the underlying cipher is non-malleable, which is
+			# the case with InternalCipher, being AEAD.
+			signature = self.get_metadata(self.DataType.SIGNATURE)
+			assert self.blob_uuid is not None
+
+			self.blob_path = self.get_metadata(
+						self.DataType.BLOB_PATH)
+			if prefixless != self.blob_path:
+				raise SecurityError(
+					"%s has unexpected path, should be %s"
+					% (self.name, self.blob_path))
 		else:
-			path = prefixless
-			if args.encrypt:
-				# Retrieving the metadata should set
-				# @self.blob_uuid.  It's safe to use
-				# an encrypted hash as a MAC as long as
-				# the underlying cipher is non-malleable,
-				# which is the case with InternalCipher,
-				# being AEAD.
-				signature = self.get_metadata(
-						self.DataType.SIGNATURE)
-				assert self.blob_uuid is not None
+			self.blob_path = prefixless
 
-		self.setup(path)
-
-		self.subvolume = self.get_metadata(self.DataType.SUBVOLUME)
+		self.setup()
 
 		if args.verify_blob_size or self.has_metadata(
 						self.DataType.BLOB_SIZE):
@@ -2394,12 +2522,16 @@ class MetaBlob(MetaCipher): # {{{
 
 		# Return None if @gcs_blob doesn't belong to the backups
 		# of @args.subsystem after all.
-		if self.subvolume != args.subvolume:
+		if self.get_metadata(self.DataType.SUBVOLUME) \
+				!= self.subvolume:
 			return None
 		return self
 
-	def setup(self, path: Optional[str] = None) -> None:
+	def setup(self) -> None:
 		pass
+
+	def __str__(self):
+		return self.blob_path
 
 	def calc_signature(self) -> Hasher:
 		import hashlib
@@ -2407,7 +2539,10 @@ class MetaBlob(MetaCipher): # {{{
 		# SHA-256 is fast and secure.
 		hasher = hashlib.sha256()
 
-		hasher.update(self.args.subvolume.encode())
+		hasher.update(self.subvolume.encode())
+		hasher.update(b'\0')
+
+		hasher.update(self.blob_path.encode())
 		hasher.update(b'\0')
 
 		blob_size = self.blob_size if self.blob_size is not None else 0
@@ -2575,6 +2710,8 @@ class MetaBlob(MetaCipher): # {{{
 			return self.get_binary_metadata(data_type)
 		elif data_type == self.DataType.SUBVOLUME:
 			return self.get_text_metadata(data_type)
+		elif data_type == self.DataType.BLOB_PATH:
+			return self.get_text_metadata(data_type)
 		elif data_type == self.DataType.BLOB_SIZE:
 			return self.get_integer_metadata(data_type)
 		else:
@@ -2585,7 +2722,13 @@ class MetaBlob(MetaCipher): # {{{
 			self.set_binary_metadata(data_type, value)
 		elif data_type == self.DataType.SUBVOLUME:
 			self.set_text_metadata(data_type, value)
-			self.subvolume = value
+		elif data_type == self.DataType.BLOB_PATH:
+			# If not @self.args.encrypt, this is redundant.
+			# Otherwise if not @self.args.encrypt_metadata,
+			# it's still validated.
+			if self.args.encrypt:
+				self.set_text_metadata(data_type, value)
+			self.blob_path = value
 		elif data_type == self.DataType.BLOB_SIZE:
 			if self.args.verify_blob_size:
 				self.set_integer_metadata(data_type, value)
@@ -2623,10 +2766,6 @@ class BackupBlob(MetaBlob): # {{{
 	snapshot_uuid: uuid.UUID
 	parent_uuid: Optional[uuid.UUID]
 
-	def __str__(self):
-		return "%s/%s" % (self.snapshot_name,
-		    			self.payload_type.field())
-
 	def __init__(self, args: EncryptedBucketOptions,
 	      		payload_type: PayloadType,
 			snapshot: Snapshot, parent: Optional[Snapshot],
@@ -2634,13 +2773,8 @@ class BackupBlob(MetaBlob): # {{{
 		with self.new(args, "%s/%s" % (snapshot.snapshot_name,
 						 payload_type.field()),
 				backups):
-			self.set_metadata(self.DataType.PAYLOAD_TYPE,
-		     				payload_type)
-			self.set_metadata(self.DataType.SNAPSHOT_NAME,
-		     				snapshot.snapshot_name)
 			self.set_metadata(self.DataType.SNAPSHOT_UUID,
 		     				snapshot.snapshot_uuid)
-
 			if payload_type == self.PayloadType.DELTA:
 				assert parent is not None
 				self.set_metadata(self.DataType.PARENT_UUID,
@@ -2649,32 +2783,25 @@ class BackupBlob(MetaBlob): # {{{
 				assert parent is None
 				self.parent_uuid = None
 
-	def setup(self, path: Optional[str] = None) -> None:
-		if path is not None:
-			self.snapshot_name, per, payload_type = \
-					path.rpartition('/')
-			if not per:
-				raise ConsistencyError(
-					f"{self.name} is missing "
-					"payload_type")
+	def setup(self) -> None:
+		self.snapshot_name, per, payload_type = \
+				self.blob_path.rpartition('/')
+		if not per:
+			raise ConsistencyError(
+				f"{self.name}'s path is missing "
+				"payload type")
 
-			if not payload_type.islower():
-				raise ConsistencyError(
-					f"{self.name} has invalid "
-					"payload_type")
-			payload_type = payload_type.upper()
-			try:
-				self.payload_type = \
-					self.PayloadType[payload_type]
-			except KeyError:
-				raise ConsistencyError(
-					f"{self.name} has unknown "
-					f"payload_type ({payload_type})")
-		else:
-			self.payload_type = self.get_metadata(
-						self.DataType.PAYLOAD_TYPE)
-			self.snapshot_name = self.get_metadata(
-						self.DataType.SNAPSHOT_NAME)
+		if not payload_type.islower():
+			raise ConsistencyError(
+				f"{self.name}'s path has invalid "
+				f"payload type ({payload_type})")
+		payload_type = payload_type.upper()
+		try:
+			self.payload_type = self.PayloadType[payload_type]
+		except KeyError:
+			raise ConsistencyError(
+				f"{self.name} has unknown "
+				f"payload type ({payload_type})")
 
 		self.snapshot_uuid = self.get_metadata(
 						self.DataType.SNAPSHOT_UUID)
@@ -2692,28 +2819,13 @@ class BackupBlob(MetaBlob): # {{{
 	def calc_signature(self) -> MetaBlob.Hasher:
 		hasher = super().calc_signature()
 
-		hasher.update(self.payload_type.value.to_bytes(2, "big"))
-		hasher.update(self.snapshot_name.encode())
-		hasher.update(b'\0')
 		hasher.update(self.snapshot_uuid.bytes)
 		hasher.update(ensure_uuid(self.parent_uuid).bytes)
 
 		return hasher
 
 	def get_metadata(self, data_type: MetaCipher.DataType) -> Any:
-		if data_type == self.DataType.PAYLOAD_TYPE:
-			payload_type = self.get_integer_metadata(
-					data_type, width=2)
-			try:
-				return self.PayloadType(payload_type)
-			except ValueError as ex:
-				raise SecurityError(
-					f"{self.name} has invalid "
-					f"payload_type ({payload_type})") \
-					from ex
-		elif data_type == self.DataType.SNAPSHOT_NAME:
-			return self.get_text_metadata(data_type)
-		elif data_type == self.DataType.SNAPSHOT_UUID:
+		if data_type == self.DataType.SNAPSHOT_UUID:
 			return self.get_uuid_metadata(data_type)
 		elif data_type == self.DataType.PARENT_UUID:
 			return self.get_uuid_metadata(data_type)
@@ -2721,15 +2833,7 @@ class BackupBlob(MetaBlob): # {{{
 			return super().get_metadata(data_type)
 
 	def set_metadata(self, data_type: MetaCipher.DataType, value: T) -> T:
-		if data_type == self.DataType.PAYLOAD_TYPE:
-			self.set_integer_metadata(data_type, value.value,
-							width=2)
-			self.payload_type = value
-		elif data_type == self.DataType.SNAPSHOT_NAME:
-			if self.args.encrypt:
-				self.set_text_metadata(data_type, value)
-			self.snapshot_name = value
-		elif data_type == self.DataType.SNAPSHOT_UUID:
+		if data_type == self.DataType.SNAPSHOT_UUID:
 			self.set_uuid_metadata(data_type, value)
 			self.snapshot_uuid = value
 		elif data_type == self.DataType.PARENT_UUID:
@@ -2855,15 +2959,21 @@ class OpenDir: # {{{
 # A chain of subprocesses.  When the Pipeline is deleted, its subprocesses
 # are killed.
 class Pipeline: # {{{
-	StdioType = Union[None, int, io.IOBase]
+	# Allow it to be an int for subprocess.PIPE and DEVNULL.
+	StdioType = Union[int, io.IOBase]
 
-	_stdin: StdioType
-	_stdout: StdioType
+	_stdin: Optional[StdioType]
+	_stdout: Optional[StdioType]
 
 	def __init__(self,
 			cmds: Sequence[Union[Sequence[str], dict[str, Any]]],
-			stdin: StdioType = subprocess.DEVNULL,
-			stdout: StdioType = None):
+			stdin: Optional[StdioType] = subprocess.DEVNULL,
+			stdout: Optional[StdioType] = None):
+		if isinstance(stdin, int):
+			assert stdin < 0
+		if isinstance(stdout, int):
+			assert stdout < 0
+
 		self.processes = [ ]
 		for i, cmd in enumerate(cmds):
 			if not self.processes:
@@ -2938,6 +3048,290 @@ class Pipeline: # {{{
 			raise FatalError("\n".join(errors))
 # }}}
 
+# glob.glob() on steroids.
+class Globber(glob2.Globber): # {{{
+	# Raised by glob() when it finds no or too many matches unexpectedly.
+	class MatchError(Exception): pass
+
+	# List of globbing metacharacters.
+	GLOBBING = ('?', '*', '[', ']')
+
+	# The GLOBBING characters may be escaped like this in patterns.
+	escaped = re.compile(r"\\(.)")
+
+	def has_magic(self, pattern: str) -> bool:
+		# Remove the escaped metacharacters from the @pattern
+		# to make glob2.has_magic() more accurate.
+		return glob2.has_magic(self.escaped.sub("", pattern))
+
+	def must_exist(self, path: str) -> None:
+		os.stat(path)
+
+	# If @at_least_one and @at_most_one, return a single string.
+	def glob(self, pattern: str,
+			at_least_one: bool = True,
+	  		must_exist: bool = True,
+			at_most_one: bool = False) -> Union[Iterable[str], str]:
+		def subst(m: re.Match) -> str:
+			# This is how to escape metacharacters for glob2.glob().
+			c = m.group(1)
+			return f"[{c}]" if c in self.GLOBBING else c
+		matches = super().iglob(self.escaped.sub(subst, pattern))
+
+		if not at_least_one and not at_most_one:
+			# We can return the iterator directly.
+			return matches
+
+		matches = list(matches)
+		if at_least_one and not matches:
+			if self.has_magic(pattern):
+				raise self.MatchError(f"{pattern}: no matches")
+			elif must_exist:
+				# Raise the appropriate exception.
+				self.must_exist(pattern)
+				assert False
+			elif at_most_one:
+				return pattern
+			else:
+				return (pattern,)
+		elif at_most_one and len(matches) > 1:
+			raise self.MatchError(f"{pattern}: too many matches")
+
+		if at_least_one and at_most_one:
+			assert len(matches) == 1
+			return matches[0]
+		else:
+			return matches
+
+	def globs(self, patterns: Iterable[str], **kw) -> Iterable[str]:
+		for pattern in patterns:
+			matches = self.glob(pattern, **kw)
+			if isinstance(matches, str):
+				yield matches
+			else:
+				yield from matches
+# }}}
+
+# A virtual file system.
+class VirtualGlobber(Globber): # {{{
+	@dataclasses.dataclass
+	class DirEnt:
+		fname: str
+		children: Optional[dict[str, DirEnt]] = None
+		parent: Optional[DirEnt] = None
+
+		# Whether this entry was created on-demand by _lookup().
+		volatile: bool = False
+
+		# Any associated object, eg. a MetaBlob.
+		obj: Any = None
+
+		@classmethod
+		def mkfile(cls, fname: str, obj: Any = None,
+				volatile: bool = False) -> DirEnt:
+			return cls(fname, None, obj=obj, volatile=volatile)
+
+		@classmethod
+		def mkdir(cls, fname: str, obj: Any = None,
+				volatile: bool = False) -> DirEnt:
+			return cls(fname, { }, obj=obj, volatile=volatile)
+
+		def __eq__(self, other: DirEnt) -> bool:
+			return id(self) == id(other)
+
+		def __hash__(self) -> int:
+			return id(self)
+
+		def __repr__(self) -> str:
+			parent = self.parent
+			if parent is not None:
+				parent = "..."
+
+			children = self.children
+			if children is not None:
+				children = "..."
+
+			return "%s(fname=%r, children=%s, parent=%s)" \
+				% (self.__class__.__name__, self.fname,
+       					children, parent)
+
+		def path(self, relative_to: Optional[DirEnt] = None) \
+				-> pathlib.PurePath:
+			parts = [ ]
+			dent = self
+			while dent is not relative_to:
+				parts.append(dent.fname)
+				if dent.parent is None:
+					break
+				dent = dent.parent
+			return pathlib.PurePath(*reversed(parts))
+
+		def isdir(self):
+			return self.children is not None
+
+		def must_be_dir(self) -> None:
+			if not self.isdir():
+				raise NotADirectoryError(self.path())
+
+		def is_parent(self, parent: DirEnt) -> bool:
+			dent = self
+			while True:
+				if dent is parent:
+					return True
+				dent = dent.parent
+				if dent is None:
+					return False
+
+		def __iter__(self) -> Iterator[Self]:
+			self.must_be_dir()
+			return iter(self.children.values())
+
+		def __contains__(self, fname: str) -> bool:
+			self.must_be_dir()
+			return fname in self.children
+
+		def __getitem__(self, fname: str) -> DirEnt:
+			self.must_be_dir()
+			child = self.children.get(fname)
+			if child is None:
+				raise FileNotFoundError(
+					self.path().joinpath(fname))
+			return child
+
+		def get(self, fname: str) -> Optional[DirEnt]:
+			self.must_be_dir()
+			return self.children.get(fname)
+
+		def add(self, child: DirEnt) -> DirEnt:
+			assert child.parent is None
+			self.must_be_dir()
+
+			if child.fname in self.children:
+				raise FileExistsError(
+					self.path() / child.fname)
+
+			self.children[child.fname] = child
+			child.parent = self
+
+			return child
+
+		def remove(self, child: DirEnt) -> DirEnt:
+			self.must_be_dir()
+			del self.children[child.fname]
+			child.parent = None
+			return child
+
+		def infanticide(self) -> None:
+			self.must_be_dir()
+			for child in self:
+				child.parent = None
+			self.children = { }
+
+		def ls(self) -> Iterable[str]:
+			self.must_be_dir()
+			return self.children.keys()
+
+		def scan(self, include_self: bool = True) -> Iterator[DirEnt]:
+			if include_self:
+				yield self
+			if self.isdir():
+				for child in self.children.values():
+					yield from child.scan()
+
+		# Remove this entry's branch if it's volatile.
+		def rollback(self) -> None:
+			if not self.volatile:
+				return
+
+			child, parent = self, self.parent
+			while parent.volatile:
+				child, parent = parent, parent.parent
+			parent.remove(child)
+
+	root: DirEnt
+	cwd: DirEnt
+
+	def __init__(self, files: Iterable[Any]):
+		self.cwd = self.root = self.DirEnt.mkdir('/')
+		for file in files:
+			parent = self.root
+			path = pathlib.PurePath(str(file))
+			start = 1 if path.is_absolute() else 0
+			for fname in path.parts[start:-1]:
+				child = parent.get(fname)
+				if child is None:
+					child = self.DirEnt.mkdir(fname)
+					parent.add(child)
+				parent = child
+			parent.add(self.DirEnt.mkfile(path.parts[-1], file))
+
+	def lookup(self, path: str, create: bool = False) -> DirEnt:
+		return self._lookup(self.escaped.sub(r"\1", path), create)
+
+	def _lookup(self, path: str, create: bool = False) -> DirEnt:
+		if not path:
+			raise FileNotFoundError(path)
+
+		must_be_dir = path.endswith(('/', "/."))
+		path = pathlib.PurePath(path)
+		if path.is_absolute():
+			parts = path.parts[1:]
+			dent = self.root
+		else:
+			parts = path.parts
+			dent = self.cwd
+
+		for i, fname in enumerate(parts):
+			dent.must_be_dir()
+			if fname != "..":
+				try:
+					dent = dent[fname]
+				except FileNotFoundError:
+					if not create:
+						raise
+
+					parent = dent
+					leaf = i == len(parts) - 1
+
+					dent = self.DirEnt.mkdir(
+							fname, volatile=True) \
+						if not leaf or must_be_dir \
+						else self.DirEnt.mkfile(
+							fname, volatile=True)
+					parent.add(dent)
+			elif dent.parent is not None:
+				dent = dent.parent
+		if must_be_dir:
+			dent.must_be_dir()
+
+		return dent
+
+	def chdir(self, path: str) -> None:
+		dent = self._lookup(path)
+		dent.must_be_dir()
+		self.cwd = dent
+
+	def listdir(self, path: str) -> list[str]:
+		return self._lookup(path).ls()
+
+	def isdir(self, path: str) -> bool:
+		return self._lookup(path).isdir()
+
+	def islink(self, path: str) -> bool:
+		return False
+
+	def must_exist(self, path: str) -> None:
+		self._lookup(path)
+
+	def exists(self, path: str) -> bool:
+		try:
+			self.must_exist(path)
+		except (FileNotFoundError, NotADirectoryError):
+			return False
+		else:
+			return True
+# }}}
+
 # Utilities {{{
 # Remove all values from a dict which don't match the predicate.
 def filter_dict(d: dict[Any, Any], keep: Callable[[Any], bool]) -> None:
@@ -2988,15 +3382,18 @@ def wait_proc(proc: subprocess.Popen) -> None:
 			% (prog, -proc.returncode))
 
 # Convert a size in bytes into a fractional number of KiB/MiB/etc.
-def humanize_size(size: int) -> str:
+def humanize_size(size: int, with_exact=False) -> str:
 	if size < 1024:
-		return "%d B" % size
+		return str(size) if with_exact else f"{size} B"
 
+	exact = size
 	for unit in ("KiB", "MiB", "GiB", "TiB", "PiB"):
 		size /= 1024.0
 		if size < 1024:
 			break
-	return "%.2f %s" % (size, unit)
+
+	human = "%.2f %s" % (size, unit)
+	return f"{exact} ({human})" if with_exact else human
 
 # Convert the @duration in seconds into "1h2m3s" format.
 def humanize_duration(duration: float) -> str:
@@ -3027,6 +3424,250 @@ def humanize_duration(duration: float) -> str:
 
 def woulda(args: DryRunOptions, verb: str) -> str:
 	return f"Would have {verb}" if args.is_dry_run() else verb.capitalize()
+# }}}
+
+# Blob-related functions {{{
+def discover_remote_blobs(args: EncryptedBucketOptions,
+				cls: type[MetaBlob.T] = MetaBlob) \
+				-> Iterable[MetaBlob.T]:
+	prefix = args.prefix
+	if prefix is not None:
+		prefix += '/'
+
+	for blob in args.find_bucket().list_blobs(prefix=prefix):
+		if (blob := cls.init(args, blob)) is not None:
+			yield blob
+
+# Write @blob.blob_uuid as binary to @sys.stdout.
+def write_header(blob: MetaBlob) -> Callable[[], None]:
+	def write_header():
+		# Redirect this function's stdout to stderr, so it doesn't
+		# go into the pipeline by accident.
+		stdout, sys.stdout = sys.stdout, sys.stderr
+
+		try:
+			os.write(
+				stdout.fileno(),
+				blob.external_header(blob.DataType.PAYLOAD))
+		except Exception as ex:
+			# The contents of exceptions are not passed back
+			# to the main interpreter, so let's print it here.
+			print(ex, file=sys.stderr)
+			raise
+
+	return write_header
+
+def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
+		command: Optional[Sequence[str]] = None,
+		pipeline_stdin: Optional[Pipeline.StdioType] = None) -> int:
+	assert command is not None or pipeline_stdin is not None
+
+	if args.encrypt_external() and args.add_header_to_blob:
+		# Write @blob_uuid into the pipeline before the @command
+		# is executed.  We rely on the pipe having capacity for
+		# ~16 bytes, otherwise there will be a deadlock.
+		#
+		# If we're using InternalEncrypt, it will add the headers
+		# itself.
+		command = {
+			"args": command or ("cat",),
+			"preexec_fn": write_header(blob),
+		}
+
+	pipeline = [ ]
+	if command is not None:
+		pipeline.append(command)
+	if args.compressor is not None:
+		pipeline.append(args.compressor)
+	if args.encrypt_external():
+		pipeline.append(blob.external_encrypt())
+
+	# @pipeline could be empty.
+	kw = { "stdout": subprocess.PIPE }
+	if pipeline_stdin is not None:
+		kw["stdin"] = pipeline_stdin
+	pipeline = Pipeline(pipeline, **kw)
+
+	src = pipeline.stdout()
+	if args.encrypt_internal():
+		src = blob.internal_encrypt(blob.DataType.PAYLOAD, src)
+
+	# Check the @pipeline for errors before returning the last read
+	# to upload_from_file().  If pipeline.wait() throws an exception
+	# the upload will fail and not create the blob.
+	src = Progressometer(src, args.progress, final_cb=pipeline.wait)
+
+	if not args.wet_run:
+		try:
+			flags = args.get_retry_flags()
+			if args.reupload:
+				# The blob to update must exist.
+				flags["if_generation_not_match"] = 0
+			else:	# The blob must not exist yet.
+				flags["if_generation_match"] = 0
+			if args.upload_chunk_size is not None:
+				blob.gcs_blob.chunk_size = \
+					args.upload_chunk_size * 1024 * 1024
+			blob.gcs_blob.upload_from_file(src, checksum="md5",
+							**flags)
+		except google.api_core.exceptions.PreconditionFailed as ex:
+			if args.reupload:
+				raise ConsistencyError(
+					"%s does not exist in bucket"
+					% blob.name)
+			else:
+				raise ConsistencyError(
+					"%s already exists in bucket"
+					% blob.name)
+		except GoogleAPICallError as ex:
+			raise FatalError(ex) from ex
+	else:	# In case of --wet-run just read @src until we hit EOF.
+		if not args.ignore_remote:
+			exists = blob.gcs_blob.bucket.get_blob(blob.name) \
+					is not None
+			if exists and not args.reupload:
+				raise ConsistencyError(
+					"%s already exists in bucket"
+					% blob.name)
+			elif args.reupload and not exists:
+				raise ConsistencyError(
+					"%s does not exist in bucket"
+					% blob.name)
+		while src.read(1024*1024):
+			pass
+
+	src.final_progress()
+
+	if not args.wet_run and blob.gcs_blob.size != src.bytes_transferred:
+		# GCS has a different idea about the blob's size than us.
+		try:
+			blob.gcs_blob.delete()
+		except:	# We may not have permission to do so.
+			print(f"WARNING: {blob.name} could be corrupted, "
+				"but unable to delete it!", file=sys.stderr)
+		raise ConsistencyError(
+				"Blob size mismatch (%d != %d)"
+				% (blob.gcs_blob.size, src.bytes_transferred))
+
+	blob.set_metadata(blob.DataType.BLOB_SIZE, src.bytes_transferred)
+	if not args.wet_run:
+		# In case of failure the blob won't be usable without
+		# --no-verify-blob-size, so it's okay not to delete it.
+		blob.sync_metadata()
+
+	return src.bytes_transferred
+
+# Read a pair of UUIDs from stdin and compare them to the expected ones
+# passed through sys.argv.  If they check out, execute sys.argv[4].
+HEADER_VERIFICATION_SCRIPT = """
+import sys, os
+import struct, uuid
+
+# Set a more informative COMM than "python3" for wait_proc().
+try:
+	fd = os.open("/proc/self/comm", os.O_WRONLY)
+except FileNotFoundError:
+	pass
+else:
+	os.write(fd, b"verify_header")
+	os.close(fd)
+
+# sys.argv[0] is "-c".
+expected_data_type = int(sys.argv[1])
+expected_uuid = uuid.UUID(sys.argv[2])
+
+# Read and parse the @header.
+encryption_header_st = struct.Struct("{encryption_header_st}")
+header = os.read(sys.stdin.fileno(), encryption_header_st.size)
+if len(header) < encryption_header_st.size:
+	sys.exit("Failed to read encryption header, only got %d bytes."
+			% len(header))
+recv_data_type, recv_uuid = encryption_header_st.unpack_from(header)
+
+# Verify the @header.
+if recv_data_type != expected_data_type:
+	sys.exit("Data type ID (0x%.2X) differs from expected (0x%.2X)."
+			% (recv_data_type, expected_data_type))
+
+if recv_uuid != expected_uuid.bytes:
+	sys.exit("Blob UUID (%s) differs from expected (%s)."
+			% (uuid.UUID(bytes=recv_uuid), expected_uuid))
+
+# Execute btrfs receive.
+os.execvp(sys.argv[3], sys.argv[3:])
+""".format(encryption_header_st=MetaCipher.external_header_st.format)
+
+def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
+		command: Union[None, Sequence[str], dict[str, Any]] = None,
+		pipeline_stdout: Optional[Pipeline.StdioType] = None,
+		pipeline_callback:
+			Optional[Callable[[Pipeline], None]] = None) -> int:
+	assert command is not None or pipeline_stdout is not None
+
+	if args.encrypt_external() and args.add_header_to_blob:
+		# Wrap @command with the @HEADER_VERIFICATION_SCRIPT,
+		# and pass it the expected DataType and UUID.
+		if command is None:
+			command_args = ("cat",)
+		elif isinstance(command, dict):
+			command_args = command["args"]
+		else:
+			command_args = command
+
+		if not isinstance(command, dict):
+			command = { }
+		command["args"] = \
+			("python3", "-c", HEADER_VERIFICATION_SCRIPT,
+				str(blob.DataType.PAYLOAD.value),
+				str(blob.blob_uuid)) \
+			+ command_args
+		command["executable"] = sys.executable
+
+	pipeline = [ ]
+	if args.encrypt_external():
+		pipeline.append(blob.external_decrypt())
+	if args.compressor is not None:
+		pipeline.append(args.compressor)
+	if command is not None:
+		pipeline.append(command)
+
+	# @pipeline could be empty.
+	pipeline = Pipeline(pipeline,
+				stdin=subprocess.PIPE,
+				stdout=pipeline_stdout)
+
+	dst = pipeline.stdin()
+	if args.encrypt_internal():
+		dst = blob.internal_decrypt(blob.DataType.PAYLOAD, dst)
+
+	dst = Progressometer(dst, args.progress, blob.gcs_blob.size)
+
+	try:	# The actual download.
+		blob.gcs_blob.download_to_file(dst, **args.get_retry_flags())
+		dst.final_progress()
+		if isinstance(dst.wrapped, InternalDecrypt):
+			dst.wrapped.close()
+	except (Exception, KeyboardInterrupt) as ex:
+		if isinstance(ex, GoogleAPICallError):
+			raise FatalError(ex) from ex
+		raise
+	finally:
+		if len(pipeline) > 0:
+			# This should cause the @pipeline to finish.
+			pipeline.stdin().close()
+		if pipeline_callback is not None:
+			# And this one should consume the @pipeline's
+			# stdout or stderr.
+			pipeline_callback(pipeline)
+
+	# It should be safe to wait for the @pipeline now that it has been
+	# read.  If it wasn't, we could deadlock.
+	pipeline.wait()
+
+	# If there's a mismatch Progressometer.final_progress() should have
+	# caught it.
+	assert dst.bytes_transferred == blob.gcs_blob.size
+	return dst.bytes_transferred
 # }}}
 
 # Subvolume-related functions {{{
@@ -3096,17 +3737,9 @@ def discover_local_snapshots(path: str) -> Snapshots:
 # Go through the blobs of a GCS bucket and create Backup:s from them.
 def discover_remote_backups(args: EncryptedBucketOptions,
 				keep_index_only: bool = False) -> Backups:
-	prefix = args.prefix
-	if prefix is not None:
-		prefix += '/'
-
 	by_name = { }
 	by_uuid = Backups()
-	for blob in args.find_bucket().list_blobs(prefix=prefix):
-		blob = BackupBlob.init(args, blob)
-		if blob is None:
-			continue
-
+	for blob in discover_remote_blobs(args, BackupBlob):
 		try:
 			backup = by_uuid[blob.snapshot_uuid]
 		except KeyError:
@@ -3212,229 +3845,8 @@ def choose_snapshots(args: SelectionOptions, snapshots: Snapshots) \
 		return ()
 # }}}
 
-# Blob-related functions {{{
-# Write @blob.blob_uuid as binary to @sys.stdout.
-def write_header(blob: MetaBlob) -> Callable[[], None]:
-	def write_header():
-		# Redirect this function's stdout to stderr, so it doesn't
-		# go into the pipeline by accident.
-		stdout, sys.stdout = sys.stdout, sys.stderr
-
-		try:
-			os.write(
-				stdout.fileno(),
-				blob.external_header(blob.DataType.PAYLOAD))
-		except Exception as ex:
-			# The contents of exceptions are not passed back
-			# to the main interpreter, so let's print it here.
-			print(ex, file=sys.stderr)
-			raise
-
-	return write_header
-
-def upload_blob(args: UploadBlobOptions,
-		blob: MetaBlob, command: Sequence[str]) -> int:
-	if args.encrypt_external() and args.add_header_to_blob:
-		# Write @blob_uuid into the pipeline before the @command
-		# is executed.  We rely on the pipe having capacity for
-		# ~16 bytes, otherwise there will be a deadlock.
-		#
-		# If we're using InternalEncrypt, it will add the headers
-		# itself.
-		command = {
-			"args": command,
-			"preexec_fn": write_header(blob),
-		}
-
-	pipeline = [ command ]
-	if args.compressor is not None:
-		pipeline.append(args.compressor)
-	if args.encrypt_external():
-		pipeline.append(blob.external_encrypt())
-	pipeline = Pipeline(pipeline, stdout=subprocess.PIPE)
-
-	src = pipeline.stdout()
-	if args.encrypt_internal():
-		src = blob.internal_encrypt(blob.DataType.PAYLOAD, src)
-
-	# Check the @pipeline for errors before returning the last read
-	# to upload_from_file().  If pipeline.wait() throws an exception
-	# the upload will fail and not create the blob.
-	src = Progressometer(src, args.progress, final_cb=pipeline.wait)
-
-	if not args.wet_run:
-		try:
-			flags = args.get_retry_flags()
-			if args.reupload:
-				# The blob to update must exist.
-				flags["if_generation_not_match"] = 0
-			else:	# The blob must not exist yet.
-				flags["if_generation_match"] = 0
-			if args.upload_chunk_size is not None:
-				blob.gcs_blob.chunk_size = \
-					args.upload_chunk_size * 1024 * 1024
-			blob.gcs_blob.upload_from_file(src, checksum="md5",
-							**flags)
-		except google.api_core.exceptions.PreconditionFailed as ex:
-			if args.reupload:
-				raise ConsistencyError(
-					"%s does not exist in bucket"
-					% blob.name)
-			else:
-				raise ConsistencyError(
-					"%s already exists in bucket"
-					% blob.name)
-		except GoogleAPICallError as ex:
-			raise FatalError(ex) from ex
-	else:	# In case of --wet-run just read @src until we hit EOF.
-		if not args.ignore_remote:
-			exists = blob.gcs_blob.bucket.get_blob(blob.name) \
-					is not None
-			if exists and not args.reupload:
-				raise ConsistencyError(
-					"%s already exists in bucket"
-					% blob.name)
-			elif args.reupload and not exists:
-				raise ConsistencyError(
-					"%s does not exist in bucket"
-					% blob.name)
-		while src.read(1024*1024):
-			pass
-
-	src.final_progress()
-
-	if not args.wet_run and blob.gcs_blob.size != src.bytes_transferred:
-		# GCS has a different idea about the blob's size than us.
-		try:
-			blob.gcs_blob.delete()
-		except:	# We may not have permission to do so.
-			print(f"WARNING: {blob.name} could be corrupted, "
-				"but unable to delete it!", file=sys.stderr)
-		raise ConsistencyError(
-				"Blob size mismatch (%d != %d)"
-				% (blob.gcs_blob.size, src.bytes_transferred))
-
-	blob.set_metadata(blob.DataType.BLOB_SIZE, src.bytes_transferred)
-	if not args.wet_run:
-		# If case of failure the blob won't be usable without
-		# --no-verify-blob-size, so it's okay not to delete it.
-		blob.sync_metadata()
-
-	return src.bytes_transferred
-
-# Read a pair of UUIDs from stdin and compare them to the expected ones
-# passed through sys.argv.  If they check out, execute sys.argv[4].
-HEADER_VERIFICATION_SCRIPT = """
-import sys, os
-import struct, uuid
-
-# Set a more informative COMM than "python3" for wait_proc().
-try:
-	fd = os.open("/proc/self/comm", os.O_WRONLY)
-except FileNotFoundError:
-	pass
-else:
-	os.write(fd, b"verify_header")
-	os.close(fd)
-
-# sys.argv[0] is "-c".
-expected_data_type = int(sys.argv[1])
-expected_uuid = uuid.UUID(sys.argv[2])
-
-# Read and parse the @header.
-encryption_header_st = struct.Struct("{encryption_header_st}")
-header = os.read(sys.stdin.fileno(), encryption_header_st.size)
-if len(header) < encryption_header_st.size:
-	sys.exit("Failed to read encryption header, only got %d bytes."
-			% len(header))
-recv_data_type, recv_uuid = encryption_header_st.unpack_from(header)
-
-# Verify the @header.
-if recv_data_type != expected_data_type:
-	sys.exit("Data type ID (0x%.2X) differs from expected (0x%.2X)."
-			% (recv_data_type, expected_data_type))
-
-if recv_uuid != expected_uuid.bytes:
-	sys.exit("Blob UUID (%s) differs from expected (%s)."
-			% (uuid.UUID(bytes=recv_uuid), expected_uuid))
-
-# Execute btrfs receive.
-os.execvp(sys.argv[3], sys.argv[3:])
-""".format(encryption_header_st=MetaCipher.external_header_st.format)
-
-def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
-		command: Union[None, Sequence[str], dict[str, Any]] = None,
-		pipeline_stdout: Pipeline.StdioType = None,
-		pipeline_callback:
-			Optional[Callable[[Pipeline], None]] = None) -> int:
-	if args.encrypt_external() and args.add_header_to_blob:
-		# Wrap @command with the @HEADER_VERIFICATION_SCRIPT,
-		# and pass it the expected DataType and UUID.
-		if command is None:
-			command_args = ("cat",)
-		elif isinstance(command, dict):
-			command_args = command["args"]
-		else:
-			command_args = command
-
-		if not isinstance(command, dict):
-			command = { }
-		command["args"] = \
-			("python3", "-c", HEADER_VERIFICATION_SCRIPT,
-				str(blob.DataType.PAYLOAD.value),
-				str(blob.blob_uuid)) \
-			+ command_args
-		command["executable"] = sys.executable
-
-	pipeline = [ ]
-	if args.encrypt_external():
-		pipeline.append(blob.external_decrypt())
-	if args.compressor is not None:
-		pipeline.append(args.compressor)
-	if command is not None:
-		pipeline.append(command)
-
-	# @pipeline could be empty.
-	pipeline = Pipeline(pipeline,
-				stdin=subprocess.PIPE,
-				stdout=pipeline_stdout)
-
-	dst = pipeline.stdin()
-	if args.encrypt_internal():
-		dst = blob.internal_decrypt(blob.DataType.PAYLOAD, dst)
-
-	dst = Progressometer(dst, args.progress, blob.gcs_blob.size)
-
-	try:	# The actual download.
-		blob.gcs_blob.download_to_file(dst, **args.get_retry_flags())
-		dst.final_progress()
-		if isinstance(dst.wrapped, InternalDecrypt):
-			dst.wrapped.close()
-	except (Exception, KeyboardInterrupt) as ex:
-		if isinstance(ex, GoogleAPICallError):
-			raise FatalError(ex) from ex
-		raise
-	finally:
-		if len(pipeline) > 0:
-			# This should cause the @pipeline to finish.
-			pipeline.stdin().close()
-		if pipeline_callback is not None:
-			# And this one should consume the @pipeline's
-			# stdout or stderr.
-			pipeline_callback(pipeline)
-
-	# It should be safe to wait for the @pipeline now that it has been
-	# read.  If it wasn't, we could deadlock.
-	pipeline.wait()
-
-	# If there's a mismatch Progressometer.final_progress() should have
-	# caught it.
-	assert dst.bytes_transferred == blob.gcs_blob.size
-	return dst.bytes_transferred
-# }}}
-
 # The list buckets subcommand {{{
-class CmdListBuckets(CmdLeaf, CommonOptions):
+class CmdListBuckets(CmdExec, CommonOptions):
 	cmd = "buckets"
 	help = "TODO"
 
@@ -3465,7 +3877,7 @@ def cmd_list_buckets(args: CmdListBuckets) -> None:
 # }}}
 
  # The list local subcommand {{{
-class CmdListLocal(CmdLeaf, CommonOptions, ShowUUIDOptions):
+class CmdListLocal(CmdExec, CommonOptions, ShowUUIDOptions):
 	cmd = "local"
 	help = "TODO"
 
@@ -3508,7 +3920,7 @@ def cmd_list_local(args: CmdListLocal) -> None:
 # }}}
 
  # The list remote subcommand {{{
-class CmdListRemote(CmdLeaf, ListRemoteOptions):
+class CmdListRemote(CmdExec, ListRemoteOptions):
 	cmd = "remote"
 	help = "TODO"
 
@@ -3566,7 +3978,7 @@ def cmd_list_remote(args: CmdListRemote) -> None:
 # }}}
 
 # The delete local subcommand {{{
-class CmdDeleteLocal(CmdLeaf, DeleteOptions, SnapshotSelectionOptions):
+class CmdDeleteLocal(CmdExec, DeleteOptions, SnapshotSelectionOptions):
 	cmd = "local"
 	help = "TODO"
 
@@ -3669,7 +4081,7 @@ def cmd_delete_local(args: CmdDeleteLocal) -> None:
 # }}}
 
 # The delete remote subcommand {{{
-class CmdDeleteRemote(CmdLeaf, DeleteOptions):
+class CmdDeleteRemote(CmdExec, DeleteOptions):
 	cmd = "remote"
 	help = "TODO"
 
@@ -3872,7 +4284,7 @@ def cmd_delete_remote(args: CmdDeleteRemote) -> None:
 # }}}
 
  # The index list subcommand {{{
-class CmdListIndex(CmdLeaf, IndexSelectionOptions, ListRemoteOptions):
+class CmdListIndex(CmdExec, IndexSelectionOptions, ListRemoteOptions):
 	cmd = "list"
 	help = "TODO"
 
@@ -3912,7 +4324,7 @@ def cmd_list_index(args: CmdListIndex) -> None:
 # }}}
 
 # The index get subcommand {{{
-class CmdGetIndex(CmdLeaf, CommonOptions, DownloadBlobOptions,
+class CmdGetIndex(CmdExec, CommonOptions, DownloadBlobOptions,
 			SelectionOptions):
 	cmd = "get"
 	help = "TODO"
@@ -4012,7 +4424,7 @@ def cmd_get_index(args: CmdGetIndex) -> None:
 # }}}
 
 # The index delete subcommand {{{
-class CmdDeleteIndex(CmdLeaf, DeleteOptions, IndexSelectionOptions):
+class CmdDeleteIndex(CmdExec, DeleteOptions, IndexSelectionOptions):
 	cmd = "delete"
 	help = "TODO"
 
@@ -4096,7 +4508,7 @@ def cmd_delete_index(args: CmdDeleteIndex) -> None:
 # }}}
 
 # The upload subcommand {{{
-class CmdUpload(CmdLeaf, UploadDownloadOptions, UploadBlobOptions,
+class CmdUpload(CmdExec, UploadDownloadOptions, UploadBlobOptions,
 		SnapshotSelectionOptions):
 	cmd = "upload"
 	help = "TODO"
@@ -4424,7 +4836,7 @@ def cmd_upload(args: CmdUpload) -> None:
 # }}}
 
 # The download subcommand {{{
-class CmdDownload(CmdLeaf, DownloadBlobOptions, UploadDownloadOptions):
+class CmdDownload(CmdExec, DownloadBlobOptions, UploadDownloadOptions):
 	cmd = "download"
 	help = "TODO"
 
@@ -4702,107 +5114,747 @@ def cmd_download(args: CmdDownload) -> None:
 		print("%s." % ' '.join(msg))
 # }}}
 
-class CmdFTP(CmdLineCommand):
+class FTPClient:
+	# Matches the root (/), current (.) and parent (..) directory
+	# designations.
+	re_baseless = re.compile(r"(^(/|\.|\.\.)|/(\.|\.\.))/*$")
+
+	@functools.cached_property
+	def local(self):
+		assert isinstance(self, CmdFTP)
+		return Globber()
+
+	@functools.cached_property
+	def remote(self):
+		assert isinstance(self, CmdFTP)
+		return VirtualGlobber(discover_remote_blobs(self))
+
+
+class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions, FTPClient):
 	cmd = "ftp"
 	help = "TODO"
 
-	def get_subcommands(self) -> Sequence[CmdLineCommand]:
-		return (CmdFTPGet(),)
+	@functools.cached_property
+	def subcommands(self) -> Sequence[CmdLineCommand]:
+		return (CmdFTPDir(self), CmdFTPDu(self), CmdFTPRm(self),
+			CmdFTPGet(self), CmdFTPPut(self))
 
-class CmdFTPGet(CmdLeaf, CommonOptions, DownloadBlobOptions):
-	cmd = "get"
+	def split(self, s: str) -> Iterable[str]:
+		token = None
+		quoted = None
+		escaped = False
+		for c in s:
+			if escaped:
+				assert token is not None
+				if c == '\\' or c in Globber.GLOBBING:
+					token += rf'\{c}'
+				else:
+					token += c
+				escaped = False
+			elif quoted is not None:
+				assert token is not None
+				if c == quoted:
+					quoted = None
+				elif c == '\\':
+					escaped = True
+				elif c in Globber.GLOBBING:
+					token += rf'\{c}'
+				else:
+					token += c
+			elif c.isspace():
+				if token is not None:
+					yield token
+					token = None
+			else:
+				if token is None:
+					token = ""
+				if c == '\\':
+					escaped = True
+				elif c in ('"', "'"):
+					quoted = c
+				else:
+					token += c
+
+		if escaped:
+			raise ValueError("Dangling escape character")
+		elif quoted is not None:
+			raise ValueError("Unclosed quotation")
+		elif token is not None:
+			yield token
+
+	def execute(self) -> None:
+		import readline
+
+		error = False
+		re_shell = re.compile(r"^\s*!(.*)")
+		while True:
+			try:
+				line = input("%s> " % self.remote.cwd.path())
+			except KeyboardInterrupt:
+				print()
+				continue
+			except EOFError:
+				print()
+				break
+
+			if (m := re_shell.match(line)) is not None:
+				ret = subprocess.run(m.group(1), shell=True)
+				error = ret.returncode != 0
+				continue
+
+			try:
+				cmdline = list(self.split(line))
+			except ValueError as ex:
+				print(f"Syntax error: {ex}", file=sys.stderr)
+				error = True
+				continue
+
+			if not cmdline or cmdline[0].startswith('#'):
+				continue
+			if cmdline[0].startswith('-'):
+				print(f"Invalid command.", file=sys.stderr)
+				error = True
+				continue
+
+			try:
+				error = not CmdFTPShell(self).run(cmdline)
+			except SystemExit as ex:
+				# argparse.parse_args() exited.
+				error = ex.code != 0
+			except KeyboardInterrupt:
+				error = True
+			except CmdFTPExit.ExitFTP:
+				break
+
+		if error:
+			sys.exit(1)
+
+class CmdFTPShell(CmdTop):
+	class ArgumentParserNoUsage(CmdTop.ArgumentParser):
+		def print_usage(self, *args, **kw):
+			# Don't add the usage when printing an error.
+			pass
+
+	class ArgumentParser(ArgumentParserNoUsage):
+		def __init__(self, *args, **kw):
+			super().__init__(*args, **kw)
+
+			# Patch argparse._SubParsersAction to omit the script
+			# name from the usage, which would otherwise start with
+			# "usage: prog.py @name".
+			cls = self._registry_get("action", "parsers")
+			class SubParsersAction(cls):
+				def add_parser(self, name, *args, **kw):
+					return super().add_parser(
+							name, *args,
+							**kw, prog=name)
+
+			self.register("action", "parsers", SubParsersAction)
+
+		def add_subparsers(self, *args, **kw):
+			# The hack above is not desired for the subparsers
+			# of the subparsers (the usage would omt the mid-level
+			# subcommands).
+			parent = CmdFTPShell.ArgumentParserNoUsage
+			return super().add_subparsers(*args, **kw,
+				 			parser_class=parent)
+
+	# Remove the flags we don't want the @subcommands to have.
+	def prune(self, subcommands: Iterable[CmdLineCommand]) -> None:
+		for cmd in subcommands:
+			cmd.remove_argument("--debug")
+			self.prune(cmd.subcommands)
+
+	@functools.cached_property
+	def subcommands(self) -> Sequence[CmdLineCommand]:
+		subcommands = (CmdFTPHelp(self), CmdFTPExit(self),
+		 		CmdFTPLChDir(self), CmdFTPLPwd(self),
+		 		CmdFTPChDir(self), CmdFTPPwd(self),
+		 		CmdFTPDir(self), CmdFTPPDir(self),
+		 		CmdFTPDu(self), CmdFTPRm(self),
+		 		CmdFTPGet(self), CmdFTPPut(self))
+		self.prune(subcommands)
+		return subcommands
+
+class CmdFTPHelp(CmdExec):
+	cmd = "help"
 	help = "TODO"
 
-	remote: list[str]
-	local: Optional[str]
+	topic: Optional[Sequence[str]]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("topic", nargs='*')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.topic = args.topic
+
+	def execute(self):
+		if self.topic:
+			# Run `<subcommands> --help'.
+			self.topic.append("--help")
+			self.parent.__class__(self).run(self.topic)
+			return
+
+		subcommands = [
+			(", ".join(subcommand.aliases()), subcommand)
+			for subcommand in self.parent.subcommands
+		]
+		maxwidth = max(len(title) for title, _ in subcommands)
+
+		print("Available commands:")
+		for title, cmd in subcommands:
+			print(f"  * {title}: ", ' ' * (maxwidth - len(title)),
+	 			cmd.help, sep="")
+
+class CmdFTPExit(CmdExec):
+	cmd = ("exit", "quit")
+	help = "TODO"
+
+	class ExitFTP(Exception): pass
+
+	def execute(self):
+		raise self.ExitFTP
+
+class CmdFTPLChDir(CmdExec):
+	cmd = "lcd"
+	help = "TODO"
+
+	dst: str
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("directory")
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.dst = args.directory
+
+	def execute(self):
+		os.chdir(self.local.glob(os.path.expanduser(self.dst),
+						at_least_one=True,
+						at_most_one=True))
+
+class CmdFTPLPwd(CmdExec):
+	cmd = "lpwd"
+	help = "TODO"
+
+	def execute(self):
+		print(os.getcwd())
+
+class CmdFTPChDir(CmdExec):
+	cmd = "cd"
+	help = "TODO"
+
+	dst: str
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("directory")
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.dst = args.directory
+
+	def execute(self: _CmdFTPChDir):
+		self.remote.chdir(self.remote.glob(
+					self.dst,
+					at_least_one=True,
+					at_most_one=True))
+
+class CmdFTPPwd(CmdExec):
+	cmd = "pwd"
+	help = "TODO"
+
+	def execute(self: _CmdFTPPwd):
+		print(self.remote.cwd.path())
+
+class CmdFTPDir(CmdExec):
+	cmd = ("dir", "ls")
+	help = "TODO"
+
+	readdir: bool
+	recursive: bool
+	what: list[str]
+
+	# Overridden by CmdFTPPDir.
+	output: TextIO = sys.stdout
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
-		self.sections["positional"].add_argument("files", nargs='+')
+		section = self.sections["operation"]
+		section.add_enable_flag("--directory", "-d")
+		section.add_enable_flag("--recursive", "-R")
+
+		self.sections["positional"].add_argument("what", nargs='*')
 
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
 
-		self.local = args.files.pop() if len(args.files) > 1 else None
-		self.remote = args.files
+		self.readdir = not args.directory
+		self.recursive = args.recursive
+		self.what = args.what
+
+	def print_files(self,
+			files: Iterable[tuple[str, VirtualGlobber.DirEnt]]) \
+			-> None:
+		lines = [ ]
+		total_size = 0
+		nfiles = ndirs = 0
+		timestamp_width = None
+		has_no_timestamp = False
+		for path, dent in files:
+			line = [ ]
+			lines.append(line)
+
+			if dent.obj is not None:
+				created = dent.obj.gcs_blob.time_created \
+						.timestamp()
+				timestamp = time.strftime(
+						"%Y-%m-%d %H:%M:%S",
+						time.localtime(created))
+				timestamp_width = len(timestamp)
+				line.append(timestamp)
+			else:
+				has_no_timestamp = True
+				line.append(None)
+
+			if dent.isdir():
+				ndirs += 1
+				line.append("<DIR>")
+			else:
+				nfiles += 1
+				size = dent.obj.gcs_blob.size
+				total_size += size
+				line.append(humanize_size(
+						size, with_exact=True))
+
+			line.append(path)
+
+		if timestamp_width is not None:
+			max_size_width = max(len(line[1]) for line in lines)
+			max_size_width = max(max_size_width, 14)
+			for line in lines:
+				line[1] = line[1].rjust(max_size_width)
+
+		if has_no_timestamp:
+			for line in lines:
+				if line[0] is not None:
+					pass
+				elif timestamp_width is not None:
+					line[0] = ' ' * timestamp_width
+				else:
+					del line[0]
+
+		if nfiles + ndirs > 1:
+			line = [ "total:" ]
+			if ndirs > 0:
+				line.append(str(ndirs))
+				line.append(
+					"directories" if ndirs > 1
+					else "directory")
+			if nfiles > 0:
+				if ndirs > 0:
+					line.append("and")
+				line.append(str(nfiles))
+				line.append(
+					"file" if nfiles == 1
+					else "files")
+				line.append("in")
+				line.append(humanize_size(total_size))
+			print(*line, file=self.output)
+
+		for line in lines:
+			print(*line, file=self.output)
+
+	def print_dir(self, path: str, dent: VirtualGlobber.DirEnt,
+			divisor: bool = False, header: bool = False) -> None:
+		if divisor:
+			print(file=self.output)
+		if header:
+			print(f"{path}:", file=self.output)
+
+		self.print_files((child.fname, child) for child in dent)
+		if not self.recursive:
+			return
+
+		for child in dent:
+			if not child.isdir():
+				continue
+			self.print_dir(os.path.join(path, child.fname), child,
+					divisor=True, header=True)
+
+	def execute(self: _CmdFTPDir) -> None:
+		files, dirs = [ ], [ ]
+		if self.what:
+			for match in self.remote.globs(self.what):
+				dent = self.remote.lookup(match)
+				lst = dirs if self.readdir and dent.isdir() \
+						else files
+				lst.append((match, dent))
+		else:
+			dirs.append(('.', self.remote.cwd),)
+
+		self.print_files(files)
+		for i, (remote, dent) in enumerate(dirs):
+			self.print_dir(remote, dent,
+					divisor=bool(files or i > 0),
+					header=bool(files or len(dirs) > 1
+							or self.recursive))
+
+class CmdFTPPDir(CmdFTPDir):
+	cmd = "pdir"
+	help = "TODO"
+
+	def execute(self: _CmdFTPPDir) -> None:
+		pager = subprocess.Popen(("sensible-pager",),
+						stdin=subprocess.PIPE,
+			   			text=True)
+		self.output = pager.stdin
+		super().execute()
+		pager.stdin.close()
+		pager.wait()
+
+class CmdFTPDu(CmdExec):
+	cmd = "du"
+	help = "TODO"
+
+	what: list[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("what", nargs='*')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.what = args.what
+
+	def duit(self, dent: VirtualGlobber.DirEnt) -> tuple[int, int]:
+		if dent.isdir():
+			total_files = total_size = 0
+			for child in dent:
+				n, size = self.duit(child)
+				total_files += n
+				total_size += size
+			return total_files, total_size
+		elif dent.obj is not None:
+			return (1, dent.obj.gcs_blob.size)
+		else:
+			return (1, 0)
+
+	def execute(self: _CmdFTPDu) -> None:
+		total_files = total_size = 0
+		if self.what:
+			sizes = [ ]
+			has_dirs = False
+			for match in self.remote.globs(self.what):
+				dent = self.remote.lookup(match)
+				has_dirs |= dent.isdir()
+
+				n, size = self.duit(dent)
+				total_files += n
+				total_size += size
+
+				size = humanize_size(size, with_exact=True)
+				sizes.append((match, size))
+
+			# @self.what must have matched something.
+			assert len(sizes) > 0
+			max_size_width = max(len(line[1]) for line in sizes)
+			for match, size in sizes:
+				print(size.rjust(max_size_width), match)
+
+			if total_files <= 1 and not has_dirs:
+				return
+		else:
+			total_files, total_size = self.duit(self.remote.cwd)
+
+		line = [ humanize_size(total_size) ]
+		line.append("in")
+		line.append(str(total_files))
+		line.append("file" if total_files == 1 else "files")
+		print(*line)
+
+class CmdFTPRm(CmdExec):
+	cmd = "rm"
+	help = "TODO"
+
+	recursive: bool
+	verbose: bool
+	what: list[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["operation"]
+		section.add_enable_flag("--recursive", "-r", "-R")
+		section.add_enable_flag("--verbose", "-v")
+
+		self.sections["positional"].add_argument("what", nargs='+')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.recursive = args.recursive
+		self.verbose = args.verbose
+		self.what = args.what
+
+	def execute(self: _CmdFTPDu) -> None:
+		to_delete = [ ]
+		for match in self.remote.globs(self.what):
+			dent = self.remote.lookup(match)
+			if not self.recursive and dent.isdir():
+				raise IsADirectoryError(match)
+			to_delete.append(dent)
+
+		deleted = set()
+		nfiles = size = 0
+		for top in to_delete:
+			for dent in top.scan():
+				# A file may be included by multiple
+				# @top directories.
+				if dent in deleted:
+					continue
+				deleted.add(dent)
+
+				if not dent.isdir():
+					if self.verbose:
+						print("Deleting %s..."
+							% dent.path())
+					size += dent.obj.gcs_blob.size
+					nfiles += 1
+
+					dent.obj.gcs_blob.delete()
+
+			if top.isdir():
+				if top is self.remote.root:
+					# rm -rf /
+					self.remote.cwd = top
+				elif self.remote.cwd.is_parent(top):
+					# @cwd is or is under @top.
+					self.remote.cwd = top.parent
+
+		if self.remote.root in deleted:
+			self.remote.root.infanticide()
+		else:
+			for dent in deleted:
+				dent.parent.remove(dent)
+
+		if self.verbose:
+			print("Deleted %d file(s) of %s."
+				% (nfiles, humanize_size(size)))
+
+class CmdFTPGet(CmdExec):
+	cmd = "get"
+	help = "TODO"
+
+	src: list[str]
+	dst: Optional[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		self.sections["positional"].add_argument("what", nargs='+')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+
+		self.dst = args.what.pop() if len(args.what) > 1 else None
+		self.src = args.what
 
 	def execute(self) -> None:
-		print(self.remote)
-		print(self.local)
-		pass
+		cmd_ftp_get(self)
 
-# Non-leaf-level subcommands {{{
+def cmd_ftp_get(self: _CmdFTPGet) -> None:
+	remote = [
+		(match, self.remote.lookup(match))
+		for match in self.remote.globs(self.src)
+	]
+
+	if self.dst is None:
+		local = '.'
+	elif not isinstance(self.parent, CmdFTPShell):
+		# Globbing must have been done by the user's shell.
+		local = self.dst
+	else:
+		local = self.local.glob(os.path.expanduser(self.dst),
+						at_least_one=True,
+						at_most_one=True,
+						must_exist=False)
+	local = pathlib.PurePath(local)
+
+	try:
+		local_isdir = stat.S_ISDIR(os.stat(local).st_mode)
+	except FileNotFoundError:
+		local_isdir = None
+
+	if local_isdir is False and (len(remote) > 1 or remote[0][1].isdir()):
+		raise NotADirectoryError(local)
+	elif local_isdir is None and len(remote) > 1:
+		raise FileNotFoundError(local)
+
+	for src, src_top in remote:
+		src_tree = src_top.scan()
+		dst_top = local
+
+		if local_isdir:
+			if self.re_baseless.search(src):
+				src_tree = src_top.scan(include_self=False)
+			else:
+				dst_top = dst_top.joinpath(src_top.fname)
+
+		for src in src_tree:
+			dst = dst_top / src.path(src_top)
+			if src.isdir():
+				print("MKDIR(%s)" % dst)
+			else:
+				print("DOWNLOAD(%s => %s)" % (src.path(), dst))
+
+class CmdFTPPut(CmdExec):
+	cmd = "put"
+	help = "TODO"
+
+	follow_symlinks: bool
+	src: list[str]
+	dst: Optional[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["operation"]
+		section.add_enable_flag("--follow-symlinks", "--dereference",
+					"-L")
+
+		self.sections["positional"].add_argument("what", nargs='+')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+
+		self.follow_symlinks = args.follow_symlinks
+		self.dst = args.what.pop() if len(args.what) > 1 else None
+		self.src = args.what
+
+	def execute(self) -> None:
+		cmd_ftp_put(self)
+
+def cmd_ftp_put(self: _CmdFTPPut) -> None:
+	if isinstance(self.parent, CmdFTPShell):
+		local = self.local.globs(map(os.path.expanduser, self.src))
+	else:
+		local = self.src
+	local = [ (src, os.stat(src).st_mode) for src in local ]
+
+	for src, mode in local:
+		if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+			raise ValueError(
+				f"{src}: not a regular file or directory")
+
+	if self.dst is not None:
+		remote = self.remote.lookup(
+				self.remote.glob(self.dst,
+						at_least_one=True,
+						at_most_one=True,
+						must_exist=False),
+				create=True)
+	else:
+		remote = self.remote.cwd
+
+	if (len(local) > 1 or stat.S_ISDIR(local[0][1])) \
+			and not remote.isdir():
+		if remote.volatile:
+			remote.rollback()
+			raise FileNotFoundError(remote.path())
+		else:
+			raise NotADirectoryError(remote.path())
+
+	seen = set() if self.follow_symlinks else None
+	for src, mode in local:
+		if stat.S_ISREG(mode):
+			dst = remote.path()
+			if remote.isdir():
+				dst = dst.joinpath(os.path.basename(src))
+			print(f"UPLOAD({src} => {dst})")
+			upload_blob(self, MetaBlob(self, str(dst)), pipeline_stdin=open(src))
+			continue
+
+		src_top = pathlib.PurePath(src)
+		dst_top = remote.path()
+		if not remote.volatile and not self.re_baseless.search(src):
+			dst_top = dst_top.joinpath(src_top.name)
+
+		for dirpath, dirs, files in os.walk(
+				src_top, followlinks=self.follow_symlinks):
+			dirpath = pathlib.PurePath(dirpath)
+			dst_dir = dst_top / dirpath.relative_to(src_top)
+			for fname in files:
+				src = dirpath / fname
+				if stat.S_ISREG(os.stat(src).st_mode):
+					dst = dst_dir / fname
+					print(f"UPLOAD({src} => {dst})")
+
+			if seen is not None:
+				sbuf = os.stat(dirpath)
+				seen.add((sbuf.st_dev, sbuf.st_ino))
+
+				i = 0
+				remove = [ ]
+				for dname in dirs:
+					sbuf = os.stat(dirpath / dname)
+					if (sbuf.st_dev, sbuf.st_ino) in seen:
+						remove.append(i)
+					else:
+						i += 1
+
+				for i in remove:
+					del dirs[i]
+
+class _CmdFTPChDir(CmdFTP, CmdFTPChDir): pass
+class _CmdFTPPwd(CmdFTP, CmdFTPPwd): pass
+class _CmdFTPDir(CmdFTP, CmdFTPDir): pass
+class _CmdFTPPDir(CmdFTP, CmdFTPPDir): pass
+class _CmdFTPDu(CmdFTP, CmdFTPDu): pass
+class _CmdFTPRm(CmdFTP, CmdFTPRm): pass
+class _CmdFTPGet(CmdFTP, CmdFTPGet): pass
+class _CmdFTPPut(CmdFTP, CmdFTPPut): pass
+
+# Non-executable subcommands {{{
 class CmdList(CmdLineCommand):
 	cmd = "list"
 	help = "TODO"
 
-	def get_subcommands(self) -> Sequence[CmdLineCommand]:
+	@functools.cached_property
+	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdListBuckets(), CmdListLocal(), CmdListRemote())
 
 class CmdDelete(CmdLineCommand):
 	cmd = "delete"
 	help = "TODO"
 
-	def get_subcommands(self) -> Sequence[CmdLineCommand]:
+	@functools.cached_property
+	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdDeleteLocal(), CmdDeleteRemote())
 
 class CmdIndex(CmdLineCommand):
 	cmd = "index"
 	help = "TODO"
 
-	def get_subcommands(self) -> Sequence[CmdLineCommand]:
+	@functools.cached_property
+	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdListIndex(), CmdGetIndex(), CmdDeleteIndex())
 
 # The top-level command.
-class CmdTop(CmdLineCommand):
+class CmdMain(CmdTop):
 	description = "TODO"
 
-	def get_subcommands(self) -> Sequence[CmdLineCommand]:
+	@functools.cached_property
+	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdList(), CmdDelete(), CmdIndex(),
 	  		CmdUpload(), CmdDownload(), CmdFTP())
-
-	def parse(self) -> CmdLeaf:
-		parser = argparse.ArgumentParser(
-				description=self.description,
-				add_help=False)
-		self.build_for_parser(parser)
-		args = parser.parse_args()
-
-		# Find which leaf-level CmdLineCommand was called.
-		cmd = self
-		level = 1
-		while True:
-			var = f"sub{level}command"
-			if not hasattr(args, var):
-				break
-			cmd = cmd.find_subcommand(getattr(args, var))
-			level += 1
-		assert isinstance(cmd, CmdLeaf)
-
-		try:
-			cmd.setup(args)
-		except CmdLineOptions.CmdLineError as ex:
-			if cmd.debug:
-				raise
-			parser.error(ex.args[0])
-
-		return cmd
 # }}}
 
-# Main starts here. {{{
-cmd = None
-try:
-	cmd = CmdTop().parse()
-	cmd.execute()
-except KeyboardInterrupt:
-	sys.exit("Interrupted.")
-except (FatalError, UserError) as ex:
-	if cmd is None or cmd.debug:
-		# Print the backtrace when debugging.
-		raise
-	sys.exit("%s: %s" % (type(ex).__name__, " ".join(ex.args)))
-# }}}
+# Main starts here.
+sys.exit(not CmdMain().run())
 
 # vim: set foldmethod=marker:
 # End of giccs.py
