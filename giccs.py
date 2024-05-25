@@ -4,6 +4,8 @@
 # args -> self
 # DirEnt.volatile -> obj?
 # maybe load glob2 on-demand
+# Globber: sorting?
+# COUNTER_SCRIPT -> dd?
 #
 # consistency check of remote backups
 # calculate/verify hash?
@@ -15,6 +17,7 @@
 # CmdFTPGet: --no-keep-mtime
 #
 # tabbing?
+# dynamic discovery
 # get, put
 # cat [-c <bytes>], page?
 # mv [--dir/--fname]
@@ -24,7 +27,7 @@
 #   * skip
 #   * error
 #   * ask
-#   * silent
+#   * force
 # overwrite-mode:
 #   * truncate
 #   * atomic
@@ -73,6 +76,7 @@ import contextlib, functools
 
 import btrfs
 
+sys.path.append("/home/adam/volatile/btrfs/giccs/lib")
 import google.cloud.storage
 import google.oauth2.service_account
 # }}}
@@ -802,8 +806,6 @@ class ConfigFileOptions(CmdLineOptions): # {{{
 class AccountOptions(ConfigFileOptions): # {{{
 	service_account_info: Optional[dict[str, str]] = None
 
-	gcs_client: Optional[google.cloud.storage.Client] = None
-
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
@@ -871,20 +873,15 @@ class AccountOptions(ConfigFileOptions): # {{{
 				wait_proc(cmd)
 
 	# Make a google.cloud.storage.Client from @self.service_account_info.
-	def get_gcs_client(self) -> google.cloud.storage.Client:
-		if self.gcs_client is not None:
-			return self.gcs_client
-
+	@functools.cached_property
+	def gcs_client(self) -> google.cloud.storage.Client:
 		if self.service_account_info is not None:
 			creds = google.oauth2.service_account.Credentials. \
 					from_service_account_info(
 						self.service_account_info)
 		else:
 			creds = None
-
-		self.gcs_client = google.cloud.storage.Client(
-							credentials=creds)
-		return self.gcs_client
+		return google.cloud.storage.Client(credentials=creds)
 # }}}
 
 # Provide options to specify the GCS bucket to use.
@@ -892,7 +889,6 @@ class BucketOptions(AccountOptions): # {{{
 	# Can be overridden by subclasses.
 	bucket_required: bool = False
 
-	bucket:		Optional[google.cloud.storage.Bucket] = None
 	bucket_name:	Optional[str] = None
 	bucket_labels:	Optional[dict[str, Optional[str]]] = None
 	prefix:		Optional[str] = None
@@ -957,13 +953,10 @@ class BucketOptions(AccountOptions): # {{{
 		return True
 
 	# Find the bucket specified on the command line.
-	def find_bucket(self) -> google.cloud.storage.Bucket:
-		if self.bucket is not None:
-			return self.bucket
-
-		gcs = self.get_gcs_client()
+	@functools.cached_property
+	def bucket(self) -> google.cloud.storage.Bucket:
 		if self.bucket_name is not None:
-			self.bucket = gcs.bucket(self.bucket_name)
+			self.bucket = self.gcs_client.bucket(self.bucket_name)
 			try:
 				if not self.bucket.exists():
 					raise UserError(
@@ -976,7 +969,7 @@ class BucketOptions(AccountOptions): # {{{
 			return self.bucket
 
 		found = [ ]
-		for bucket in gcs.list_buckets():
+		for bucket in self.gcs_client.list_buckets():
 			if self.bucket_matches(bucket):
 				found.append(bucket)
 
@@ -985,8 +978,7 @@ class BucketOptions(AccountOptions): # {{{
 		elif len(found) > 1:
 			raise UserError("More than one buckets found")
 		else:
-			self.bucket = found[0]
-			return self.bucket
+			return found[0]
 # }}}
 
 # Add --dry-run.
@@ -1253,49 +1245,14 @@ class AutodeleteOptions(CmdLineOptions): # {{{
 			self.autodelete = True
 # }}}
 
-# Add --compress/--decompress and --compressor/--decompressor.
-class CompressionOptions(CmdLineOptions): # {{{
+# Compression {{{
+class CompressionOptionsBase(CmdLineOptions):
 	DFLT_COMPRESSION	= "xz"
 	DFLT_COMPRESSOR		= (DFLT_COMPRESSION, "-c")
 	DFLT_DECOMPRESSOR	= (DFLT_COMPRESSION, "-dc")
 
 	compressor:		Optional[Sequence[str]] = None
-	index_compressor:	Optional[Sequence[str]] = None
-
-	def declare_arguments(self) -> None:
-		super().declare_arguments()
-
-		section = self.sections["compress"]
-		mutex = section.add_mutually_exclusive_group()
-		if isinstance(self, UploadBlobOptions):
-			mutex.add_enable_flag_no_dflt("--compress", "-Z")
-			mutex.add_disable_flag_no_dflt("--no-compress")
-			mutex.add_argument("--compressor", dest="compress")
-			if isinstance(self, CmdUpload):
-				mutex = section.add_mutually_exclusive_group()
-				mutex.add_enable_flag_no_dflt(
-						"--compress-index")
-				mutex.add_disable_flag_no_dflt(
-						"--no-compress-index")
-				mutex.add_argument("--index-compressor",
-						dest="compress_index")
-		else:
-			flags = [ "--decompress", "--compress", "-Z" ]
-			if isinstance(self, CmdGetIndex):
-				flags.insert(1, "--decompress-index")
-				flags.insert(-1, "--compress-index")
-			mutex.add_enable_flag_no_dflt(*flags, dest="compress")
-
-			flags = [ "--no-decompress", "--no-compress" ]
-			if isinstance(self, CmdGetIndex):
-				flags.insert(1, "--no-decompress-index")
-				flags.append("--no-compress-index")
-			mutex.add_disable_flag_no_dflt(*flags, dest="compress")
-
-			flags = [ "--decompressor" ]
-			if isinstance(self, CmdGetIndex):
-				flags.append("--index-decompressor")
-			mutex.add_argument(*flags, dest="compress")
+	decompressor:		Optional[Sequence[str]] = None
 
 	def get_compressor(self,
 			option: Union[None, bool, str], 
@@ -1331,40 +1288,100 @@ class CompressionOptions(CmdLineOptions): # {{{
 		else:
 			return fallback
 
+# Add --compress, --no-compress and --compressor.
+class CompressionOptions(CompressionOptionsBase):
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["compress"]
+		mutex = section.add_mutually_exclusive_group()
+		mutex.add_enable_flag_no_dflt("--compress", "-Z")
+		mutex.add_disable_flag_no_dflt("--no-compress")
+		mutex.add_argument("--compressor", dest="compress")
+
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
 
-		if isinstance(self, UploadBlobOptions):
-			self.compressor = self.get_compressor(
-					args.compress,
-					"compress",
-					"compressor",
-					"decompressor",
-					self.DFLT_COMPRESSOR)
-			if isinstance(self, CmdUpload):
-				self.index_compressor = self.get_compressor(
-						args.compress_index,
-						"compress-index",
-						"index-compressor",
-						"index-decompressor",
-						self.DFLT_COMPRESSOR,
-						self.DFLT_COMPRESSOR)
+		self.compressor = \
+			self.get_compressor(
+				args.compress, "compress",
+				"compressor", "decompressor",
+				self.DFLT_COMPRESSOR)
+
+# Add --compress-index, --no-compress-index and --index-compressor.
+class IndexCompressionOptions(CompressionOptionsBase):
+	index_compressor: Optional[Sequence[str]] = None
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["compress"]
+		mutex = section.add_mutually_exclusive_group()
+		mutex.add_enable_flag_no_dflt("--compress-index")
+		mutex.add_disable_flag_no_dflt("--no-compress-index")
+		mutex.add_argument("--index-compressor", dest="compress_index")
+
+	def post_validate(self, args: argparse.Namespace) -> None:
+		super().post_validate(args)
+
+		self.index_compressor = \
+			self.get_compressor(
+				args.compress_index, "compress-index",
+				"index-compressor", "index-decompressor",
+				self.DFLT_COMPRESSOR, self.DFLT_COMPRESSOR)
+
+# Add --decompress, --no-decompress and --decompressor.
+class DecompressionOptions(CompressionOptionsBase):
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["compress"]
+		mutex = section.add_mutually_exclusive_group()
+
+		flags = [ "--decompress" ]
+		if not isinstance(self, CompressionOptions):
+			flags.append("-Z")
+		mutex.add_enable_flag_no_dflt(*flags)
+
+		mutex.add_disable_flag_no_dflt("--no-decompress")
+		mutex.add_argument("--decompressor", dest="decompress")
+
+	def post_validate(self, args: argparse.Namespace) -> None:
+		super().post_validate(args)
+
+		if self.compressor is not None:
+			# CompressionOptions has enabled compression.
+			fallback = self.DFLT_DECOMPRESSOR
 		else:
-			if isinstance(self, CmdGetIndex):
-				self.compressor = self.get_compressor(
-						args.compress,
-						"compress-index",
-						"index-decompressor",
-						"index-compressor",
-						self.DFLT_DECOMPRESSOR,
-						self.DFLT_DECOMPRESSOR)
-			else:
-				self.compressor = self.get_compressor(
-						args.compress,
-						"compress",
-						"decompressor",
-						"compressor",
-						self.DFLT_DECOMPRESSOR)
+			fallback = None
+		self.decompressor = \
+			self.get_compressor(
+				args.decompress, "compress",
+				"decompressor", "compressor",
+				self.DFLT_DECOMPRESSOR, fallback)
+
+# Add --decompress-index, --no-decompress-index and --index-decompressor.
+class IndexDecompressionOptions(CompressionOptionsBase):
+	index_decompressor: Optional[Sequence[str]] = None
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["compress"]
+		mutex = section.add_mutually_exclusive_group()
+		mutex.add_enable_flag_no_dflt("--decompress-index")
+		mutex.add_disable_flag_no_dflt("--no-decompress-index")
+		mutex.add_argument("--index-decompressor",
+					dest="decompress_index")
+
+	def post_validate(self, args: argparse.Namespace) -> None:
+		super().post_validate(args)
+
+		self.index_decompressor = \
+			self.get_compressor(
+				args.decompress_index, "compress-index",
+				"index-decompressor", "index-compressor",
+				self.DFLT_DECOMPRESSOR, self.DFLT_DECOMPRESSOR)
 # }}}
 
 # Add --encryption-command/--encryption-key/--encryption-key-command/etc.
@@ -1486,8 +1503,9 @@ class EncryptionOptions(CmdLineOptions): # {{{
 
 class EncryptedBucketOptions(EncryptionOptions, BucketOptions):
 	# Initialize @self.subvolume if it hasn't been set explicitly.
-	def find_bucket(self) -> google.cloud.storage.Bucket:
-		bucket = super().find_bucket()
+	@property
+	def bucket(self) -> google.cloud.storage.Bucket:
+		bucket = super().bucket
 
 		if self.subvolume is None:
 			subvolume = [ bucket.name ]
@@ -1543,38 +1561,11 @@ class TransferOptions(CmdLineOptions): # {{{
 # }}}
 
 # Upload/DownloadBlobOptions {{{
-class UploadBlobOptions(CompressionOptions, EncryptionOptions,
-			TransferOptions, WetRunOptions):
-	reupload: bool = False
-	ignore_remote: bool = False
+class UploadBlobOptions(CompressionOptionsBase, EncryptionOptions,
+			TransferOptions):
+	pass
 
-	def declare_arguments(self) -> None:
-		super().declare_arguments()
-
-		section = self.sections["upload"]
-		section.add_enable_flag("--reupload")
-
-		section = self.sections["operation"]
-		section.add_enable_flag("--ignore-remote")
-
-	def pre_validate(self, args: argparse.Namespace) -> None:
-		super().pre_validate(args)
-
-		self.ignore_remote = args.ignore_remote
-		if self.ignore_remote and not (self.dry_run or self.wet_run):
-			raise self.CmdLineError(
-					"--ignore-remote only makes sense "
-					"with --dry-run/--wet-run")
-
-		self.reupload = args.reupload
-		if self.reupload and self.ignore_remote:
-			# With --reupload the remote backups to overwrite
-			# must exist.
-			raise self.CmdLineError(
-					"cannot specify --ignore-remote "
-					"with --reupload")
-
-class DownloadBlobOptions(CompressionOptions, EncryptionOptions,
+class DownloadBlobOptions(CompressionOptionsBase, EncryptionOptions,
 				TransferOptions):
 	pass
 # }}}
@@ -1883,16 +1874,16 @@ class InternalCipher: # {{{
 			...
 
 	# Header included with each block of ciphertext consisting of:
-	#   1) UUIDs unambiguously identifying the Backup it belongs to
+	#   1) an UUID unambiguously identifying the blob it belongs to
 	#   2) a pseudo-random sequence number unique for each ciphertext;
 	#      the first block contains the seed, from which the sequence
 	#      number of the remaining blocks are derived.
 	#
-	# 1) protects against swapping ciphertext blocks between Backups
-	# (or swapping entire Backups with each other) while 2) prevents
+	# 1) protects against swapping ciphertext blocks between blobs
+	# (or swapping entire blobs with each other) while 2) prevents
 	# the reordering of blocks within a Backup.
 	#
-	# Calculating a MAC for the whole Backup would be less secure because
+	# Calculating a MAC for the whole blob would be less secure because
 	# this way we can detect tampering as soon as possible, before piping
 	# data to btrfs receive, which only operates reliably and securely if
 	# the input is trustworthy.
@@ -1917,6 +1908,8 @@ class InternalCipher: # {{{
 	blob_uuid_bytes: bytes
 
 	wrapped: Optional[BinaryIO]
+	inbytes: int
+	outbytes: int
 
 	def __init__(self, key: bytes,
 			data_type_id: Optional[int] = None,
@@ -1933,6 +1926,7 @@ class InternalCipher: # {{{
 		self.blob_uuid_bytes = ensure_uuid(blob_uuid).bytes
 
 		self.wrapped = wrapped
+		self.inbytes = self.outbytes = 0
 
 	def init(self, wrapped: Optional[BinaryIO]) -> None:
 		assert self.wrapped is None
@@ -2004,6 +1998,7 @@ class InternalEncrypt(InternalCipher):
 			if n == ciphertext_len:
 				self.ciphertext = bytearray()
 				self.ciphertext_i = 0
+			self.outbytes += len(ciphertext)
 			return ciphertext
 
 		if self.ciphertext_i > 0:
@@ -2027,6 +2022,7 @@ class InternalEncrypt(InternalCipher):
 				prev = len(cleartext)
 				cleartext += self.wrapped.read(
 						self.CLEARTEXT_SIZE - prev)
+				self.inbytes += len(cleartext) - prev
 				if len(cleartext) == prev:
 					self.eof = True
 
@@ -2046,19 +2042,18 @@ class InternalEncrypt(InternalCipher):
 		if n is None or len(self.ciphertext) <= n:
 			ciphertext = self.ciphertext
 			self.ciphertext = bytearray()
+			self.outbytes += len(ciphertext)
 			return ciphertext
 		else:
 			ciphertext = memoryview(self.ciphertext)[:n]
 			self.ciphertext_i = n
+			self.outbytes += len(ciphertext)
 			return ciphertext
 
 class InternalDecrypt(InternalCipher):
 	nonce: Optional[bytearray]
 	prng: Optional[random.Random]
 	ciphertext: bytearray
-
-	inbytes: int
-	outbytes: int
 
 	def __init__(self, key: bytes,
 			data_type_id: Optional[int] = None,
@@ -2069,8 +2064,6 @@ class InternalDecrypt(InternalCipher):
 		self.nonce = None
 		self.prng = None
 		self.ciphertext = bytearray()
-
-		self.inbytes = self.outbytes = 0
 
 	def extract_nonce(self, buf: ByteString, buf_i: int = 0) \
 			-> Optional[int]:
@@ -2205,8 +2198,9 @@ class MetaCipher: # {{{
 		SUBVOLUME	= 2
 		BLOB_PATH	= 3
 		BLOB_SIZE	= 4
-		SNAPSHOT_UUID	= 5
-		PARENT_UUID	= 6
+		FILE_SIZE	= 5
+		SNAPSHOT_UUID	= 6
+		PARENT_UUID	= 7
 
 		def field(self):
 			return self.name.lower()
@@ -2276,7 +2270,7 @@ class MetaCipher: # {{{
 		return key
 
 	CipherClass = TypeVar("CipherClass", bound=InternalCipher)
-	def internal_cipher(self, cipher_class: CipherClass,
+	def internal_cipher(self, cipher_class: type[CipherClass],
 				data_type: DataType, wrapped: BinaryIO) \
 				-> CipherClass:
 		assert self.args.encrypt_internal()
@@ -2384,9 +2378,10 @@ class MetaBlob(MetaCipher): # {{{
 
 	blob_path: str
 	blob_size: Optional[int]
+	file_size: Optional[int]
 
 	# Whether metadata has changed.
-	dirty: bool
+	dirty: bool = False
 
 	@property
 	def name(self) -> str:
@@ -2396,15 +2391,11 @@ class MetaBlob(MetaCipher): # {{{
 	def subvolume(self) -> str:
 		return self.args.subvolume
 
-	def __init__(self):
-		raise AssertionError(
-			"Subclasses should implement __init__() "
-			"and call new() instead of super().__init__().")
-
 	# This is a context manager, so we can perform things post-__init__().
 	@contextlib.contextmanager
-	def new(self, args: EncryptedBucketOptions, path: str,
-			backups: Optional[Backups] = None):
+	def new(self: T, args: EncryptedBucketOptions, path: str,
+			backups: Optional[Backups] = None) \
+			-> contextlib.AbstractContextManager[T]:
 		super().__init__(args)
 
 		while True:
@@ -2440,16 +2431,25 @@ class MetaBlob(MetaCipher): # {{{
 		self.blob_size = None
 
 		# Return control to the caller.
-		yield
+		yield self
 
 		self.update_signature()
 		self.dirty = False
 
-	# Shouldn't be called from subclasses.
+	# Used if the caller just wants a new MetaBlob.  Shouldn't be called
+	# from subclasses.
 	def __init__(self, args: EncryptedBucketOptions, path: str):
 		with self.new(args, path):
 			pass
 
+	# Like above, but allows for customizing the initialization.
+	@classmethod
+	def create(cls: type[T], args: EncryptedBucketOptions, path: str) \
+			-> contextlib.AbstractContextManager[T]:
+		self = super().__new__(cls)
+		return self.new(args, path)
+
+	# Create a MetaBlob from and existing @gcs_blob.
 	@classmethod
 	def init(cls: type[T], args: EncryptedBucketOptions,
 			gcs_blob: google.cloud.storage.Blob) -> T:
@@ -2510,6 +2510,12 @@ class MetaBlob(MetaCipher): # {{{
 		else:
 			self.blob_size = None
 
+		if self.has_metadata(self.DataType.FILE_SIZE):
+			self.file_size = self.get_metadata(
+						self.DataType.FILE_SIZE)
+		else:
+			self.file_size = None
+
 		if signature is not None:
 			if signature != self.calc_signature().digest():
 				raise SecurityError(
@@ -2527,11 +2533,20 @@ class MetaBlob(MetaCipher): # {{{
 			return None
 		return self
 
+	# Called by init().
 	def setup(self) -> None:
 		pass
 
 	def __str__(self):
 		return self.blob_path
+
+	def encode_int(self, value: Optional[int], width: int = 8) -> bytes:
+		if value is None:
+			value = (1 << 8*width) - 1
+		return value.to_bytes(8, "big")
+
+	def decode_int(self, value: bytes) -> int:
+		return int.from_bytes(value, "big")
 
 	def calc_signature(self) -> Hasher:
 		import hashlib
@@ -2545,8 +2560,8 @@ class MetaBlob(MetaCipher): # {{{
 		hasher.update(self.blob_path.encode())
 		hasher.update(b'\0')
 
-		blob_size = self.blob_size if self.blob_size is not None else 0
-		hasher.update(blob_size.to_bytes(8, "big"))
+		hasher.update(self.encode_int(self.blob_size))
+		hasher.update(self.encode_int(self.file_size))
 
 		return hasher
 
@@ -2663,7 +2678,7 @@ class MetaBlob(MetaCipher): # {{{
 				"%s[%s]: unexpected metadata size (%d != %d)"
 				% (self.name, data_type.field(),
 					len(metadata), width))
-		return int.from_bytes(metadata, "big")
+		return self.decode_int(metadata)
 
 	def set_integer_metadata(self, data_type: MetaCipher.DataType,
 					value: int, width: int = 8) -> None:
@@ -2672,7 +2687,7 @@ class MetaBlob(MetaCipher): # {{{
 		else:
 			metadata = self.encrypt_metadata(
 					data_type,
-					value.to_bytes(width, "big"))
+					self.encode_int(value, width))
 		self.set_raw_metadata(data_type, metadata)
 
 	def get_uuid_metadata(self, data_type: MetaCipher.DataType) \
@@ -2714,6 +2729,8 @@ class MetaBlob(MetaCipher): # {{{
 			return self.get_text_metadata(data_type)
 		elif data_type == self.DataType.BLOB_SIZE:
 			return self.get_integer_metadata(data_type)
+		elif data_type == self.DataType.FILE_SIZE:
+			return self.get_integer_metadata(data_type)
 		else:
 			assert False
 
@@ -2733,6 +2750,9 @@ class MetaBlob(MetaCipher): # {{{
 			if self.args.verify_blob_size:
 				self.set_integer_metadata(data_type, value)
 				self.blob_size = value
+		elif data_type == self.DataType.FILE_SIZE:
+			self.set_integer_metadata(data_type, value)
+			self.file_size = value
 		else:
 			assert False
 		return value
@@ -2956,6 +2976,69 @@ class OpenDir: # {{{
 		return self.fd
 # }}}
 
+# Store the size of multiple MetaBlob:s.
+class SizeAccumulator: # {{{
+	_blob_size: Optional[int] = None
+	_blob_size_incomplete: bool = False
+
+	_file_size: Optional[int] = None
+	_file_size_incomplete: bool = False
+
+	def __init__(self, init: Optional[Union[int, MetaBlob]] = None):
+		if isinstance(init, int):
+			self._blob_size = init
+		elif isinstance(init, MetaBlob):
+			self.add(init)
+
+	def _add(self, attr: str, value: Optional[int]) -> None:
+		if value is None:
+			setattr(self, f"{attr}_incomplete", True)
+		elif getattr(self, attr) is None:
+			setattr(self, attr, value)
+		else:
+			setattr(self, attr, getattr(self, attr) + value)
+
+	def add(self, what: Union[Self, MetaBlob]) -> None:
+		if isinstance(what, self.__class__):
+			self._add("_blob_size", what._blob_size)
+			self._blob_size_incomplete |= \
+					what._blob_size_incomplete
+			self._add("_file_size", what._file_size)
+			self._file_size_incomplete |= \
+					what._file_size_incomplete
+		else:
+			self._add("_blob_size", what.gcs_blob.size)
+			self._add("_file_size", what.file_size)
+
+	def _get(self, attr: str, **kw) -> Optional[int]:
+		value = getattr(self, attr)
+		if value is None:
+			return None
+
+		value = humanize_size(value, **kw)
+		if getattr(self, f"{attr}_incomplete"):
+			value += '+'
+		return value
+
+	def blob_size(self, **kw) -> Optional[str]:
+		return self._get("_blob_size")
+
+	def file_size(self, **kw) -> Optional[str]:
+		return self._get("_file_size")
+
+	def get(self, **kw) -> Optional[str]:
+		blob_size = self.blob_size(**kw)
+		if blob_size is None:
+			return None
+		sizes = [ blob_size ]
+
+		file_size = self.file_size(**kw)
+		if file_size is not None:
+			sizes.append(file_size)
+
+		return '/'.join(sizes)
+# }}}
+
 # A chain of subprocesses.  When the Pipeline is deleted, its subprocesses
 # are killed.
 class Pipeline: # {{{
@@ -3136,6 +3219,9 @@ class VirtualGlobber(Globber): # {{{
 				volatile: bool = False) -> DirEnt:
 			return cls(fname, { }, obj=obj, volatile=volatile)
 
+		def __lt__(self, other: DirEnt) -> bool:
+			return self.fname < other.fname
+
 		def __eq__(self, other: DirEnt) -> bool:
 			return id(self) == id(other)
 
@@ -3184,7 +3270,7 @@ class VirtualGlobber(Globber): # {{{
 
 		def __iter__(self) -> Iterator[Self]:
 			self.must_be_dir()
-			return iter(self.children.values())
+			return iter(sorted(self.children.values()))
 
 		def __contains__(self, fname: str) -> bool:
 			self.must_be_dir()
@@ -3229,13 +3315,13 @@ class VirtualGlobber(Globber): # {{{
 
 		def ls(self) -> Iterable[str]:
 			self.must_be_dir()
-			return self.children.keys()
+			return sorted(self.children.keys())
 
 		def scan(self, include_self: bool = True) -> Iterator[DirEnt]:
 			if include_self:
 				yield self
 			if self.isdir():
-				for child in self.children.values():
+				for child in self:
 					yield from child.scan()
 
 		# Remove this entry's branch if it's volatile.
@@ -3434,7 +3520,7 @@ def discover_remote_blobs(args: EncryptedBucketOptions,
 	if prefix is not None:
 		prefix += '/'
 
-	for blob in args.find_bucket().list_blobs(prefix=prefix):
+	for blob in args.bucket.list_blobs(prefix=prefix):
 		if (blob := cls.init(args, blob)) is not None:
 			yield blob
 
@@ -3457,9 +3543,26 @@ def write_header(blob: MetaBlob) -> Callable[[], None]:
 
 	return write_header
 
+# Pump stdin to stdout while counting the number of bytes transferred,
+# written to the file descriptor designated by the first argument.
+COUNTER_SCRIPT = """
+import sys, os
+
+n = 0
+while True:
+	buf = os.read(sys.stdin.fileno(), 1024*1024)
+	if not buf:
+		break
+	os.write(sys.stdout.fileno(), buf)
+	n += len(buf)
+open(int(sys.argv[1]), 'w').write(str(n))
+"""
+
 def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 		command: Optional[Sequence[str]] = None,
-		pipeline_stdin: Optional[Pipeline.StdioType] = None) -> int:
+		pipeline_stdin: Optional[Pipeline.StdioType] = None,
+		count_bytes_in: bool = True, wet_run: bool = False,
+		overwrite: Optional[bool] = None) -> int:
 	assert command is not None or pipeline_stdin is not None
 
 	if args.encrypt_external() and args.add_header_to_blob:
@@ -3482,28 +3585,65 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 	if args.encrypt_external():
 		pipeline.append(blob.external_encrypt())
 
+	bytes_in_counter = None
+	if pipeline and (command is None or len(pipeline) > 1) \
+			and count_bytes_in:
+		if not isinstance(pipeline_stdin, io.IOBase):
+			# Insert @bytes_in_counter after the @command,
+			# counting its output.
+			assert command is not None
+			bytes_in_counter = { }
+			pipeline.insert(1, bytes_in_counter)
+		elif stat.S_ISREG(os.stat(pipeline_stdin.fileno()).st_mode):
+			# We don't need to count the file size, just retrieve
+			# it when we're done (who knows, it might change
+			# meanwhile).
+			bytes_in_counter = pipeline_stdin
+		else:	# Insert @bytes_in_counter before anything else.
+			# counting @pipeline_stdin.
+			bytes_in_counter = { }
+			pipeline.insert(0, bytes_in_counter)
+
+		if isinstance(bytes_in_counter, dict):
+			r, w = os.pipe()
+			bytes_in_counter["executable"] = sys.executable
+			bytes_in_counter["args"] = \
+				("python3", "-c", COUNTER_SCRIPT, str(w))
+			bytes_in_counter["pass_fds"] = (w,)
+			bytes_in_counter = (r, w)
+
 	# @pipeline could be empty.
 	kw = { "stdout": subprocess.PIPE }
 	if pipeline_stdin is not None:
 		kw["stdin"] = pipeline_stdin
 	pipeline = Pipeline(pipeline, **kw)
 
+	if isinstance(bytes_in_counter, tuple):
+		r, w = bytes_in_counter
+		os.close(w)
+		bytes_in_counter = r
+
 	src = pipeline.stdout()
 	if args.encrypt_internal():
 		src = blob.internal_encrypt(blob.DataType.PAYLOAD, src)
+		if count_bytes_in and bytes_in_counter is None:
+			bytes_in_counter = src
 
 	# Check the @pipeline for errors before returning the last read
 	# to upload_from_file().  If pipeline.wait() throws an exception
 	# the upload will fail and not create the blob.
 	src = Progressometer(src, args.progress, final_cb=pipeline.wait)
+	if count_bytes_in and bytes_in_counter is None:
+		bytes_in_counter = src
 
-	if not args.wet_run:
+	if not wet_run:
 		try:
 			flags = args.get_retry_flags()
-			if args.reupload:
+			if overwrite is True:
 				# The blob to update must exist.
 				flags["if_generation_not_match"] = 0
-			else:	# The blob must not exist yet.
+			elif overwrite is False:
+				# The blob must not exist yet.
 				flags["if_generation_match"] = 0
 			if args.upload_chunk_size is not None:
 				blob.gcs_blob.chunk_size = \
@@ -3511,25 +3651,27 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			blob.gcs_blob.upload_from_file(src, checksum="md5",
 							**flags)
 		except google.api_core.exceptions.PreconditionFailed as ex:
-			if args.reupload:
+			if overwrite is True:
 				raise ConsistencyError(
 					"%s does not exist in bucket"
-					% blob.name)
-			else:
+					% blob.name) from ex
+			elif overwrite is False:
 				raise ConsistencyError(
 					"%s already exists in bucket"
-					% blob.name)
+					% blob.name) from ex
+			else:
+				raise
 		except GoogleAPICallError as ex:
 			raise FatalError(ex) from ex
 	else:	# In case of --wet-run just read @src until we hit EOF.
-		if not args.ignore_remote:
+		if overwrite is not None:
 			exists = blob.gcs_blob.bucket.get_blob(blob.name) \
 					is not None
-			if exists and not args.reupload:
+			if exists and not overwrite:
 				raise ConsistencyError(
 					"%s already exists in bucket"
 					% blob.name)
-			elif args.reupload and not exists:
+			elif overwrite and not exists:
 				raise ConsistencyError(
 					"%s does not exist in bucket"
 					% blob.name)
@@ -3538,7 +3680,7 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 
 	src.final_progress()
 
-	if not args.wet_run and blob.gcs_blob.size != src.bytes_transferred:
+	if not wet_run and blob.gcs_blob.size != src.bytes_transferred:
 		# GCS has a different idea about the blob's size than us.
 		try:
 			blob.gcs_blob.delete()
@@ -3549,8 +3691,21 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 				"Blob size mismatch (%d != %d)"
 				% (blob.gcs_blob.size, src.bytes_transferred))
 
+	if bytes_in_counter is not None:
+		if isinstance(bytes_in_counter, io.IOBase):
+			bytes_in = os.stat(pipeline_stdin.fileno()).st_size
+		elif isinstance(bytes_in_counter, int):
+			bytes_in = int(open(bytes_in_counter).readline())
+		elif isinstance(bytes_in_counter, InternalEncrypt):
+			bytes_in = bytes_in_counter.inbytes
+		elif isinstance(bytes_in_counter, Progressometer):
+			bytes_in = bytes_in_counter.bytes_transferred
+		else:
+			assert False
+		blob.set_metadata(blob.DataType.FILE_SIZE, bytes_in)
+
 	blob.set_metadata(blob.DataType.BLOB_SIZE, src.bytes_transferred)
-	if not args.wet_run:
+	if not wet_run:
 		# In case of failure the blob won't be usable without
 		# --no-verify-blob-size, so it's okay not to delete it.
 		blob.sync_metadata()
@@ -3616,18 +3771,18 @@ def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 
 		if not isinstance(command, dict):
 			command = { }
+		command["executable"] = sys.executable
 		command["args"] = \
 			("python3", "-c", HEADER_VERIFICATION_SCRIPT,
 				str(blob.DataType.PAYLOAD.value),
 				str(blob.blob_uuid)) \
 			+ command_args
-		command["executable"] = sys.executable
 
 	pipeline = [ ]
 	if args.encrypt_external():
 		pipeline.append(blob.external_decrypt())
-	if args.compressor is not None:
-		pipeline.append(args.compressor)
+	if args.decompressor is not None:
+		pipeline.append(args.decompressor)
 	if command is not None:
 		pipeline.append(command)
 
@@ -3859,7 +4014,7 @@ class CmdListBuckets(CmdExec, CommonOptions):
 
 def cmd_list_buckets(args: CmdListBuckets) -> None:
 	found = False
-	for bucket in args.get_gcs_client().list_buckets():
+	for bucket in args.gcs_client.list_buckets():
 		if not args.bucket_matches(bucket):
 			continue
 		found = True
@@ -3938,8 +4093,8 @@ def cmd_list_remote(args: CmdListRemote) -> None:
 	snapshots = discover_local_snapshots(args.dir) \
 			if args.dir is not None else None
 
-	nbytes = 0
 	nbackups = 0
+	nbytes = SizeAccumulator()
 	for backup in discover_remote_backups(args).ordered:
 		line = [ ]
 		if args.show_uuid:
@@ -3960,7 +4115,7 @@ def cmd_list_remote(args: CmdListRemote) -> None:
 					blob.PayloadType.FULL,
 					blob.PayloadType.DELTA):
 				nbackups += 1
-				nbytes += blob.gcs_blob.size
+				nbytes.add(blob)
 
 			if args.verbose:
 				created = blob.gcs_blob \
@@ -3968,13 +4123,12 @@ def cmd_list_remote(args: CmdListRemote) -> None:
 				print("", blob.payload_type.field(),
 					time.strftime("%Y-%m-%d %H:%M:%S",
 						time.localtime(created)),
-					humanize_size(blob.gcs_blob.size),
-					blob.name,
+	  				SizeAccumulator(blob).get(), blob.name,
 					sep="\t")
 
 	if args.verbose and nbackups > 1:
 		print()
-		print("%d backups in %s." % (nbackups, humanize_size(nbytes)))
+		print("%d backups in %s." % (nbackups, nbytes.get()))
 # }}}
 
 # The delete local subcommand {{{
@@ -4325,7 +4479,7 @@ def cmd_list_index(args: CmdListIndex) -> None:
 
 # The index get subcommand {{{
 class CmdGetIndex(CmdExec, CommonOptions, DownloadBlobOptions,
-			SelectionOptions):
+			IndexDecompressionOptions, SelectionOptions):
 	cmd = "get"
 	help = "TODO"
 
@@ -4399,9 +4553,11 @@ def cmd_get_index(args: CmdGetIndex) -> None:
 					os.path.join(output_dir, output_fname)
 				output = open(output_path, 'w')
 
-			bytes_transferred += download_blob(
-						args, backup.index,
-						pipeline_stdout=output)
+			with args.override_flags(
+					decompressor=args.index_decompressor):
+				bytes_transferred += download_blob(
+							args, backup.index,
+							pipeline_stdout=output)
 
 			if output_dir is not None:
 				output.close()
@@ -4509,16 +4665,31 @@ def cmd_delete_index(args: CmdDeleteIndex) -> None:
 
 # The upload subcommand {{{
 class CmdUpload(CmdExec, UploadDownloadOptions, UploadBlobOptions,
+		IndexCompressionOptions, CompressionOptions,
 		SnapshotSelectionOptions):
 	cmd = "upload"
 	help = "TODO"
 
 	selection_section = "snapshot"
 
+	reupload: bool = False
+	store_snapshot_size: bool = True
+	ignore_remote: bool = False
 	index: Optional[bool] = None
+
+	@property
+	def overwrite(self) -> Optional[bool]:
+		return None if self.ignore_remote else self.reupload
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
+
+		section = self.sections["upload"]
+		section.add_enable_flag("--reupload")
+		section.add_disable_flag("--no-store-snapshot-size")
+
+		section = self.sections["operation"]
+		section.add_enable_flag("--ignore-remote")
 
 		section = self.sections["index"]
 		mutex = section.add_mutually_exclusive_group()
@@ -4528,6 +4699,25 @@ class CmdUpload(CmdExec, UploadDownloadOptions, UploadBlobOptions,
 		section.add_argument("--index-fmt")
 
 		self.add_dir()
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+
+		self.store_snapshot_size = args.store_snapshot_size
+
+		self.ignore_remote = args.ignore_remote
+		if self.ignore_remote and not (self.dry_run or self.wet_run):
+			raise self.CmdLineError(
+					"--ignore-remote only makes sense "
+					"with --dry-run/--wet-run")
+
+		self.reupload = args.reupload
+		if self.reupload and self.ignore_remote:
+			# With --reupload the remote backups to overwrite
+			# must exist.
+			raise self.CmdLineError(
+					"cannot specify --ignore-remote "
+					"with --reupload")
 
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
@@ -4586,7 +4776,9 @@ def upload_index(args: CmdUpload, snapshot: Snapshot, backups: Backups) \
 		cmd = tuple(map(transformer, args.indexer))
 
 		with args.override_flags(compressor=args.index_compressor):
-			return upload_blob(args, blob, cmd)
+			return upload_blob(args, blob, cmd,
+						wet_run=args.wet_run,
+						overwrite=args.overwrite)
 	finally:
 		print()
 
@@ -4594,7 +4786,10 @@ def upload_snapshot(args: CmdUpload, blob: MetaBlob,
 			btrfs_send: Sequence[str]) -> int:
 	if args.wet_run_no_data:
 		btrfs_send = (*btrfs_send, "--no-data")
-	return upload_blob(args, blob, btrfs_send)
+	return upload_blob(args, blob, btrfs_send,
+				count_bytes_in=args.store_snapshot_size,
+				wet_run=args.wet_run,
+				overwrite=args.overwrite)
 
 def upload_full(args: CmdUpload, snapshot: Snapshot, backups: Backups) -> int:
 	if args.dry_run:
@@ -4836,7 +5031,8 @@ def cmd_upload(args: CmdUpload) -> None:
 # }}}
 
 # The download subcommand {{{
-class CmdDownload(CmdExec, DownloadBlobOptions, UploadDownloadOptions):
+class CmdDownload(CmdExec, DownloadBlobOptions, UploadDownloadOptions,
+			DecompressionOptions):
 	cmd = "download"
 	help = "TODO"
 
@@ -5129,8 +5325,30 @@ class FTPClient:
 		assert isinstance(self, CmdFTP)
 		return VirtualGlobber(discover_remote_blobs(self))
 
+	# Right-justify the @col:th column in @rows, or delete it.
+	def rjust_column(self, rows: Sequence[list[Optional[str]]], col: int,
+		  		min_width: Optional[int] = None) -> None:
+		width = None
+		for row in rows:
+			if row[col] is not None:
+				width = max(width or 0, len(row[col]))
 
-class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions, FTPClient):
+		if width is not None and min_width is not None:
+			width = max(width, min_width)
+
+		for row in rows:
+			if width is None:
+				del row[col]
+			elif row[col] is not None:
+				row[col] = row[col].rjust(width)
+			elif col < len(row) - 1:
+				row[col] = ' ' * width
+			else:
+				del row[col]
+
+class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
+		DecompressionOptions, CompressionOptions,
+		FTPClient):
 	cmd = "ftp"
 	help = "TODO"
 
@@ -5401,10 +5619,8 @@ class CmdFTPDir(CmdExec):
 			files: Iterable[tuple[str, VirtualGlobber.DirEnt]]) \
 			-> None:
 		lines = [ ]
-		total_size = 0
 		nfiles = ndirs = 0
-		timestamp_width = None
-		has_no_timestamp = False
+		total_size = SizeAccumulator()
 		for path, dent in files:
 			line = [ ]
 			lines.append(line)
@@ -5412,41 +5628,29 @@ class CmdFTPDir(CmdExec):
 			if dent.obj is not None:
 				created = dent.obj.gcs_blob.time_created \
 						.timestamp()
-				timestamp = time.strftime(
+				line.append(time.strftime(
 						"%Y-%m-%d %H:%M:%S",
-						time.localtime(created))
-				timestamp_width = len(timestamp)
-				line.append(timestamp)
+						time.localtime(created)))
 			else:
-				has_no_timestamp = True
 				line.append(None)
 
 			if dent.isdir():
 				ndirs += 1
 				line.append("<DIR>")
+				line.append(None)
 			else:
 				nfiles += 1
-				size = dent.obj.gcs_blob.size
-				total_size += size
-				line.append(humanize_size(
-						size, with_exact=True))
+				size = SizeAccumulator(dent.obj)
+				total_size.add(size)
+
+				line.append(size.blob_size(with_exact=True))
+				line.append(size.file_size(with_exact=True))
 
 			line.append(path)
 
-		if timestamp_width is not None:
-			max_size_width = max(len(line[1]) for line in lines)
-			max_size_width = max(max_size_width, 14)
-			for line in lines:
-				line[1] = line[1].rjust(max_size_width)
-
-		if has_no_timestamp:
-			for line in lines:
-				if line[0] is not None:
-					pass
-				elif timestamp_width is not None:
-					line[0] = ' ' * timestamp_width
-				else:
-					del line[0]
+		self.rjust_column(lines, 2, 14)
+		self.rjust_column(lines, 1, 14 if nfiles > 0 else None)
+		self.rjust_column(lines, 0)
 
 		if nfiles + ndirs > 1:
 			line = [ "total:" ]
@@ -5459,11 +5663,9 @@ class CmdFTPDir(CmdExec):
 				if ndirs > 0:
 					line.append("and")
 				line.append(str(nfiles))
-				line.append(
-					"file" if nfiles == 1
-					else "files")
+				line.append("file" if nfiles == 1 else "files")
 				line.append("in")
-				line.append(humanize_size(total_size))
+				line.append(total_size.get())
 			print(*line, file=self.output)
 
 		for line in lines:
@@ -5531,47 +5733,54 @@ class CmdFTPDu(CmdExec):
 		super().pre_validate(args)
 		self.what = args.what
 
-	def duit(self, dent: VirtualGlobber.DirEnt) -> tuple[int, int]:
+	def duit(self, dent: VirtualGlobber.DirEnt) \
+			-> tuple[int, SizeAccumulator]:
 		if dent.isdir():
-			total_files = total_size = 0
+			total_files = 0
+			total_size = SizeAccumulator(0)
 			for child in dent:
 				n, size = self.duit(child)
 				total_files += n
-				total_size += size
+				total_size.add(size)
 			return total_files, total_size
 		elif dent.obj is not None:
-			return (1, dent.obj.gcs_blob.size)
+			return (1, SizeAccumulator(dent.obj))
 		else:
-			return (1, 0)
+			return (1, SizeAccumulator())
 
 	def execute(self: _CmdFTPDu) -> None:
-		total_files = total_size = 0
 		if self.what:
-			sizes = [ ]
+			lines = [ ]
 			has_dirs = False
+			total_files = 0
+			total_size = SizeAccumulator(0)
 			for match in self.remote.globs(self.what):
 				dent = self.remote.lookup(match)
 				has_dirs |= dent.isdir()
 
 				n, size = self.duit(dent)
 				total_files += n
-				total_size += size
+				total_size.add(size)
 
-				size = humanize_size(size, with_exact=True)
-				sizes.append((match, size))
+				lines.append([
+					size.blob_size(with_exact=True),
+					size.file_size(with_exact=True),
+					match,
+				])
 
 			# @self.what must have matched something.
-			assert len(sizes) > 0
-			max_size_width = max(len(line[1]) for line in sizes)
-			for match, size in sizes:
-				print(size.rjust(max_size_width), match)
+			assert len(lines) > 0
+			self.rjust_column(lines, 1, 10)
+			self.rjust_column(lines, 0)
+			for line in lines:
+				print(*line)
 
 			if total_files <= 1 and not has_dirs:
 				return
 		else:
 			total_files, total_size = self.duit(self.remote.cwd)
 
-		line = [ humanize_size(total_size) ]
+		line = [ total_size.get() ]
 		line.append("in")
 		line.append(str(total_files))
 		line.append("file" if total_files == 1 else "files")
@@ -5738,6 +5947,18 @@ class CmdFTPPut(CmdExec):
 	def execute(self) -> None:
 		cmd_ftp_put(self)
 
+def upload_file(self: _CmdFTPPut,
+		src: Union[str, os.PathLike], dst: Union[str, os.PathLike]) \
+		-> int:
+	with MetaBlob.create(self, str(dst)) as blob:
+		pass
+
+	print(f"Uploading {src}...", end="", flush=True)
+	try:
+		return upload_blob(self, blob, pipeline_stdin=open(src, "rb"))
+	finally:
+		print()
+
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	if isinstance(self.parent, CmdFTPShell):
 		local = self.local.globs(map(os.path.expanduser, self.src))
@@ -5774,8 +5995,8 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			dst = remote.path()
 			if remote.isdir():
 				dst = dst.joinpath(os.path.basename(src))
-			print(f"UPLOAD({src} => {dst})")
-			upload_blob(self, MetaBlob(self, str(dst)), pipeline_stdin=open(src))
+			#print(f"UPLOAD({src} => {dst})")
+			upload_file(self, src, dst)
 			continue
 
 		src_top = pathlib.PurePath(src)
@@ -5791,8 +6012,13 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 				src = dirpath / fname
 				if stat.S_ISREG(os.stat(src).st_mode):
 					dst = dst_dir / fname
-					print(f"UPLOAD({src} => {dst})")
+					print(f"Uploading {src}...", end="")
+					#print(f"UPLOAD({src} => {dst})")
+					upload_blob(self,
+						MetaBlob(self, str(dst)),
+						pipeline_stdin=open(src))
 
+			# Don't descend into @dirs we've @seen.
 			if seen is not None:
 				sbuf = os.stat(dirpath)
 				seen.add((sbuf.st_dev, sbuf.st_ino))
@@ -5853,8 +6079,15 @@ class CmdMain(CmdTop):
 	  		CmdUpload(), CmdDownload(), CmdFTP())
 # }}}
 
-# Main starts here.
-sys.exit(not CmdMain().run())
+# Main starts here. {{{
+main = CmdMain()
+try:
+	sys.exit(not main.run())
+except KeyboardInterrupt:
+	if not main.debug:
+		sys.exit(1)
+	raise
+# }}}
 
 # vim: set foldmethod=marker:
 # End of giccs.py
