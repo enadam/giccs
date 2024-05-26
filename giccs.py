@@ -3,9 +3,7 @@
 # TODO: {{{
 # args -> self
 # DirEnt.volatile -> obj?
-# maybe load glob2 on-demand
-# Globber: sorting?
-# COUNTER_SCRIPT -> dd?
+# support ftp + no encrypt metadata + prefix
 #
 # consistency check of remote backups
 # calculate/verify hash?
@@ -2428,7 +2426,7 @@ class MetaBlob(MetaCipher): # {{{
 
 		self.set_metadata(self.DataType.SUBVOLUME, self.subvolume)
 		self.set_metadata(self.DataType.BLOB_PATH, path)
-		self.blob_size = None
+		self.blob_size = self.file_size = None
 
 		# Return control to the caller.
 		yield self
@@ -3074,6 +3072,9 @@ class Pipeline: # {{{
 			self.processes.append(subprocess.Popen(**cmd,
 				stdin=proc_stdin, stdout=proc_stdout))
 
+			if cmd.get("stderr") == subprocess.PIPE:
+				cmd["stderr"] = self.processes[-1].stderr
+
 		self._stdin = stdin
 		self._stdout = stdout
 		if not self.processes \
@@ -3193,6 +3194,9 @@ class Globber(glob2.Globber): # {{{
 				yield matches
 			else:
 				yield from matches
+
+	def listdir(self, path: str) -> list[str]:
+		return sorted(super().listdir(path))
 # }}}
 
 # A virtual file system.
@@ -3392,10 +3396,22 @@ class VirtualGlobber(Globber): # {{{
 
 		return dent
 
-	def chdir(self, path: str) -> None:
-		dent = self._lookup(path)
+	def chdir(self, path: str, create: bool = False) -> None:
+		dent = self._lookup(path, create)
 		dent.must_be_dir()
 		self.cwd = dent
+
+	def chroot(self, path: str, create: bool = False) -> None:
+		dent = self._lookup(path, create)
+		dent.must_be_dir()
+
+		if not self.cwd.is_parent(dent):
+			# @self.cwd is not under the new root.
+			self.cwd = dent
+		self.root = dent
+
+		dent.fname = '/'
+		dent.parent = None
 
 	def listdir(self, path: str) -> list[str]:
 		return self._lookup(path).ls()
@@ -3543,21 +3559,6 @@ def write_header(blob: MetaBlob) -> Callable[[], None]:
 
 	return write_header
 
-# Pump stdin to stdout while counting the number of bytes transferred,
-# written to the file descriptor designated by the first argument.
-COUNTER_SCRIPT = """
-import sys, os
-
-n = 0
-while True:
-	buf = os.read(sys.stdin.fileno(), 1024*1024)
-	if not buf:
-		break
-	os.write(sys.stdout.fileno(), buf)
-	n += len(buf)
-open(int(sys.argv[1]), 'w').write(str(n))
-"""
-
 def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 		command: Optional[Sequence[str]] = None,
 		pipeline_stdin: Optional[Pipeline.StdioType] = None,
@@ -3605,23 +3606,15 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			pipeline.insert(0, bytes_in_counter)
 
 		if isinstance(bytes_in_counter, dict):
-			r, w = os.pipe()
-			bytes_in_counter["executable"] = sys.executable
-			bytes_in_counter["args"] = \
-				("python3", "-c", COUNTER_SCRIPT, str(w))
-			bytes_in_counter["pass_fds"] = (w,)
-			bytes_in_counter = (r, w)
+			# Use dd(1) to count its input.
+			bytes_in_counter["args"] = ("dd", "bs=4M")
+			bytes_in_counter["stderr"] = subprocess.PIPE
 
 	# @pipeline could be empty.
 	kw = { "stdout": subprocess.PIPE }
 	if pipeline_stdin is not None:
 		kw["stdin"] = pipeline_stdin
 	pipeline = Pipeline(pipeline, **kw)
-
-	if isinstance(bytes_in_counter, tuple):
-		r, w = bytes_in_counter
-		os.close(w)
-		bytes_in_counter = r
 
 	src = pipeline.stdout()
 	if args.encrypt_internal():
@@ -3694,8 +3687,11 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 	if bytes_in_counter is not None:
 		if isinstance(bytes_in_counter, io.IOBase):
 			bytes_in = os.stat(pipeline_stdin.fileno()).st_size
-		elif isinstance(bytes_in_counter, int):
-			bytes_in = int(open(bytes_in_counter).readline())
+		elif isinstance(bytes_in_counter, dict):
+			# Parse the stderr of dd(1).
+			out = bytes_in_counter["stderr"].read().decode()
+			m = re.search(r"^(\d+) bytes ", out, re.MULTILINE)
+			bytes_in = int(m.group(1))
 		elif isinstance(bytes_in_counter, InternalEncrypt):
 			bytes_in = bytes_in_counter.inbytes
 		elif isinstance(bytes_in_counter, Progressometer):
@@ -5071,8 +5067,8 @@ class CmdDownload(CmdExec, DownloadBlobOptions, UploadDownloadOptions,
 	def execute(self) -> None:
 		cmd_download(self)
 
-def download_backup(args: CmdDownload, fname: str,
-			blob: google.cloud.storage.Blob,
+def download_backup(args: CmdDownload,
+		    	fname: str, blob: BackupBlob,
 			btrfs_recv: Sequence[str]) -> int:
 	if not args.ignore_local and os.path.exists(
 					os.path.join(args.dir, fname)):
@@ -5323,7 +5319,11 @@ class FTPClient:
 	@functools.cached_property
 	def remote(self):
 		assert isinstance(self, CmdFTP)
-		return VirtualGlobber(discover_remote_blobs(self))
+
+		globber = VirtualGlobber(discover_remote_blobs(self))
+		if self.prefix is not None:
+			globber.chroot(self.prefix, create=True)
+		return globber
 
 	# Right-justify the @col:th column in @rows, or delete it.
 	def rjust_column(self, rows: Sequence[list[Optional[str]]], col: int,
@@ -5352,11 +5352,32 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 	cmd = "ftp"
 	help = "TODO"
 
+	load_all_blobs: bool = False
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["bucket"]
+		section.add_enable_flag_no_dflt("--load-all-blobs")
+
+	def post_validate(self, args: argparse.Namespace) -> None:
+		super().post_validate(args)
+
+		self.merge_options_from_ini(args, "load_all_blobs", tpe=bool)
+		if self.encrypt_metadata:
+			# Blob names aren't arranges hierarchically,
+			# we can't load them incrementally.
+			self.load_all_blobs = True
+		elif args.load_all_blobs is not None:
+			self.load_all_blobs = args.load_all_blobs
+
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdFTPDir(self), CmdFTPDu(self), CmdFTPRm(self),
 			CmdFTPGet(self), CmdFTPPut(self))
 
+	# Like shlex.split(), split a line of input into tokens,
+	# paying attention to quotation and escaping.
 	def split(self, s: str) -> Iterable[str]:
 		token = None
 		quoted = None
@@ -5470,8 +5491,8 @@ class CmdFTPShell(CmdTop):
 			self.register("action", "parsers", SubParsersAction)
 
 		def add_subparsers(self, *args, **kw):
-			# The hack above is not desired for the subparsers
-			# of the subparsers (the usage would omt the mid-level
+			# The hack above is not desired for the subparsers of
+			# the subparsers (the usage would omit the mid-level
 			# subcommands).
 			parent = CmdFTPShell.ArgumentParserNoUsage
 			return super().add_subparsers(*args, **kw,
@@ -6008,7 +6029,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 				src_top, followlinks=self.follow_symlinks):
 			dirpath = pathlib.PurePath(dirpath)
 			dst_dir = dst_top / dirpath.relative_to(src_top)
-			for fname in files:
+			for fname in sorted(files):
 				src = dirpath / fname
 				if stat.S_ISREG(os.stat(src).st_mode):
 					dst = dst_dir / fname
@@ -6034,6 +6055,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 
 				for i in remove:
 					del dirs[i]
+			dirs.sort()
 
 class _CmdFTPChDir(CmdFTP, CmdFTPChDir): pass
 class _CmdFTPPwd(CmdFTP, CmdFTPPwd): pass
