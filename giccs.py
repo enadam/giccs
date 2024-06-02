@@ -3,7 +3,8 @@
 # TODO: {{{
 # args -> self
 # DirEnt.volatile -> obj?
-# support ftp + no encrypt metadata + prefix
+# support ftp --chdir/--chroot
+# if encrypt_metadata, always set PARENT_UUID
 #
 # consistency check of remote backups
 # calculate/verify hash?
@@ -931,7 +932,17 @@ class BucketOptions(AccountOptions): # {{{
 				self.bucket_labels[key] = val if eq else None
 
 		self.merge_options_from_ini(args, "prefix")
-		self.prefix = args.prefix
+		if args.prefix is not None:
+			prefix = pathlib.PurePath(args.prefix)
+			if prefix not in (pathlib.PurePath('.'),
+		     				pathlib.PurePath('/')):
+				if ".." in prefix.parts:
+					raise self.CmdLineError(
+							"--prefix must not "
+							"contain \"..\"")
+				if prefix.is_absolute():
+					prefix = prefix.relative_to('/')
+				self.prefix = str(prefix)
 
 	# Does @bucket match @self.bucket_name and/or @self.bucket_labels?
 	def bucket_matches(self, bucket: google.cloud.storage.Bucket) -> bool:
@@ -977,6 +988,22 @@ class BucketOptions(AccountOptions): # {{{
 			raise UserError("More than one buckets found")
 		else:
 			return found[0]
+
+	def with_prefix(self, path: str) -> str:
+		if self.prefix is not None:
+			return f"{self.prefix}/{path}"
+		else:
+			return path
+
+	def without_prefix(self, path: str) -> str:
+		if self.prefix is not None:
+			prefix = self.prefix + '/'
+			if not path.startswith(prefix):
+				raise ConsistencyError(
+					f"{path} doesn't start with {prefix}")
+			return path.removeprefix(prefix)
+		else:
+			return path
 # }}}
 
 # Add --dry-run.
@@ -2401,12 +2428,11 @@ class MetaBlob(MetaCipher): # {{{
 				# Generate a random @self.blob_uuid.
 				self.blob_uuid = uuid.uuid4()
 
-			if args.encrypt_metadata:
-				blob_name = str(self.blob_uuid)
-			else:
-				blob_name = path
-			if args.prefix is not None:
-				blob_name = f"{args.prefix}/{blob_name}"
+			blob_name = args.with_prefix(
+						str(self.blob_uuid) \
+						if args.encrypt_metadata \
+						else path)
+			assert not blob_name.startswith('/')
 
 			self.gcs_blob = args.bucket.blob(blob_name)
 			if not args.encrypt:
@@ -2417,7 +2443,7 @@ class MetaBlob(MetaCipher): # {{{
 				# The generated @self.blob_uuid conflicts
 				# with an existing one.
 				continue
-			elif backups is None and args.encrypt_metadata \
+			elif (backups is None or args.encrypt_metadata) \
 					and self.gcs_blob.exists():
 				# Likewise.
 				continue
@@ -2425,7 +2451,11 @@ class MetaBlob(MetaCipher): # {{{
 				break
 
 		self.set_metadata(self.DataType.SUBVOLUME, self.subvolume)
-		self.set_metadata(self.DataType.BLOB_PATH, path)
+		if args.encrypt_metadata:
+			self.set_metadata(self.DataType.BLOB_PATH, path)
+		else:
+			self.set_metadata(self.DataType.BLOB_PATH,
+						args.with_prefix(path), path)
 		self.blob_size = self.file_size = None
 
 		# Return control to the caller.
@@ -2447,6 +2477,10 @@ class MetaBlob(MetaCipher): # {{{
 		self = super().__new__(cls)
 		return self.new(args, path)
 
+	@classmethod
+	def isa(cls, gcs_blob: google.cloud.storage.Blob) -> bool:
+		return True
+
 	# Create a MetaBlob from and existing @gcs_blob.
 	@classmethod
 	def init(cls: type[T], args: EncryptedBucketOptions,
@@ -2455,15 +2489,7 @@ class MetaBlob(MetaCipher): # {{{
 		super().__init__(self, args)
 
 		self.gcs_blob = gcs_blob
-		if args.prefix is not None:
-			prefix = args.prefix + '/'
-			if not self.name.startswith(prefix):
-				raise ConsistencyError(
-					f"{self.name} doesn't start with "
-					f"{prefix}")
-			prefixless = self.name.removeprefix(prefix)
-		else:
-			prefixless = self.name
+		prefixless = args.without_prefix(self.name)
 
 		signature = None
 		if args.encrypt_metadata:
@@ -2485,14 +2511,18 @@ class MetaBlob(MetaCipher): # {{{
 			signature = self.get_metadata(self.DataType.SIGNATURE)
 			assert self.blob_uuid is not None
 
-			self.blob_path = self.get_metadata(
-						self.DataType.BLOB_PATH)
-			if prefixless != self.blob_path:
+			expected = self.get_metadata(self.DataType.BLOB_PATH)
+			if self.name != expected:
 				raise SecurityError(
 					"%s has unexpected path, should be %s"
-					% (self.name, self.blob_path))
+					% (self.name, expected))
+			self.blob_path = prefixless
 		else:
 			self.blob_path = prefixless
+
+		if self.get_metadata(self.DataType.SUBVOLUME) \
+				!= self.subvolume:
+			return None
 
 		self.setup()
 
@@ -2524,11 +2554,6 @@ class MetaBlob(MetaCipher): # {{{
 				"%s[%s]: unexpected metadata"
 				% (self.name, self.DataType.SIGNATURE.field()))
 
-		# Return None if @gcs_blob doesn't belong to the backups
-		# of @args.subsystem after all.
-		if self.get_metadata(self.DataType.SUBVOLUME) \
-				!= self.subvolume:
-			return None
 		return self
 
 	# Called by init().
@@ -2555,7 +2580,7 @@ class MetaBlob(MetaCipher): # {{{
 		hasher.update(self.subvolume.encode())
 		hasher.update(b'\0')
 
-		hasher.update(self.blob_path.encode())
+		hasher.update(self.args.with_prefix(self.blob_path).encode())
 		hasher.update(b'\0')
 
 		hasher.update(self.encode_int(self.blob_size))
@@ -2726,13 +2751,20 @@ class MetaBlob(MetaCipher): # {{{
 		elif data_type == self.DataType.BLOB_PATH:
 			return self.get_text_metadata(data_type)
 		elif data_type == self.DataType.BLOB_SIZE:
+			if not self.args.encrypt_metadata \
+					and not self.has_metadata(data_type):
+				return self.gcs_blob.size
 			return self.get_integer_metadata(data_type)
 		elif data_type == self.DataType.FILE_SIZE:
 			return self.get_integer_metadata(data_type)
 		else:
 			assert False
 
-	def set_metadata(self, data_type: MetaCipher.DataType, value: T) -> T:
+	def set_metadata(self, data_type: MetaCipher.DataType,
+				value: Any, internal: T = None) -> T:
+		if internal is None:
+			internal = value
+
 		if data_type == self.DataType.SIGNATURE:
 			self.set_binary_metadata(data_type, value)
 		elif data_type == self.DataType.SUBVOLUME:
@@ -2743,25 +2775,31 @@ class MetaBlob(MetaCipher): # {{{
 			# it's still validated.
 			if self.args.encrypt:
 				self.set_text_metadata(data_type, value)
-			self.blob_path = value
+			self.blob_path = internal
 		elif data_type == self.DataType.BLOB_SIZE:
 			if self.args.verify_blob_size:
-				self.set_integer_metadata(data_type, value)
-				self.blob_size = value
+				if self.args.encrypt_metadata:
+					self.set_integer_metadata(data_type,
+			       						value)
+				self.blob_size = internal
 		elif data_type == self.DataType.FILE_SIZE:
 			self.set_integer_metadata(data_type, value)
-			self.file_size = value
+			self.file_size = internal
 		else:
 			assert False
-		return value
 
-	def update_signature(self):
-		if self.args.encrypt and not self.args.encrypt_metadata:
+		return internal
+
+	def add_signature(self) -> bool:
+		return self.args.encrypt and not self.args.encrypt_metadata
+
+	def update_signature(self) -> None:
+		if self.add_signature():
 			self.set_metadata(
 					self.DataType.SIGNATURE,
 					self.calc_signature().digest())
 
-	def sync_metadata(self):
+	def sync_metadata(self) -> None:
 		if self.dirty:
 			self.update_signature()
 			self.gcs_blob.patch()
@@ -2783,6 +2821,13 @@ class BackupBlob(MetaBlob): # {{{
 	snapshot_name: str
 	snapshot_uuid: uuid.UUID
 	parent_uuid: Optional[uuid.UUID]
+
+	@classmethod
+	def isa(cls, gcs_blob: google.cloud.storage.Blob) -> bool:
+		# Does @gcs_blob have SNAPSHOT_UUID metadata?
+		return gcs_blob.metadata \
+			and cls.DataType.SNAPSHOT_UUID.field() \
+				in gcs_blob.metadata
 
 	def __init__(self, args: EncryptedBucketOptions,
 	      		payload_type: PayloadType,
@@ -2850,16 +2895,21 @@ class BackupBlob(MetaBlob): # {{{
 		else:
 			return super().get_metadata(data_type)
 
-	def set_metadata(self, data_type: MetaCipher.DataType, value: T) -> T:
+	def set_metadata(self, data_type: MetaCipher.DataType,
+				value: Any, internal: T = None) -> T:
+		if internal is None:
+			internal = value
+
 		if data_type == self.DataType.SNAPSHOT_UUID:
 			self.set_uuid_metadata(data_type, value)
-			self.snapshot_uuid = value
+			self.snapshot_uuid = internal
 		elif data_type == self.DataType.PARENT_UUID:
 			self.set_uuid_metadata(data_type, value)
-			self.parent_uuid = value
+			self.parent_uuid = internal
 		else:
-			return super().set_metadata(data_type, value)
-		return value
+			return super().set_metadata(data_type, value, internal)
+
+		return internal
 # }}}
 
 # A class that reads from or writes to a wrapped file-like object, printing
@@ -3528,15 +3578,36 @@ def woulda(args: DryRunOptions, verb: str) -> str:
 	return f"Would have {verb}" if args.is_dry_run() else verb.capitalize()
 # }}}
 
+
 # Blob-related functions {{{
 def discover_remote_blobs(args: EncryptedBucketOptions,
-				cls: type[MetaBlob.T] = MetaBlob) \
+				expected: Union[
+					None, type[MetaBlob.T],
+					Sequence[type[MetaBlob.T]]] = None) \
 				-> Iterable[MetaBlob.T]:
 	prefix = args.prefix
 	if prefix is not None:
 		prefix += '/'
 
+	if expected is None:
+		# We may create any subclass of MetaBlob.
+		expected = (BackupBlob, MetaBlob)
+	elif issubclass(expected, MetaBlob):
+		expected = (expected,)
+
 	for blob in args.bucket.list_blobs(prefix=prefix):
+		if args.encrypt_metadata and args.prefix is None \
+				and '/' in blob.name:
+			# Skip blobs belonging to a non-empty prefix.
+			continue
+
+		# Find the appropriate @cls of @blob.
+		for cls in expected:
+			if cls.isa(blob):
+				break
+		else:
+			continue
+
 		if (blob := cls.init(args, blob)) is not None:
 			yield blob
 
@@ -5319,11 +5390,7 @@ class FTPClient:
 	@functools.cached_property
 	def remote(self):
 		assert isinstance(self, CmdFTP)
-
-		globber = VirtualGlobber(discover_remote_blobs(self))
-		if self.prefix is not None:
-			globber.chroot(self.prefix, create=True)
-		return globber
+		return VirtualGlobber(discover_remote_blobs(self))
 
 	# Right-justify the @col:th column in @rows, or delete it.
 	def rjust_column(self, rows: Sequence[list[Optional[str]]], col: int,
@@ -5969,10 +6036,10 @@ class CmdFTPPut(CmdExec):
 		cmd_ftp_put(self)
 
 def upload_file(self: _CmdFTPPut,
-		src: Union[str, os.PathLike], dst: Union[str, os.PathLike]) \
+		src: Union[str, os.PathLike], dst: os.PathLike) \
 		-> int:
-	with MetaBlob.create(self, str(dst)) as blob:
-		pass
+	# Make @dst non-absolute, looks nicer in the GCS console.
+	blob = MetaBlob(self, str(dst.relative_to('/')))
 
 	print(f"Uploading {src}...", end="", flush=True)
 	try:
@@ -6016,7 +6083,6 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			dst = remote.path()
 			if remote.isdir():
 				dst = dst.joinpath(os.path.basename(src))
-			#print(f"UPLOAD({src} => {dst})")
 			upload_file(self, src, dst)
 			continue
 
@@ -6032,12 +6098,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			for fname in sorted(files):
 				src = dirpath / fname
 				if stat.S_ISREG(os.stat(src).st_mode):
-					dst = dst_dir / fname
-					print(f"Uploading {src}...", end="")
-					#print(f"UPLOAD({src} => {dst})")
-					upload_blob(self,
-						MetaBlob(self, str(dst)),
-						pipeline_stdin=open(src))
+					upload_file(self, src, dst_dir / fname)
 
 			# Don't descend into @dirs we've @seen.
 			if seen is not None:
