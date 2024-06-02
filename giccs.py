@@ -2416,11 +2416,8 @@ class MetaBlob(MetaCipher): # {{{
 	def subvolume(self) -> str:
 		return self.args.subvolume
 
-	# This is a context manager, so we can perform things post-__init__().
-	@contextlib.contextmanager
-	def new(self: T, args: EncryptedBucketOptions, path: str,
-			backups: Optional[Backups] = None) \
-			-> contextlib.AbstractContextManager[T]:
+	def __init__(self, args: EncryptedBucketOptions, path: str,
+			backups: Optional[Backups] = None, **kw):
 		super().__init__(args)
 
 		while True:
@@ -2443,39 +2440,28 @@ class MetaBlob(MetaCipher): # {{{
 				# The generated @self.blob_uuid conflicts
 				# with an existing one.
 				continue
-			elif (backups is None or args.encrypt_metadata) \
+			elif backups is None and args.encrypt_metadata \
 					and self.gcs_blob.exists():
 				# Likewise.
 				continue
 			else:
 				break
 
-		self.set_metadata(self.DataType.SUBVOLUME, self.subvolume)
-		if args.encrypt_metadata:
-			self.set_metadata(self.DataType.BLOB_PATH, path)
-		else:
-			self.set_metadata(self.DataType.BLOB_PATH,
-						args.with_prefix(path), path)
-		self.blob_size = self.file_size = None
-
-		# Return control to the caller.
-		yield self
+		self.init_metadata(path, **kw)
 
 		self.update_signature()
 		self.dirty = False
 
-	# Used if the caller just wants a new MetaBlob.  Shouldn't be called
-	# from subclasses.
-	def __init__(self, args: EncryptedBucketOptions, path: str):
-		with self.new(args, path):
-			pass
-
-	# Like above, but allows for customizing the initialization.
-	@classmethod
-	def create(cls: type[T], args: EncryptedBucketOptions, path: str) \
-			-> contextlib.AbstractContextManager[T]:
-		self = super().__new__(cls)
-		return self.new(args, path)
+	# Called by __init__().
+	def init_metadata(self, path: str, **kw) -> None:
+		self.set_metadata(self.DataType.SUBVOLUME, self.subvolume)
+		if self.args.encrypt_metadata:
+			self.set_metadata(self.DataType.BLOB_PATH, path)
+		else:
+			self.set_metadata(self.DataType.BLOB_PATH,
+						self.args.with_prefix(path),
+		     				path)
+		self.blob_size = self.file_size = None
 
 	@classmethod
 	def isa(cls, gcs_blob: google.cloud.storage.Blob) -> bool:
@@ -2483,8 +2469,8 @@ class MetaBlob(MetaCipher): # {{{
 
 	# Create a MetaBlob from and existing @gcs_blob.
 	@classmethod
-	def init(cls: type[T], args: EncryptedBucketOptions,
-			gcs_blob: google.cloud.storage.Blob) -> T:
+	def init_from_gcs(cls: type[T], args: EncryptedBucketOptions,
+				gcs_blob: google.cloud.storage.Blob) -> T:
 		self = super().__new__(cls)
 		super().__init__(self, args)
 
@@ -2524,7 +2510,7 @@ class MetaBlob(MetaCipher): # {{{
 				!= self.subvolume:
 			return None
 
-		self.setup()
+		self.init_from_metadata()
 
 		if args.verify_blob_size or self.has_metadata(
 						self.DataType.BLOB_SIZE):
@@ -2557,7 +2543,7 @@ class MetaBlob(MetaCipher): # {{{
 		return self
 
 	# Called by init().
-	def setup(self) -> None:
+	def init_from_metadata(self) -> None:
 		pass
 
 	def __str__(self):
@@ -2833,20 +2819,28 @@ class BackupBlob(MetaBlob): # {{{
 	      		payload_type: PayloadType,
 			snapshot: Snapshot, parent: Optional[Snapshot],
 	      		backups: Backups):
-		with self.new(args, "%s/%s" % (snapshot.snapshot_name,
-						 payload_type.field()),
-				backups):
-			self.set_metadata(self.DataType.SNAPSHOT_UUID,
-		     				snapshot.snapshot_uuid)
-			if payload_type == self.PayloadType.DELTA:
-				assert parent is not None
-				self.set_metadata(self.DataType.PARENT_UUID,
-							parent.snapshot_uuid)
-			else:
-				assert parent is None
-				self.parent_uuid = None
+		path = "%s/%s" % (snapshot.snapshot_name, payload_type.field())
+		super().__init__(args, path, backups,
+					payload_type=payload_type,
+		   			snapshot=snapshot, parent=parent)
 
-	def setup(self) -> None:
+	def init_metadata(self, path: str,
+				payload_type: PayloadType,
+				snapshot: Snapshot,
+		   		parent: Optional[Snapshot]) -> None:
+		super().init_metadata(path)
+
+		self.set_metadata(self.DataType.SNAPSHOT_UUID,
+					snapshot.snapshot_uuid)
+		if payload_type == self.PayloadType.DELTA:
+			assert parent is not None
+			self.set_metadata(self.DataType.PARENT_UUID,
+						parent.snapshot_uuid)
+		else:
+			assert parent is None
+			self.parent_uuid = None
+
+	def init_from_metadata(self) -> None:
 		self.snapshot_name, per, payload_type = \
 				self.blob_path.rpartition('/')
 		if not per:
@@ -3608,7 +3602,7 @@ def discover_remote_blobs(args: EncryptedBucketOptions,
 		else:
 			continue
 
-		if (blob := cls.init(args, blob)) is not None:
+		if (blob := cls.init_from_gcs(args, blob)) is not None:
 			yield blob
 
 # Write @blob.blob_uuid as binary to @sys.stdout.
