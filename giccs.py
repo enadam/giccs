@@ -1,13 +1,40 @@
 #!/usr/bin/python3
 #
 # TODO: {{{
+# pytype
 # args -> self
 # DirEnt.volatile -> obj?
-# support ftp --chdir/--chroot
-# if encrypt_metadata, always set PARENT_UUID
+# put: print the total number of bytes uploaded
+# put: doesn't work well with --chroot # XXX
 #
 # consistency check of remote backups
-# calculate/verify hash?
+# calculate/verify hash? (hash of authentication tags)
+# add timestamp to blob_uuid (to avoid collisions)
+#
+# padding?
+# use HMAC/CMAC/AEAD instead of hash+encrypt?
+#
+# bulk cipher:
+#	AES-OCB, AES-SIV, AES-SIV-GCM (not always available)
+#	mandatory rekeying every GiB (stripe) to decrease blast radius
+#	nonce:
+#		counter (8 B, for uniqueness) + random (4 B, for unpredictability)
+#			maybe pseudo-random?
+#		use it as a sequence number
+#		don't encrypt and don't add the counter to the ciphertext
+#		keep the random part secret
+#	for every chunk, add the random part of the next chunk's nonce to the cleartext
+#	for the last chunk of every stripe, add the next stripe's key to the cleartext
+# master cipher:
+#	AES-SIV-GCM if the bulk cipher is that, otherwise AES-SIV
+#	METADATA, SIGNATURE: all at once, no multiple chunks
+#	first block of PAYLOAD:
+#		key of first stripe
+#		random part of the first chunk's nonce
+#	nonce: timestamp (4 B) + random (8 B)
+# don't encrypt blob_uuid, data_type (-> AAD)
+#	we don't have to add them to the cleartext, just verify them
+#	attacker will have less idea what is in the cleartext
 #
 # upload/download: split plan and execution
 # consider using clone sources when uploading
@@ -30,9 +57,6 @@
 # overwrite-mode:
 #   * truncate
 #   * atomic
-# put:
-#   * skip-enoent-eloop
-#   * follow-symlinks
 #
 # document max blob size (5 TiB)
 # document required permissions
@@ -78,14 +102,18 @@ import btrfs
 sys.path.append("/home/adam/volatile/btrfs/giccs/lib")
 import google.cloud.storage
 import google.oauth2.service_account
+from google.api_core.exceptions import GoogleAPICallError
 # }}}
 
 # Constants and structures {{{
 # A generic-purpose type variable.
 T = TypeVar("T")
 
-# A cached singleton.
+# Cached singletons.
 UUID0 = uuid.UUID(int=0)
+
+CurDir = pathlib.PurePath('.')
+RootDir = pathlib.PurePath('/')
 
 # We store btrfs volume UUIDs in uuid.UUID, so it's important that they
 # have the same size.
@@ -115,44 +143,54 @@ BTRFS_IOC_SNAP_DESTROY_V2 = btrfs.ioctl._IOW(
 # }}}
 
 # Exceptions {{{
-GoogleAPICallError = google.api_core.exceptions.GoogleAPICallError
-def parse_GoogleAPICallError(ex: GoogleAPICallError) -> str:
-	error = [ ex.code.name ]
-	if ex.response is None:
-		return error[0]
+class GiCCSError(Exception):
+	# Dig the detailed error message out of GoogleAPICallError.
+	def parse_GoogleAPICallError(self, ex: GoogleAPICallError) -> str:
+		error = [ ex.code.name ]
+		if ex.response is None:
+			return error[0]
 
-	from requests.exceptions import JSONDecodeError
+		from requests.exceptions import JSONDecodeError
 
-	try:
-		js = ex.response.json()
-	except JSONDecodeError:
-		error.append(ex.response.text)
-	else:
-		if isinstance(js, dict) and "error" in js:
-			js = js["error"]
-			if isinstance(js, dict):
-				msg = js.get("message")
-				if msg is not None:
-					error.append(msg)
+		try:
+			js = ex.response.json()
+		except JSONDecodeError:
+			error.append(ex.response.text)
+		else:
+			if isinstance(js, dict) and "error" in js:
+				js = js["error"]
+				if isinstance(js, dict):
+					msg = js.get("message")
+					if msg is not None:
+						error.append(msg)
 
-	return ": ".join(error)
+		return ": ".join(error)
+
+	def __str__(self):
+		args = self.args
+		if not args and self.__cause__ is not None:
+			args = (self.__cause__,)
+
+		parts = [ ]
+		for arg in args:
+			if isinstance(arg, GoogleAPICallError):
+				parts.append(
+					self.parse_GoogleAPICallError(arg))
+			else:
+				parts.append(str(arg))
+
+		return ' '.join(parts)
 
 # Bad user input.
-class UserError(Exception): pass
+class UserError(GiCCSError): pass
 
 # Any other non-recoverable error.
-class FatalError(Exception): # {{{
-	def __init__(self, *args):
-		# Dig the detailed error message out of GoogleAPICallError.
-		if len(args) == 1 and isinstance(args[0], GoogleAPICallError):
-			args = (parse_GoogleAPICallError(args[0]),)
-		super().__init__(*args)
-# }}}
+class FatalError(GiCCSError): pass
 
 # Possible foul-play detected.
 class SecurityError(FatalError): pass
 
-# System is in unexpected state.
+# System is in an unexpected state.
 class ConsistencyError(FatalError): pass
 # }}}
 
@@ -340,7 +378,7 @@ class CmdLineOptions: # {{{
 			("bucket",	"Bucket and blob selection"	),
 			("snapshot",	"Snapshot selection"		),
 			("backup",	"Backup selection"		),
-			("rmdelete",	"Which backups to delete"	),
+			("deletion",	"Deletion options"		),
 			("indexsel",	"Index selection"		),
 			("upload",	"Backup options"		),
 			("download",	"Restore options"		),
@@ -563,7 +601,7 @@ class CmdLineOptions: # {{{
 		try:
 			lst = shlex.split(s)
 		except ValueError as ex:
-			raise self.CmdLineError(f"{what}: {ex.args[0]}")
+			raise self.CmdLineError(f"{what}: {ex}") from ex
 
 		if not lst and not empty_ok:
 			raise self.CmdLineError(f"{what}: missing value")
@@ -615,8 +653,8 @@ class CmdLineCommand(CmdLineOptions): # {{{
 	parent: Optional[CmdLineOptions] = None
 
 	def __init__(self, parent: Optional[CmdLineOptions] = None):
-		super().__init__()
 		self.parent = parent
+		super().__init__()
 
 	def __getattr__(self, attr: str) -> Any:
 		if self.parent is not None:
@@ -704,8 +742,9 @@ class CmdExec(CmdLineCommand): # {{{
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
-		section = self.sections["common"]
-		section.add_enable_flag_no_dflt("--debug")
+		if self.parent is None:
+			section = self.sections["common"]
+			section.add_enable_flag_no_dflt("--debug")
 
 	def execute(self) -> None:
 		# Subclasses must implement it.
@@ -774,10 +813,7 @@ class CmdTop(CmdLineCommand): # {{{
 				import traceback
 				traceback.print_exc()
 			else:
-				msg = ex.args
-				if isinstance(msg, (tuple, list)):
-					msg = ' '.join(map(str, msg))
-				print("%s: %s" % (type(ex).__name__, msg),
+				print("%s: %s" % (type(ex).__name__, ex),
 	  				file=sys.stderr)
 			return False
 		else:
@@ -862,8 +898,7 @@ class AccountOptions(ConfigFileOptions): # {{{
 		except json.decoder.JSONDecodeError as ex:
 			if cmd is not None:
 				cmd.kill()
-			raise self.CmdLineError(
-					"%s: %s" % (src, ex.args[0])) from ex
+			raise self.CmdLineError(f"{src}: {ex}") from ex
 		else:
 			if not isinstance(self.service_account_info, dict):
 				raise self.CmdLineError(f"{src}: not a dict")
@@ -899,7 +934,7 @@ class BucketOptions(AccountOptions): # {{{
 		# may be provided through the config file.
 		section = self.sections["bucket"]
 		mutex = section.add_mutually_exclusive_group()
-		mutex.add_argument("--bucket", "-b", dest="bucket")
+		mutex.add_argument("--bucket", "-b")
 		mutex.add_argument("--bucket-labels", "-B", action="append")
 		section.add_argument("--prefix", "-p")
 
@@ -934,14 +969,13 @@ class BucketOptions(AccountOptions): # {{{
 		self.merge_options_from_ini(args, "prefix")
 		if args.prefix is not None:
 			prefix = pathlib.PurePath(args.prefix)
-			if prefix not in (pathlib.PurePath('.'),
-		     				pathlib.PurePath('/')):
+			if prefix not in (CurDir, RootDir):
 				if ".." in prefix.parts:
 					raise self.CmdLineError(
 							"--prefix must not "
 							"contain \"..\"")
 				if prefix.is_absolute():
-					prefix = prefix.relative_to('/')
+					prefix = prefix.relative_to(RootDir)
 				self.prefix = str(prefix)
 
 	# Does @bucket match @self.bucket_name and/or @self.bucket_labels?
@@ -965,17 +999,16 @@ class BucketOptions(AccountOptions): # {{{
 	@functools.cached_property
 	def bucket(self) -> google.cloud.storage.Bucket:
 		if self.bucket_name is not None:
-			self.bucket = self.gcs_client.bucket(self.bucket_name)
+			bucket = self.gcs_client.bucket(self.bucket_name)
 			try:
-				if not self.bucket.exists():
+				if not bucket.exists():
 					raise UserError(
-						f"{self.bucket_name}:",
-						parse_GoogleAPICallError(ex)) \
-						from ex
+						f"{self.bucket_name}: "
+						"no such bucket")
 			except GoogleAPICallError as ex:
-				raise FatalError(f"{self.bucket_name}:",
-					parse_GoogleAPICallError(ex)) from ex
-			return self.bucket
+				raise FatalError(
+					f"{self.bucket_name}:", ex) from ex
+			return bucket
 
 		found = [ ]
 		for bucket in self.gcs_client.list_buckets():
@@ -1101,9 +1134,7 @@ class SelectionOptions(CmdLineOptions): # {{{
 				return uuid.UUID(val)
 			except ValueError as ex:
 				raise self.CmdLineError(
-					"--%s %s: %s"
-					% (flag, val, ex.args[0])) \
-					from ex
+					f"--{flag} {val}: {ex}") from ex
 
 		if args.frm is not None:
 			self.frm = to_uuid("from", args.frm)
@@ -2059,7 +2090,11 @@ class InternalEncrypt(InternalCipher):
 			assert len(cleartext) == self.CLEARTEXT_SIZE \
 					or self.eof
 
-			nonce = self.csrng.randbytes(self.NONCE_SIZE)
+			# Make sure the nonce is not repeated
+			# (https://frereit.de/aes_gcm).
+			nonce = int(time.time()).to_bytes(4, "big")
+			nonce += self.csrng.randbytes(
+					self.NONCE_SIZE - len(nonce))
 			self.ciphertext += nonce
 			self.ciphertext += self.cipher.encrypt(
 						nonce, bytes(cleartext), None)
@@ -2158,11 +2193,11 @@ class InternalDecrypt(InternalCipher):
 		try:
 			cleartext = memoryview(self.cipher.decrypt(
 				self.nonce, bytes(ciphertext), None))
-		except cryptography_exceptions.InvalidTag:
+		except cryptography_exceptions.InvalidTag as ex:
 			raise SecurityError(
-					"Decryption of ciphertext block "
-					"at offset %d failed"
-					% self.inbytes)
+				"Decryption of ciphertext block "
+				"at offset %d failed" % self.inbytes) \
+				from ex
 
 		cleartext = self.verify_header(cleartext)
 		if self.wrapped is not None:
@@ -2219,13 +2254,8 @@ class InternalDecrypt(InternalCipher):
 class MetaCipher: # {{{
 	class DataType(enum.IntEnum):
 		PAYLOAD		= 0
-		SIGNATURE	= 1
-		SUBVOLUME	= 2
-		BLOB_PATH	= 3
-		BLOB_SIZE	= 4
-		FILE_SIZE	= 5
-		SNAPSHOT_UUID	= 6
-		PARENT_UUID	= 7
+		METADATA	= 1
+		SIGNATURE	= 2
 
 		def field(self):
 			return self.name.lower()
@@ -2265,7 +2295,7 @@ class MetaCipher: # {{{
 
 		# Is the @key cached?
 		key_cache = self.__class__.key_cache
-		if not self.args.encryption_key_command_per_uuid:
+		if not self.args.encryption_key_per_uuid:
 			assert key_cache is None or isinstance(key_cache,
 								bytes)
 			key = key_cache
@@ -2402,11 +2432,8 @@ class MetaBlob(MetaCipher): # {{{
 	gcs_blob: google.cloud.storage.Blob
 
 	blob_path: str
-	blob_size: Optional[int]
-	file_size: Optional[int]
-
-	# Whether metadata has changed.
-	dirty: bool = False
+	blob_size: Optional[int] = None
+	file_size: Optional[int] = None
 
 	@property
 	def name(self) -> str:
@@ -2415,6 +2442,13 @@ class MetaBlob(MetaCipher): # {{{
 	@property
 	def subvolume(self) -> str:
 		return self.args.subvolume
+
+	@classmethod
+	def isa(cls, metadata: Optional[dict[str, Any]]) -> bool:
+		return True
+
+	def __str__(self):
+		return self.blob_path
 
 	def __init__(self, args: EncryptedBucketOptions, path: str,
 			backups: Optional[Backups] = None, **kw):
@@ -2448,115 +2482,177 @@ class MetaBlob(MetaCipher): # {{{
 				break
 
 		self.init_metadata(path, **kw)
-
-		self.update_signature()
-		self.dirty = False
-
-	# Called by __init__().
-	def init_metadata(self, path: str, **kw) -> None:
-		self.set_metadata(self.DataType.SUBVOLUME, self.subvolume)
-		if self.args.encrypt_metadata:
-			self.set_metadata(self.DataType.BLOB_PATH, path)
-		else:
-			self.set_metadata(self.DataType.BLOB_PATH,
-						self.args.with_prefix(path),
-		     				path)
-		self.blob_size = self.file_size = None
-
-	@classmethod
-	def isa(cls, gcs_blob: google.cloud.storage.Blob) -> bool:
-		return True
+		self.update_metadata()
 
 	# Create a MetaBlob from and existing @gcs_blob.
 	@classmethod
-	def init_from_gcs(cls: type[T], args: EncryptedBucketOptions,
-				gcs_blob: google.cloud.storage.Blob) -> T:
+	def init_from_gcs(cls, args: EncryptedBucketOptions,
+				gcs_blob: google.cloud.storage.Blob,
+				classes: Optional[Sequence[type]] = None,
+		   		blob_uuid: Optional[uuid.UUID] = None,
+		   		metadata: Optional[dict[str, Any]] = None) \
+				-> Optional[T]:
+		# The caller might not know in advance exactly which of the
+		# @classes represent the @gcs_blob.  Let's try them all.
+		if classes and not args.encrypt_metadata:
+			for klass in classes:
+				if not klass.isa(gcs_blob.metadata):
+					continue
+				elif klass is cls:
+					break
+				return klass.init_from_gcs(args, gcs_blob)
+			else:	# None of them.
+				return None
+
 		self = super().__new__(cls)
 		super().__init__(self, args)
 
 		self.gcs_blob = gcs_blob
-		prefixless = args.without_prefix(self.name)
-
-		signature = None
 		if args.encrypt_metadata:
-			blob_uuid = prefixless
-			try:
-				self.blob_uuid = uuid.UUID(blob_uuid)
-			except ValueError as ex:
-				raise ConsistencyError(
-					f"{self.name} has invalid UUID "
-					f"({blob_uuid})") from ex
+			self.init_blob_uuid(blob_uuid)
+			if metadata is None:
+				metadata = self.init_encrypted_metadata()
 
-			self.blob_path = self.get_metadata(
-						self.DataType.BLOB_PATH)
-		elif args.encrypt:
-			# Retrieving the metadata should set @self.blob_uuid.
-			# It's safe to use an encrypted hash as a MAC as long
-			# as the underlying cipher is non-malleable, which is
-			# the case with InternalCipher, being AEAD.
-			signature = self.get_metadata(self.DataType.SIGNATURE)
-			assert self.blob_uuid is not None
+			if classes:
+				for klass in classes:
+					if not klass.isa(metadata):
+						continue
+					elif klass is cls:
+						break
 
-			expected = self.get_metadata(self.DataType.BLOB_PATH)
-			if self.name != expected:
-				raise SecurityError(
-					"%s has unexpected path, should be %s"
-					% (self.name, expected))
-			self.blob_path = prefixless
-		else:
-			self.blob_path = prefixless
+					# Reuse the decrypted @metadata.
+					return klass.init_from_gcs(
+						args, gcs_blob,
+						blob_uuid=self.blob_uuid,
+						metadata=metadata)
+				else:
+					return None
+		else:	# Metadata is stored directly in the blob's metadata.
+			assert blob_uuid is None and metadata is None
+			metadata = self.gcs_blob.metadata
 
-		if self.get_metadata(self.DataType.SUBVOLUME) \
+		if self.load_metadatum(metadata, "subvolume") \
 				!= self.subvolume:
 			return None
 
-		self.init_from_metadata()
+		self.load_metadata(metadata)
 
-		if args.verify_blob_size or self.has_metadata(
-						self.DataType.BLOB_SIZE):
-			self.blob_size = self.get_metadata(
-						self.DataType.BLOB_SIZE)
-			if gcs_blob.size != self.blob_size:
-				raise SecurityError(
-					"%s has unexpected size (%d != %d)"
-					% (self.name, gcs_blob.size,
-						self.blob_size))
-		else:
-			self.blob_size = None
+		if self.has_signature():
+			# We can only verify the signature once all metadata
+			# has been loaded.
+			signature = self.decrypt_metadata(
+						self.DataType.SIGNATURE,
+						self.load_metadatum(metadata,
+			  				"signature", bytes))
 
-		if self.has_metadata(self.DataType.FILE_SIZE):
-			self.file_size = self.get_metadata(
-						self.DataType.FILE_SIZE)
-		else:
-			self.file_size = None
+			# The first decryption should set @self.blob_uuid.
+			assert self.blob_uuid is not None
 
-		if signature is not None:
 			if signature != self.calc_signature().digest():
 				raise SecurityError(
 					f"{self.name} has invalid signature")
-		elif self.has_metadata(self.DataType.SIGNATURE):
-			# Possible misconfiguration.
-			raise ConsistencyError(
-				"%s[%s]: unexpected metadata"
-				% (self.name, self.DataType.SIGNATURE.field()))
+		else:	# Assert that there's no signature in @metadata,
+			# otherwise there's a possible misconfiguration.
+			self.has_metadatum(metadata, "signature", False)
 
 		return self
 
-	# Called by init().
-	def init_from_metadata(self) -> None:
-		pass
+	# Initialize @self.blob_uuid.
+	def init_blob_uuid(self, blob_uuid: Optional[uuid.UUID] = None) \
+				-> None:
+		assert self.args.encrypt_metadata
 
-	def __str__(self):
-		return self.blob_path
+		if blob_uuid is not None:
+			self.blob_uuid = blob_uuid
+			return
 
-	def encode_int(self, value: Optional[int], width: int = 8) -> bytes:
-		if value is None:
-			value = (1 << 8*width) - 1
-		return value.to_bytes(8, "big")
+		blob_uuid = self.args.without_prefix(self.name)
+		try:
+			self.blob_uuid = uuid.UUID(blob_uuid)
+		except ValueError as ex:
+			raise ConsistencyError(
+				"%s has invalid UUID (%s)"
+				% (self.name, blob_uuid)) from ex
 
-	def decode_int(self, value: bytes) -> int:
-		return int.from_bytes(value, "big")
+	# Decrypt @self.gcs_blob.metadata["metadata"].
+	def init_encrypted_metadata(self) -> dict[str, Any]:
+		import pickle
 
+		assert self.args.encrypt_metadata
+
+		metadata = self.decrypt_metadata(
+					self.DataType.METADATA,
+					self.load_metadatum(
+						self.gcs_blob.metadata,
+						"metadata", bytes))
+
+		try:
+			metadata = pickle.loads(metadata)
+		except pickle.PickleError as ex:
+			raise SecurityError(
+				"%s[%s]: couldn't decode metadata"
+				% (self.name, "metadata")) from ex
+
+		if not isinstance(metadata, dict):
+			raise SecurityError(
+				"%s[%s]: invalid metadata"
+				% (self.name, "metadata"))
+
+		return metadata
+
+	# Called by __init__() to initialize metadata fields.
+	def init_metadata(self, path: str, **kw) -> None:
+		self.blob_path = path
+
+	# Called by update_metadata() to save metadata fields in @metadata.
+	def save_metadata(self, metadata: dict[str, Any]) -> None:
+		self.save_metadatum(metadata, "subvolume", self.subvolume)
+		if self.args.encrypt_metadata:
+			self.save_metadatum(metadata,
+		       				"blob_path", self.blob_path)
+
+		if self.args.encrypt:
+			self.save_metadatum(metadata,
+		       				"blob_size", self.blob_size)
+		self.save_metadatum(metadata, "file_size", self.file_size)
+
+		if self.has_signature():
+			# It's safe to use an encrypted hash as a MAC as long
+			# as the underlying cipher is non-malleable, which is
+			# the case with InternalCipher, being AEAD.
+			self.save_metadatum(
+				metadata, "signature",
+		       		self.encrypt_metadata(
+					self.DataType.SIGNATURE,
+					self.calc_signature().digest()))
+
+	# Called by init_from_gcs() to restore metadata fields from @metadata.
+	def load_metadata(self, metadata: Optional[dict[str, Any]]) -> None:
+		if self.args.encrypt_metadata:
+			self.blob_path = self.load_metadatum(metadata,
+								"blob_path")
+		else:
+			self.blob_path = self.args.without_prefix(self.name)
+
+		self.blob_size = self.load_metadatum(
+					metadata, "blob_size", int,
+					expected=self.args.verify_blob_size)
+		if self.blob_size is not None \
+				and self.gcs_blob.size != self.blob_size:
+			raise SecurityError(
+				"%s has unexpected size (%d != %d)"
+				% (self.name, self.gcs_blob.size,
+						self.blob_size))
+
+		self.file_size = self.load_metadatum(metadata, "file_size",
+							int, expected=False)
+
+	def has_signature(self) -> bool:
+		# If the metadata is encrypted we assume it is authenticated,
+		# so it doesn't need a separate signature.
+		return self.args.encrypt and not self.args.encrypt_metadata
+
+	# Calculate a hash of metadata fields.
 	def calc_signature(self) -> Hasher:
 		import hashlib
 
@@ -2569,227 +2665,126 @@ class MetaBlob(MetaCipher): # {{{
 		hasher.update(self.args.with_prefix(self.blob_path).encode())
 		hasher.update(b'\0')
 
-		hasher.update(self.encode_int(self.blob_size))
-		hasher.update(self.encode_int(self.file_size))
+		for size in (self.blob_size, self.file_size):
+			if size is None:
+				# Use an unlikely value.
+				size = (1 << 8*8) - 1
+			hasher.update(size.to_bytes(8, "big"))
 
 		return hasher
 
-	def has_metadata(self, data_type: MetaCipher.DataType) -> bool:
-		return self.gcs_blob.metadata \
-			and data_type.field() in self.gcs_blob.metadata
+	# Update @self.gcs_blob.metadata.
+	def update_metadata(self) -> None:
+		gcs_metadata = self.gcs_blob.metadata
+		if gcs_metadata is None:
+			gcs_metadata = { }
 
-	def get_raw_metadata(self, data_type: MetaCipher.DataType) -> str:
-		# TypeError is raised if self.gcs_blob.metadata is None.
-		try:
-			return self.gcs_blob.metadata[data_type.field()]
-		except (TypeError, KeyError):
-			raise SecurityError(
-				"%s[%s]: missing metadata"
-				% (self.name, data_type.field()))
+		metadata = { } if self.args.encrypt_metadata else gcs_metadata
+		self.save_metadata(metadata)
 
-	def set_raw_metadata(self, data_type: MetaCipher.DataType,
-				metadata: str) -> None:
-		# To update @self.gcs_blob.metadata we need to assign
-		# a new dict.
-		new_metadata = self.gcs_blob.metadata
-		if new_metadata is None:
-			new_metadata = { }
-		new_metadata[data_type.field()] = metadata
+		if self.args.encrypt_metadata:
+			# Save all @metadata in a pickle.
+			import pickle
+			self.save_metadatum(
+				gcs_metadata, "metadata",
+		       		self.encrypt_metadata(
+					self.DataType.METADATA,
+					pickle.dumps(metadata)),
+				text=True)
+		self.gcs_blob.metadata = gcs_metadata
 
-		self.gcs_blob.metadata = new_metadata
-		self.dirty = True
+	def sync_metadata(self) -> None:
+		self.update_metadata()
+		self.gcs_blob.patch()
 
-	def decode_metadata(self, data_type: MetaCipher.DataType,
-				metadata: str) -> bytes:
-		try:
-			return base64.b64decode(metadata, validate=True)
-		except binascii.Error as ex:
-			raise SecurityError(
-				"%s[%s]: couldn't decode metadata"
-				% (self.name, data_type.field())) from ex
+	MDT = TypeVar("MetaDataType", int, str, bytes, uuid.UUID)
+	def save_metadatum(self, metadata: dict[str, Any],
+				key: str, value: Optional[MDT],
+		    		text: Optional[bool] = None) -> None:
+		if value is None:
+			try: del metadata[key]
+			except KeyError: pass
+			return
 
-	def encode_metadata(self, data_type: MetaCipher.DataType,
-				metadata: bytes) -> str:
-		return base64.b64encode(metadata).decode()
+		if text is None:
+			text = not self.args.encrypt_metadata
+		if text:
+			# Convert to string.
+			if isinstance(value, bytes):
+				metadata[key] = \
+					base64.b64encode(value).decode()
+			else:
+				metadata[key] = str(value)
+		else:	# Convert to a primitive type for pickling.
+			if isinstance(value, uuid.UUID):
+				metadata[key] = value.bytes
+			else:
+				assert isinstance(value, (int, str, bytes))
+				metadata[key] = value
+
+	def has_metadatum(self, metadata: Optional[dict[str, Any]],
+				key: str, expected: Optional[bool] = None) \
+				-> bool:
+		if metadata is not None and key in metadata:
+			if expected is False:
+				raise ConsistencyError(
+						"%s[%s]: unexpected metadata"
+						% (self.name, key))
+			return True
+		else:
+			if expected is True:
+				raise SecurityError(
+						"%s[%s]: missing metadata"
+						% (self.name, key))
+			return False
+
+
+	def load_metadatum(self, metadata: Optional[dict[str, Any]],
+				key: str, tpe: type[MDT] = str,
+		    		expected: bool = True) -> Optional[MDT]:
+		if not self.has_metadatum(metadata, key, expected or None):
+			return None
+
+		value = metadata[key]
+		if isinstance(value, tpe):
+			return value
+
+		if tpe is uuid.UUID and isinstance(value, bytes):
+			try:
+				return uuid.UUID(bytes=value)
+			except ValueError as ex:
+				raise SecurityError(
+					"%s[%s]: invalid metadata"
+					% (self.name, key)) from ex
+
+		assert isinstance(value, str)
+		if tpe is bytes:
+			try:
+				return base64.b64decode(value, validate=True)
+			except binascii.Error as ex:
+				raise SecurityError(
+					"%s[%s]: couldn't decode metadata"
+					% (self.name, key)) from ex
+		else:
+			try:
+				return tpe(value)
+			except ValueError as ex:
+				raise SecurityError(
+					"%s[%s]: invalid metadata"
+					% (self.name, key)) from ex
 
 	def decrypt_metadata(self, data_type: MetaCipher.DataType,
-				metadata: str) -> bytes:
-		ciphertext = self.decode_metadata(data_type, metadata)
+				ciphertext: bytes) -> bytes:
 		try:
 			return bytes(self.decrypt(data_type, ciphertext))
 		except FatalError as ex:
 			raise ex.__class__(
 				"%s[%s]:" % (self.name, data_type.field()),
-				*ex.args) from ex
+				ex) from ex
 
 	def encrypt_metadata(self, data_type: MetaCipher.DataType,
-				metadata: bytes) -> str:
-		return self.encode_metadata(
-			data_type, self.encrypt(data_type, metadata))
-
-	def get_binary_metadata(self, data_type: MetaCipher.DataType) -> bytes:
-		# The signature is always encrypted.
-		metadata = self.get_raw_metadata(data_type)
-		if not self.args.encrypt_metadata \
-				and data_type != self.DataType.SIGNATURE:
-			return self.decode_metadata(data_type, metadata)
-		else:
-			return self.decrypt_metadata(data_type, metadata)
-
-	def set_binary_metadata(self, data_type: MetaCipher.DataType,
-				value: bytes) -> None:
-		# Like above.
-		if not self.args.encrypt_metadata \
-				and data_type != self.DataType.SIGNATURE:
-			metadata = self.encode_metadata(data_type, value)
-		else:
-			metadata = self.encrypt_metadata(data_type, value)
-		self.set_raw_metadata(data_type, metadata)
-
-	def get_text_metadata(self, data_type: MetaCipher.DataType) -> str:
-		metadata = self.get_raw_metadata(data_type)
-		if not self.args.encrypt_metadata:
-			return metadata
-
-		metadata = self.decrypt_metadata(data_type, metadata)
-		try:
-			return metadata.decode()
-		except ValueError as ex:
-			raise SecurityError(
-				"%s[%s]: invalid metadata"
-				% (self.name, data_type.field())) from ex
-
-	def set_text_metadata(self, data_type: MetaCipher.DataType,
-				value: str) -> None:
-		if not self.args.encrypt_metadata:
-			metadata = value
-		else:
-			metadata = self.encrypt_metadata(
-					data_type, value.encode())
-		self.set_raw_metadata(data_type, metadata)
-
-	def get_integer_metadata(self, data_type: MetaCipher.DataType,
-					width: int = 8) -> int:
-		metadata = self.get_raw_metadata(data_type)
-
-		if not self.args.encrypt_metadata:
-			try:
-				return int(metadata)
-			except ValueError as ex:
-				raise SecurityError(
-					"%s[%s]: invalid metadata"
-					% (self.name, data_type.field())) \
-					from ex
-
-		metadata = self.decrypt_metadata(data_type, metadata)
-		if len(metadata) != width:
-			raise SecurityError(
-				"%s[%s]: unexpected metadata size (%d != %d)"
-				% (self.name, data_type.field(),
-					len(metadata), width))
-		return self.decode_int(metadata)
-
-	def set_integer_metadata(self, data_type: MetaCipher.DataType,
-					value: int, width: int = 8) -> None:
-		if not self.args.encrypt_metadata:
-			metadata = str(value)
-		else:
-			metadata = self.encrypt_metadata(
-					data_type,
-					self.encode_int(value, width))
-		self.set_raw_metadata(data_type, metadata)
-
-	def get_uuid_metadata(self, data_type: MetaCipher.DataType) \
-				-> uuid.UUID:
-		metadata = self.get_raw_metadata(data_type)
-
-		if not self.args.encrypt_metadata:
-			try:
-				return uuid.UUID(metadata)
-			except ValueError as ex:
-				raise SecurityError(
-					"%s[%s]: invalid metadata"
-					% (self.name, data_type.field())) \
-					from ex
-
-		metadata = self.decrypt_metadata(data_type, metadata)
-		try:
-			return uuid.UUID(bytes=metadata)
-		except ValueError as ex:
-			raise SecurityError(
-				"%s[%s]: invalid metadata"
-				% (self.name, data_type.field())) from ex
-
-	def set_uuid_metadata(self, data_type: MetaCipher.DataType,
-			value: uuid.UUID) -> None:
-		if not self.args.encrypt_metadata:
-			metadata = str(value)
-		else:
-			metadata = self.encrypt_metadata(
-					data_type, value.bytes)
-		self.set_raw_metadata(data_type, metadata)
-
-	def get_metadata(self, data_type: MetaCipher.DataType) -> Any:
-		if data_type == self.DataType.SIGNATURE:
-			return self.get_binary_metadata(data_type)
-		elif data_type == self.DataType.SUBVOLUME:
-			return self.get_text_metadata(data_type)
-		elif data_type == self.DataType.BLOB_PATH:
-			return self.get_text_metadata(data_type)
-		elif data_type == self.DataType.BLOB_SIZE:
-			if not self.args.encrypt_metadata \
-					and not self.has_metadata(data_type):
-				return self.gcs_blob.size
-			return self.get_integer_metadata(data_type)
-		elif data_type == self.DataType.FILE_SIZE:
-			return self.get_integer_metadata(data_type)
-		else:
-			assert False
-
-	def set_metadata(self, data_type: MetaCipher.DataType,
-				value: Any, internal: T = None) -> T:
-		if internal is None:
-			internal = value
-
-		if data_type == self.DataType.SIGNATURE:
-			self.set_binary_metadata(data_type, value)
-		elif data_type == self.DataType.SUBVOLUME:
-			self.set_text_metadata(data_type, value)
-		elif data_type == self.DataType.BLOB_PATH:
-			# If not @self.args.encrypt, this is redundant.
-			# Otherwise if not @self.args.encrypt_metadata,
-			# it's still validated.
-			if self.args.encrypt:
-				self.set_text_metadata(data_type, value)
-			self.blob_path = internal
-		elif data_type == self.DataType.BLOB_SIZE:
-			if self.args.verify_blob_size:
-				if self.args.encrypt_metadata:
-					self.set_integer_metadata(data_type,
-			       						value)
-				self.blob_size = internal
-		elif data_type == self.DataType.FILE_SIZE:
-			self.set_integer_metadata(data_type, value)
-			self.file_size = internal
-		else:
-			assert False
-
-		return internal
-
-	def add_signature(self) -> bool:
-		return self.args.encrypt and not self.args.encrypt_metadata
-
-	def update_signature(self) -> None:
-		if self.add_signature():
-			self.set_metadata(
-					self.DataType.SIGNATURE,
-					self.calc_signature().digest())
-
-	def sync_metadata(self) -> None:
-		if self.dirty:
-			self.update_signature()
-			self.gcs_blob.patch()
-			self.dirty = False
+				cleartext: bytes) -> bytes:
+		return bytes(self.encrypt(data_type, cleartext))
 # }}}
 
 # A MetaBlob of a Backup.
@@ -2809,11 +2804,8 @@ class BackupBlob(MetaBlob): # {{{
 	parent_uuid: Optional[uuid.UUID]
 
 	@classmethod
-	def isa(cls, gcs_blob: google.cloud.storage.Blob) -> bool:
-		# Does @gcs_blob have SNAPSHOT_UUID metadata?
-		return gcs_blob.metadata \
-			and cls.DataType.SNAPSHOT_UUID.field() \
-				in gcs_blob.metadata
+	def isa(cls, metadata: Optional[dict[str, Any]]) -> bool:
+		return metadata and "snapshot_uuid" in metadata
 
 	def __init__(self, args: EncryptedBucketOptions,
 	      		payload_type: PayloadType,
@@ -2830,17 +2822,26 @@ class BackupBlob(MetaBlob): # {{{
 		   		parent: Optional[Snapshot]) -> None:
 		super().init_metadata(path)
 
-		self.set_metadata(self.DataType.SNAPSHOT_UUID,
-					snapshot.snapshot_uuid)
+		self.snapshot_name = snapshot.snapshot_name
+		self.snapshot_uuid = snapshot.snapshot_uuid
+
+		self.payload_type = payload_type
 		if payload_type == self.PayloadType.DELTA:
 			assert parent is not None
-			self.set_metadata(self.DataType.PARENT_UUID,
-						parent.snapshot_uuid)
+			self.parent_uuid = parent.snapshot_uuid
 		else:
 			assert parent is None
 			self.parent_uuid = None
 
-	def init_from_metadata(self) -> None:
+	def save_metadata(self, metadata: dict[str, Any]) -> None:
+		super().save_metadata(metadata)
+		self.save_metadatum(metadata, "snapshot_uuid",
+						self.snapshot_uuid)
+		self.save_metadatum(metadata, "parent_uuid", self.parent_uuid)
+
+	def load_metadata(self, metadata: Optional[dict[str, Any]]) -> None:
+		super().load_metadata(metadata)
+
 		self.snapshot_name, per, payload_type = \
 				self.blob_path.rpartition('/')
 		if not per:
@@ -2860,17 +2861,15 @@ class BackupBlob(MetaBlob): # {{{
 				f"{self.name} has unknown "
 				f"payload type ({payload_type})")
 
-		self.snapshot_uuid = self.get_metadata(
-						self.DataType.SNAPSHOT_UUID)
+		self.snapshot_uuid = self.load_metadatum(
+						metadata, "snapshot_uuid",
+						uuid.UUID)
 		if self.payload_type == self.PayloadType.DELTA:
-			self.parent_uuid = self.get_metadata(
-						self.DataType.PARENT_UUID)
-		elif self.has_metadata(self.DataType.PARENT_UUID):
-			raise ConsistencyError(
-				"%s[%s]: unexpected metadata"
-				% (self.name,
-					self.DataType.PARENT_UUID.field()))
+			self.parent_uuid = self.load_metadatum(
+						metadata, "parent_uuid",
+						uuid.UUID)
 		else:
+			self.has_metadatum(metadata, "parent_uuid", False)
 			self.parent_uuid = None
 
 	def calc_signature(self) -> MetaBlob.Hasher:
@@ -2880,30 +2879,6 @@ class BackupBlob(MetaBlob): # {{{
 		hasher.update(ensure_uuid(self.parent_uuid).bytes)
 
 		return hasher
-
-	def get_metadata(self, data_type: MetaCipher.DataType) -> Any:
-		if data_type == self.DataType.SNAPSHOT_UUID:
-			return self.get_uuid_metadata(data_type)
-		elif data_type == self.DataType.PARENT_UUID:
-			return self.get_uuid_metadata(data_type)
-		else:
-			return super().get_metadata(data_type)
-
-	def set_metadata(self, data_type: MetaCipher.DataType,
-				value: Any, internal: T = None) -> T:
-		if internal is None:
-			internal = value
-
-		if data_type == self.DataType.SNAPSHOT_UUID:
-			self.set_uuid_metadata(data_type, value)
-			self.snapshot_uuid = internal
-		elif data_type == self.DataType.PARENT_UUID:
-			self.set_uuid_metadata(data_type, value)
-			self.parent_uuid = internal
-		else:
-			return super().set_metadata(data_type, value, internal)
-
-		return internal
 # }}}
 
 # A class that reads from or writes to a wrapped file-like object, printing
@@ -3171,9 +3146,9 @@ class Pipeline: # {{{
 			try:
 				wait_proc(proc)
 			except FatalError as ex:
-				errors.append(ex.args[0])
+				errors.append(ex)
 		if errors:
-			raise FatalError("\n".join(errors))
+			raise FatalError(", ".join(map(str, errors)))
 # }}}
 
 # glob.glob() on steroids.
@@ -3216,7 +3191,8 @@ class Globber(glob2.Globber): # {{{
 				raise self.MatchError(f"{pattern}: no matches")
 			elif must_exist:
 				# Raise the appropriate exception.
-				self.must_exist(pattern)
+				self.must_exist(self.escaped.sub(
+						r"\1", pattern))
 				assert False
 			elif at_most_one:
 				return pattern
@@ -3247,26 +3223,37 @@ class Globber(glob2.Globber): # {{{
 class VirtualGlobber(Globber): # {{{
 	@dataclasses.dataclass
 	class DirEnt:
-		fname: str
+		_fname_or_path: Union[str, pathlib.PurePath]
 		children: Optional[dict[str, DirEnt]] = None
 		parent: Optional[DirEnt] = None
 
-		# Whether this entry was created on-demand by _lookup().
+		# Whether this entry was created on-demand by lookup().
 		volatile: bool = False
 
 		# Any associated object, eg. a MetaBlob.
 		obj: Any = None
 
 		@classmethod
-		def mkfile(cls, fname: str, obj: Any = None,
-				volatile: bool = False) -> DirEnt:
+		def mkfile(cls, fname: str,
+	     			obj: Any = None, volatile: bool = False) \
+				-> DirEnt:
 			return cls(fname, None, obj=obj, volatile=volatile)
 
 		@classmethod
-		def mkdir(cls, fname: str, obj: Any = None,
-				volatile: bool = False) -> DirEnt:
+		def mkdir(cls, fname: Union[str, pathlib.PurePath],
+	    			obj: Any = None, volatile: bool = False) \
+				-> DirEnt:
 			return cls(fname, { }, obj=obj, volatile=volatile)
 
+		@property
+		def fname(self) -> str:
+			if isinstance(self._fname_or_path, str):
+				return self._fname_or_path
+			else:	# @_fname_or_path is @self's original path()
+				# if it has been chroot()ed into.
+				return '/'
+
+		# For sorted() in __iter__().
 		def __lt__(self, other: DirEnt) -> bool:
 			return self.fname < other.fname
 
@@ -3289,15 +3276,40 @@ class VirtualGlobber(Globber): # {{{
 				% (self.__class__.__name__, self.fname,
        					children, parent)
 
-		def path(self, relative_to: Optional[DirEnt] = None) \
+		def path(self, relative_to: Optional[DirEnt] = None,
+	   			full_path: Optional[bool] = False) \
 				-> pathlib.PurePath:
-			parts = [ ]
-			dent = self
+			assert not full_path or relative_to is None
+
+			if isinstance(self._fname_or_path, pathlib.PurePath) \
+					and full_path:
+				# XXX verify the callers don't mutate it
+				return self._fname_or_path
+
+			dent, parts = self, [ ]
 			while dent is not relative_to:
-				parts.append(dent.fname)
 				if dent.parent is None:
+					if relative_to is not None:
+						p1 = self.path()
+						p2 = relative_to.path()
+						raise ValueError(
+							"%s is not under %s"
+							% (p1, p2))
+
+					if full_path:
+						p = dent._fname_or_path
+						assert isinstance(
+							p, pathlib.PurePath)
+						parts += reversed(p.parts)
+					else:
+						parts.append(dent.fname)
+
 					break
+				else:
+					parts.append(dent.fname)
+
 				dent = dent.parent
+
 			return pathlib.PurePath(*reversed(parts))
 
 		def isdir(self):
@@ -3328,8 +3340,7 @@ class VirtualGlobber(Globber): # {{{
 			self.must_be_dir()
 			child = self.children.get(fname)
 			if child is None:
-				raise FileNotFoundError(
-					self.path().joinpath(fname))
+				raise FileNotFoundError(self.path() / fname)
 			return child
 
 		def get(self, fname: str) -> Optional[DirEnt]:
@@ -3372,6 +3383,17 @@ class VirtualGlobber(Globber): # {{{
 				for child in self:
 					yield from child.scan()
 
+		# Make the entry and its ancestors non-volatile.
+		def commit(self, obj: Any = None) -> None:
+			if obj is not None:
+				self.obj = obj
+
+			# We expect the root to be non-volatile.
+			dent = self
+			while dent.volatile:
+				dent.volatile = False
+				dent = dent.parent
+
 		# Remove this entry's branch if it's volatile.
 		def rollback(self) -> None:
 			if not self.volatile:
@@ -3386,7 +3408,7 @@ class VirtualGlobber(Globber): # {{{
 	cwd: DirEnt
 
 	def __init__(self, files: Iterable[Any]):
-		self.cwd = self.root = self.DirEnt.mkdir('/')
+		self.cwd = self.root = self.DirEnt.mkdir(RootDir)
 		for file in files:
 			parent = self.root
 			path = pathlib.PurePath(str(file))
@@ -3399,15 +3421,16 @@ class VirtualGlobber(Globber): # {{{
 				parent = child
 			parent.add(self.DirEnt.mkfile(path.parts[-1], file))
 
-	def lookup(self, path: str, create: bool = False) -> DirEnt:
-		return self._lookup(self.escaped.sub(r"\1", path), create)
+	def lookup(self, path: Union[str, pathlib.PurePath],
+			create: bool = False) -> DirEnt:
+		if isinstance(path, str):
+			if not path:
+				raise FileNotFoundError(path)
+			must_be_dir = path.endswith(('/', "/."))
+			path = pathlib.PurePath(path)
+		else:
+			must_be_dir = False
 
-	def _lookup(self, path: str, create: bool = False) -> DirEnt:
-		if not path:
-			raise FileNotFoundError(path)
-
-		must_be_dir = path.endswith(('/', "/."))
-		path = pathlib.PurePath(path)
 		if path.is_absolute():
 			parts = path.parts[1:]
 			dent = self.root
@@ -3425,12 +3448,11 @@ class VirtualGlobber(Globber): # {{{
 						raise
 
 					parent = dent
-					leaf = i == len(parts) - 1
-
-					dent = self.DirEnt.mkdir(
-							fname, volatile=True) \
-						if not leaf or must_be_dir \
-						else self.DirEnt.mkfile(
+					if i < len(parts) - 1 or must_be_dir:
+						dent = self.DirEnt.mkdir(
+							fname, volatile=True)
+					else:
+						dent = self.DirEnt.mkfile(
 							fname, volatile=True)
 					parent.add(dent)
 			elif dent.parent is not None:
@@ -3440,13 +3462,15 @@ class VirtualGlobber(Globber): # {{{
 
 		return dent
 
-	def chdir(self, path: str, create: bool = False) -> None:
-		dent = self._lookup(path, create)
+	def chdir(self, path: Union[str, pathlib.PurePath],
+			create: bool = False) -> None:
+		dent = self.lookup(path, create)
 		dent.must_be_dir()
 		self.cwd = dent
 
-	def chroot(self, path: str, create: bool = False) -> None:
-		dent = self._lookup(path, create)
+	def chroot(self, path: Union[str, pathlib.PurePath],
+			create: bool = False) -> None:
+		dent = self.lookup(path, create)
 		dent.must_be_dir()
 
 		if not self.cwd.is_parent(dent):
@@ -3454,20 +3478,22 @@ class VirtualGlobber(Globber): # {{{
 			self.cwd = dent
 		self.root = dent
 
-		dent.fname = '/'
+		# Preserve the original path for path(full_path=True)
+		# on any node in the subtree.
+		dent._fname_or_path = dent.path(full_path=True)
 		dent.parent = None
 
 	def listdir(self, path: str) -> list[str]:
-		return self._lookup(path).ls()
+		return self.lookup(path).ls()
 
 	def isdir(self, path: str) -> bool:
-		return self._lookup(path).isdir()
+		return self.lookup(path).isdir()
 
 	def islink(self, path: str) -> bool:
 		return False
 
 	def must_exist(self, path: str) -> None:
-		self._lookup(path)
+		self.lookup(path)
 
 	def exists(self, path: str) -> bool:
 		try:
@@ -3501,7 +3527,7 @@ def subprocess_check_output(*args, **kwargs) -> bytes:
 	except subprocess.CalledProcessError as ex:
 		# Conceal the arguments, they might be sensitive.
 		ex.cmd = ex.cmd[0]
-		raise FatalError(str(ex)) from ex
+		raise FatalError from ex
 
 # Wait for a subprocess and raise a FatalError if it exited with non-0 status.
 def wait_proc(proc: subprocess.Popen) -> None:
@@ -3595,14 +3621,8 @@ def discover_remote_blobs(args: EncryptedBucketOptions,
 			# Skip blobs belonging to a non-empty prefix.
 			continue
 
-		# Find the appropriate @cls of @blob.
-		for cls in expected:
-			if cls.isa(blob):
-				break
-		else:
-			continue
-
-		if (blob := cls.init_from_gcs(args, blob)) is not None:
+		if (blob := MetaBlob.init_from_gcs(args, blob, expected)) \
+				is not None:
 			yield blob
 
 # Write @blob.blob_uuid as binary to @sys.stdout.
@@ -3720,7 +3740,7 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			else:
 				raise
 		except GoogleAPICallError as ex:
-			raise FatalError(ex) from ex
+			raise FatalError from ex
 	else:	# In case of --wet-run just read @src until we hit EOF.
 		if overwrite is not None:
 			exists = blob.gcs_blob.bucket.get_blob(blob.name) \
@@ -3763,10 +3783,13 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			bytes_in = bytes_in_counter.bytes_transferred
 		else:
 			assert False
-		blob.set_metadata(blob.DataType.FILE_SIZE, bytes_in)
+		blob.file_size = bytes_in
 
-	blob.set_metadata(blob.DataType.BLOB_SIZE, src.bytes_transferred)
-	if not wet_run:
+	if args.verify_blob_size:
+		blob.blob_size = src.bytes_transferred
+
+	if (bytes_in_counter is not None or args.verify_blob_size) \
+			and not wet_run:
 		# In case of failure the blob won't be usable without
 		# --no-verify-blob-size, so it's okay not to delete it.
 		blob.sync_metadata()
@@ -3863,10 +3886,8 @@ def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 		dst.final_progress()
 		if isinstance(dst.wrapped, InternalDecrypt):
 			dst.wrapped.close()
-	except (Exception, KeyboardInterrupt) as ex:
-		if isinstance(ex, GoogleAPICallError):
-			raise FatalError(ex) from ex
-		raise
+	except GoogleAPICallError as ex:
+		raise FatalError from ex
 	finally:
 		if len(pipeline) > 0:
 			# This should cause the @pipeline to finish.
@@ -4010,7 +4031,7 @@ def choose_exact_snapshots(args: SelectionOptions,
 		errors = [ "The following items were not found %s:"
 				% snapshots.where ]
 		errors += (f"  {exact}" for exact in exacts)
-		raise UserError("\n".join(errors))
+		raise UserError('\n'.join(errors))
 
 	return True
 
@@ -4102,7 +4123,7 @@ class CmdListLocal(CmdExec, CommonOptions, ShowUUIDOptions):
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
-		section = self.sections["other"]
+		section = self.sections["operation"]
 		section.add_enable_flag("--check-remote", "-r")
 
 		self.add_dir()
@@ -4315,7 +4336,7 @@ class CmdDeleteRemote(CmdExec, DeleteOptions):
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
-		section = self.sections["rmdelete"]
+		section = self.sections["deletion"]
 		mutex = section.add_mutually_exclusive_group()
 		mutex.add_enable_flag("--delete-full")
 		mutex.add_enable_flag("--delete-delta")
@@ -4747,7 +4768,7 @@ class CmdUpload(CmdExec, UploadDownloadOptions, UploadBlobOptions,
 
 		section = self.sections["upload"]
 		section.add_enable_flag("--reupload")
-		section.add_disable_flag("--no-store-snapshot-size")
+		section.add_disable_flag_no_dflt("--no-store-snapshot-size")
 
 		section = self.sections["operation"]
 		section.add_enable_flag("--ignore-remote")
@@ -4763,8 +4784,6 @@ class CmdUpload(CmdExec, UploadDownloadOptions, UploadBlobOptions,
 
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
-
-		self.store_snapshot_size = args.store_snapshot_size
 
 		self.ignore_remote = args.ignore_remote
 		if self.ignore_remote and not (self.dry_run or self.wet_run):
@@ -4782,6 +4801,10 @@ class CmdUpload(CmdExec, UploadDownloadOptions, UploadBlobOptions,
 
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
+
+		self.merge_options_from_ini(args, "store_snapshot_size", tpe=bool)
+		if args.store_snapshot_size is not None:
+			self.store_snapshot_size = args.store_snapshot_size
 
 		self.merge_options_from_ini(args, "indexer")
 		if args.indexer is not None:
@@ -5384,7 +5407,13 @@ class FTPClient:
 	@functools.cached_property
 	def remote(self):
 		assert isinstance(self, CmdFTP)
-		return VirtualGlobber(discover_remote_blobs(self))
+
+		remote = VirtualGlobber(discover_remote_blobs(self))
+		if self.chdir is not None:
+			remote.chdir(self.chdir)
+		elif self.chroot is not None:
+			remote.chroot(self.chroot)
+		return remote
 
 	# Right-justify the @col:th column in @rows, or delete it.
 	def rjust_column(self, rows: Sequence[list[Optional[str]]], col: int,
@@ -5414,6 +5443,8 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 	help = "TODO"
 
 	load_all_blobs: bool = False
+	chdir: Optional[str] = None
+	chroot: Optional[str] = None
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
@@ -5421,16 +5452,24 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 		section = self.sections["bucket"]
 		section.add_enable_flag_no_dflt("--load-all-blobs")
 
+		section = self.sections["operation"]
+		mutex = section.add_mutually_exclusive_group()
+		mutex.add_argument("--chdir")
+		mutex.add_argument("--chroot")
+
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
 
 		self.merge_options_from_ini(args, "load_all_blobs", tpe=bool)
 		if self.encrypt_metadata:
-			# Blob names aren't arranges hierarchically,
+			# Blob names aren't arranged hierarchically,
 			# we can't load them incrementally.
 			self.load_all_blobs = True
 		elif args.load_all_blobs is not None:
 			self.load_all_blobs = args.load_all_blobs
+
+		self.chdir = args.chdir
+		self.chroot = args.chroot
 
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
@@ -5529,6 +5568,7 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 		if error:
 			sys.exit(1)
 
+# Execute the appropriate subcommand in the FTP shell.
 class CmdFTPShell(CmdTop):
 	class ArgumentParserNoUsage(CmdTop.ArgumentParser):
 		def print_usage(self, *args, **kw):
@@ -5560,6 +5600,7 @@ class CmdFTPShell(CmdTop):
 				 			parser_class=parent)
 
 	# Remove the flags we don't want the @subcommands to have.
+	# TODO: currently unused
 	def prune(self, subcommands: Iterable[CmdLineCommand]) -> None:
 		for cmd in subcommands:
 			cmd.remove_argument("--debug")
@@ -5573,7 +5614,6 @@ class CmdFTPShell(CmdTop):
 		 		CmdFTPDir(self), CmdFTPPDir(self),
 		 		CmdFTPDu(self), CmdFTPRm(self),
 		 		CmdFTPGet(self), CmdFTPPut(self))
-		self.prune(subcommands)
 		return subcommands
 
 class CmdFTPHelp(CmdExec):
@@ -5891,7 +5931,7 @@ class CmdFTPRm(CmdExec):
 		self.verbose = args.verbose
 		self.what = args.what
 
-	def execute(self: _CmdFTPDu) -> None:
+	def execute(self: _CmdFTPRm) -> None:
 		to_delete = [ ]
 		for match in self.remote.globs(self.what):
 			dent = self.remote.lookup(match)
@@ -5993,7 +6033,7 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 			if self.re_baseless.search(src):
 				src_tree = src_top.scan(include_self=False)
 			else:
-				dst_top = dst_top.joinpath(src_top.fname)
+				dst_top /= src_top.fname
 
 		for src in src_tree:
 			dst = dst_top / src.path(src_top)
@@ -6007,6 +6047,7 @@ class CmdFTPPut(CmdExec):
 	help = "TODO"
 
 	follow_symlinks: bool
+
 	src: list[str]
 	dst: Optional[str]
 
@@ -6023,6 +6064,7 @@ class CmdFTPPut(CmdExec):
 		super().pre_validate(args)
 
 		self.follow_symlinks = args.follow_symlinks
+
 		self.dst = args.what.pop() if len(args.what) > 1 else None
 		self.src = args.what
 
@@ -6030,27 +6072,30 @@ class CmdFTPPut(CmdExec):
 		cmd_ftp_put(self)
 
 def upload_file(self: _CmdFTPPut,
-		src: Union[str, os.PathLike], dst: os.PathLike) \
-		-> int:
+		src: Union[str, os.PathLike], dst: os.PathLike) -> int:
 	# Make @dst non-absolute, looks nicer in the GCS console.
-	blob = MetaBlob(self, str(dst.relative_to('/')))
+	blob = MetaBlob(self, str(dst.relative_to(RootDir)))
 
 	print(f"Uploading {src}...", end="", flush=True)
 	try:
 		return upload_blob(self, blob, pipeline_stdin=open(src, "rb"))
 	finally:
 		print()
+		self.remote.lookup(dst, create=True).commit(blob)
 
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	if isinstance(self.parent, CmdFTPShell):
 		local = self.local.globs(map(os.path.expanduser, self.src))
 	else:
 		local = self.src
-	local = [ (src, os.stat(src).st_mode) for src in local ]
+	try:
+		local = [ (src, os.stat(src).st_mode) for src in local ]
+	except OSError as ex:
+		raise FatalError from ex
 
 	for src, mode in local:
 		if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-			raise ValueError(
+			raise UserError(
 				f"{src}: not a regular file or directory")
 
 	if self.dst is not None:
@@ -6076,14 +6121,15 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 		if stat.S_ISREG(mode):
 			dst = remote.path()
 			if remote.isdir():
-				dst = dst.joinpath(os.path.basename(src))
+				dst /= os.path.basename(src)
 			upload_file(self, src, dst)
 			continue
 
+		# @src is a directory.
 		src_top = pathlib.PurePath(src)
 		dst_top = remote.path()
 		if not remote.volatile and not self.re_baseless.search(src):
-			dst_top = dst_top.joinpath(src_top.name)
+			dst_top /= src_top.name
 
 		for dirpath, dirs, files in os.walk(
 				src_top, followlinks=self.follow_symlinks):
@@ -6091,8 +6137,24 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			dst_dir = dst_top / dirpath.relative_to(src_top)
 			for fname in sorted(files):
 				src = dirpath / fname
-				if stat.S_ISREG(os.stat(src).st_mode):
+				try:
+					mode = os.stat(src).st_mode
+				except OSError as ex:
+					import errno
+
+					if ex.errno in (errno.ENOENT,
+		     					errno.ELOOP):
+						print(f"{ex.filename}: "
+							f"{ex.strerror}",
+	    						file=sys.stderr)
+						continue
+					raise FatalError from ex
+
+				if stat.S_ISREG(mode):
 					upload_file(self, src, dst_dir / fname)
+				else:
+					print(f"{src}: not a regular file",
+						file=sys.stderr)
 
 			# Don't descend into @dirs we've @seen.
 			if seen is not None:
