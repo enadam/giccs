@@ -8,33 +8,12 @@
 # put: doesn't work well with --chroot # XXX
 #
 # consistency check of remote backups
-# calculate/verify hash? (hash of authentication tags)
+# calculate/verify end-to-end hash? (hash of authentication tags)
 # add timestamp to blob_uuid (to avoid collisions)
+# rename subvolume to volume
 #
 # padding?
 # use HMAC/CMAC/AEAD instead of hash+encrypt?
-#
-# bulk cipher:
-#	AES-OCB, AES-SIV, AES-SIV-GCM (not always available)
-#	mandatory rekeying every GiB (stripe) to decrease blast radius
-#	nonce:
-#		counter (8 B, for uniqueness) + random (4 B, for unpredictability)
-#			maybe pseudo-random?
-#		use it as a sequence number
-#		don't encrypt and don't add the counter to the ciphertext
-#		keep the random part secret
-#	for every chunk, add the random part of the next chunk's nonce to the cleartext
-#	for the last chunk of every stripe, add the next stripe's key to the cleartext
-# master cipher:
-#	AES-SIV-GCM if the bulk cipher is that, otherwise AES-SIV
-#	METADATA, SIGNATURE: all at once, no multiple chunks
-#	first block of PAYLOAD:
-#		key of first stripe
-#		random part of the first chunk's nonce
-#	nonce: timestamp (4 B) + random (8 B)
-# don't encrypt blob_uuid, data_type (-> AAD)
-#	we don't have to add them to the cleartext, just verify them
-#	attacker will have less idea what is in the cleartext
 #
 # upload/download: split plan and execution
 # consider using clone sources when uploading
@@ -79,7 +58,17 @@
 # Modules {{{
 from __future__ import annotations
 
-from typing import	TypeVar, Protocol, Self, \
+import sys, os, pathlib
+libdir = str(pathlib.Path(sys.argv[0]).resolve().parent.joinpath("crypto/lib").resolve())
+if "LD_LIBRARY_PATH" not in os.environ:
+	os.environ["LD_LIBRARY_PATH"] = libdir
+	os.execv(sys.argv[0], sys.argv)
+elif libdir not in os.environ["LD_LIBRARY_PATH"].split(';'):
+	os.environ["LD_LIBRARY_PATH"] += f";{libdir}"
+	os.execv(sys.argv[0], sys.argv)
+sys.path.append("/home/adam/volatile/btrfs/giccs/lib")
+
+from typing import	TypeVar, ParamSpec, Protocol, Self, \
 			Any, Union, Optional, Final, \
 			Generator, Iterator, Iterable, Callable, \
 			Container, Collection, Sequence, \
@@ -99,7 +88,6 @@ import contextlib, functools
 
 import btrfs
 
-sys.path.append("/home/adam/volatile/btrfs/giccs/lib")
 import google.cloud.storage
 import google.oauth2.service_account
 from google.api_core.exceptions import GoogleAPICallError
@@ -1442,12 +1430,14 @@ class IndexDecompressionOptions(CompressionOptionsBase):
 
 # Add --encryption-command/--encryption-key/--encryption-key-command/etc.
 class EncryptionOptions(CmdLineOptions): # {{{
-	encryption_command:	Optional[Sequence[str]] = None
-	decryption_command:	Optional[Sequence[str]] = None
+	meta_cipher:		Optional[InternalCipher.Primitive] = None
+	bulk_cipher:		Optional[InternalCipher.Primitive] = None
 
 	encryption_key:		Optional[bytes] = None
 	encryption_key_command:	Optional[Sequence[str]] = None
-	encryption_key_per_uuid: bool = False
+
+	encryption_command:	Optional[Sequence[str]] = None
+	decryption_command:	Optional[Sequence[str]] = None
 
 	encrypt_metadata:	bool = False
 	verify_blob_size:	bool = False
@@ -1456,8 +1446,7 @@ class EncryptionOptions(CmdLineOptions): # {{{
 	subvolume: Optional[str] = None
 
 	def encrypt_internal(self) -> bool:
-		return self.encryption_key is not None \
-				or self.encryption_key_command is not None
+		return bool(self.meta_cipher or self.bulk_cipher)
 
 	def encrypt_external(self) -> bool:
 		return bool(self.encryption_command or self.decryption_command)
@@ -1473,16 +1462,33 @@ class EncryptionOptions(CmdLineOptions): # {{{
 		section.add_argument("--subvolume", "-V")
 
 		section = self.sections["encryption"]
+		section.add_argument("--meta-cipher")
+		section.add_argument("--bulk-cipher", "--cipher")
 		section.add_argument("--encryption-command", "--encrypt")
+		section.add_argument("--decryption-command", "--decrypt")
 		mutex = section.add_mutually_exclusive_group()
-		mutex.add_argument("--decryption-command", "--decrypt")
 		mutex.add_argument("--encryption-key", "--key")
 		mutex.add_argument("--encryption-key-command", "--key-cmd")
-		section.add_enable_flag_no_dflt("--encryption-key-per-uuid")
 
 		section.add_disable_flag_no_dflt("--no-encrypt-metadata")
 		section.add_disable_flag_no_dflt("--no-verify-blob-size")
 		section.add_disable_flag_no_dflt("--no-blob-header")
+
+	def resolve_internal_cipher(self, which: str, *names: str) \
+					-> InternalCipher.Primitive:
+		for name in names:
+			cipher = InternalCipher.look_up_cipher(name)
+			if cipher is not None:
+				return cipher
+
+		if len(names) > 1:
+			msg = f"couldn't find a suitable {which}"
+		else:
+			msg = f"invalid {which}"
+		ciphers = ", ".join(
+				cipher.__name__ for cipher
+				in InternalCipher.available_ciphers())
+		raise self.CmdLineError(f"{msg}, choose from {ciphers}")
 
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
@@ -1492,32 +1498,25 @@ class EncryptionOptions(CmdLineOptions): # {{{
 
 		self.merge_options_from_ini(args,
 			("encryption_command", "decryption_command"),
-			"encryption_key",
-			"encryption_key_command")
-		if args.encryption_command is not None:
-			# Ensure that neither --encryption-key
-			# nor --encryption-key-command is used.
-			if args.decryption_command is None:
-				raise self.CmdLineError(
-					"--encryption-command must be used "
-					"together with --decryption-command")
-			self.encryption_command = \
-				self.shlex_split(
-					"encryption-command",
-					args.encryption_command)
-		if args.decryption_command is not None:
-			# For downloads it doesn't matter
-			# if --encryption-command is set.
-			if args.encryption_command is None \
-					and isinstance(
-						self, UploadBlobOptions):
-				raise self.CmdLineError(
-					"--decryption-command must be used "
-					"together with --encryption-command")
-			self.decryption_command = \
-				self.shlex_split(
-					"decryption-command",
-					args.decryption_command)
+			("meta_cipher", "bulk_cipher"))
+		self.merge_options_from_ini(args,
+			"encryption_key", "encryption_key_command")
+
+		if args.meta_cipher is not None:
+			self.meta_cipher = self.resolve_internal_cipher(
+							"meta-cipher",
+							args.meta_cipher)
+		if args.bulk_cipher is not None:
+			self.bulk_cipher = self.resolve_internal_cipher(
+							"bulk-cipher",
+							args.bulk_cipher)
+		if self.meta_cipher is None and self.bulk_cipher is not None:
+			self.meta_cipher = self.resolve_internal_cipher(
+						"meta-cipher",
+						"AESGCMSIV", "AESSIV")
+		if self.bulk_cipher is None and self.meta_cipher is not None:
+			self.bulk_cipher = self.meta_cipher
+
 		if args.encryption_key is not None:
 			try:
 				self.encryption_key = base64.b64decode(
@@ -1525,18 +1524,48 @@ class EncryptionOptions(CmdLineOptions): # {{{
 						validate=True)
 			except binascii.Error as ex:
 				raise self.CmdLineError(
-					"encryption key is not a valid "
+					"encryption-key is not a valid "
 					"base-64 string") from ex
 		elif args.encryption_key_command is not None:
 			self.encryption_key_command = \
 				self.shlex_split(
 					"encryption-key-command",
 					args.encryption_key_command)
+		elif self.encrypt_internal():
+			raise self.CmdLineError(
+					"either encryption-key "
+					"or encryption-key-command "
+					"must be specified")
 
-			self.merge_options_from_ini(args,
-				"encryption_key_per_uuid", tpe=bool)
-			self.encryption_key_per_uuid = \
-				args.encryption_key_per_uuid
+		if args.encryption_command is not None:
+			self.encryption_command = \
+				self.shlex_split(
+					"encryption-command",
+					args.encryption_command)
+		if args.decryption_command is not None:
+			self.decryption_command = \
+				self.shlex_split(
+					"decryption-command",
+					args.decryption_command)
+		if (self.encryption_command is not None) \
+				!= (self.decryption_command is not None):
+			raise self.CmdLineError(
+					"encryption-command "
+					"and decryption-command "
+					"must be specified together")
+		assert not (self.encrypt_internal() \
+				and self.encrypt_external())
+
+		if args.encryption_key is not None \
+				or args.encryption_key_command is not None:
+			if self.encrypt_external():
+				raise self.CmdLineError(
+					"encryption key cannot be specified "
+					"together with encryption command")
+			elif not self.encrypt_internal():
+				raise self.CmdLineError(
+					"meta-cipher and/or bulk-cipher "
+					"must be specified")
 
 		self.merge_options_from_ini(args, "encrypt_metadata", tpe=bool)
 		if args.encrypt_metadata is not False:
@@ -1917,83 +1946,240 @@ class Backups(Snapshots): # {{{
 
 # The internal encryption and decryption classes.
 class InternalCipher: # {{{
-	# Define the interface of the underlying @cipher we'll use
-	# rather than naming the concrete class, so we can defer importing
-	# the cryptography module until it's needed (if needed at all).
-	class Primitive(Protocol):
-		def encrypt(self, nonce: ByteString, data: bytes,
-				associated_data: Optional[bytes]) -> bytes:
+	# The cryptography.hazmat.primitives.ciphers.aead module,
+	# imported dynamically, only when necessary.
+	aead: types.ModuleType
+
+	# The interface of the various ciphers in the aead module. {{{
+	class PrimitiveBase(Protocol):
+		def __init__(self, key: bytes):
 			...
 
-		def decrypt(self, nonce: ByteString, data: bytes,
-				associated_data: Optional[bytes]) -> bytes:
+		def generate_key(self, bits: int) -> bytes:
 			...
 
-	# Header included with each block of ciphertext consisting of:
-	#   1) an UUID unambiguously identifying the blob it belongs to
-	#   2) a pseudo-random sequence number unique for each ciphertext;
-	#      the first block contains the seed, from which the sequence
-	#      number of the remaining blocks are derived.
-	#
-	# 1) protects against swapping ciphertext blocks between blobs
-	# (or swapping entire blobs with each other) while 2) prevents
-	# the reordering of blocks within a Backup.
-	#
-	# Calculating a MAC for the whole blob would be less secure because
-	# this way we can detect tampering as soon as possible, before piping
-	# data to btrfs receive, which only operates reliably and securely if
-	# the input is trustworthy.
-	header_st: Final[struct.Struct] = \
-		struct.Struct(f"!QB{BTRFS_UUID_SIZE}s")
+	class PrimitiveCommon(PrimitiveBase):
+		def encrypt(self, nonce: ByteString, data: ByteString,
+				associated_data: Optional[ByteString]) \
+				-> bytes:
+			...
 
+		def decrypt(self, nonce: ByteString, data: ByteString,
+				associated_data: Optional[ByteString]) \
+				-> bytes:
+			...
+
+	class PrimitiveAESSIV(PrimitiveBase):
+		def encrypt(self, data: ByteString,
+				associated_data: Optional[list[ByteString]]) \
+				-> bytes:
+			...
+
+		def decrypt(self, data: ByteString,
+				associated_data: Optional[list[ByteString]]) \
+				-> bytes:
+			...
+
+	Primitive = Union[PrimitiveCommon, PrimitiveAESSIV]
+	# }}}
+
+	# Output stream structure: {{{
+	# * init block:
+	#   * nonce:
+	#     * timestamp (4 B)
+	#     * true random (8 B)
+	#   * data (encrypted with the @meta_cipher):
+	#     * bulk key (bulk_key_size())
+	#     * prng seed (NONCE_SEED_BITS)
+	#   * verification tag (AUTH_TAG_SIZE)
+	# * first chunk (encrypted with the @bulk_cipher):
+	#   * bulk data (CLEARTEXT_SIZE - init_block_size())
+	#   * verification tag (AUTH_TAG_SIZE)
+	# * next chunk:
+	#   * bulk data (CLEARTEXT_SIZE)
+	#   * verification tag (AUTH_TAG_SIZE)
+	# [...]
+	# * last chunk of the stripe:
+	#   * next bulk key (bulk_key_size())
+	#   * bulk data (CLEARTEXT_SIZE - bulk_key_size())
+	#   * verification tag (AUTH_TAG_SIZE)
+	# }}}
+
+	# Tunable security parameters.
 	NONCE_SIZE: Final[int]		= 12
-	RND_BITS: Final[int]		= 64
-	TAG_SIZE: Final[int]		= 16
+	NONCE_SEED_BITS: Final[int]	= 64
+	BULK_KEY_BITS: Final[int]	= 256
 
-	# AESGCM has been measured to be the fastest with this block size.
-	OUTPUT_SIZE: Final[int]		= 512 * 1024
-	CIPHERTEXT_SIZE: Final[int]	= OUTPUT_SIZE - NONCE_SIZE
-	CLEARTEXT_SIZE: Final[int]	= CIPHERTEXT_SIZE - TAG_SIZE
-	INPUT_SIZE: Final[int]		= CLEARTEXT_SIZE - header_st.size
+	# This is non-tunable.
+	AUTH_TAG_SIZE: Final[int]	= 16
 
-	key: bytes
-	cipher: Primitive
+	# The various aead primitives have been measured to be the fastest
+	# with this chunk size.
+	CIPHERTEXT_SIZE: Final[int]	= 512 * 1024
+	CLEARTEXT_SIZE: Final[int]	= CIPHERTEXT_SIZE - AUTH_TAG_SIZE
 
-	data_type_id: Optional[int]
-	blob_uuid: Optional[uuid.UUID]
-	blob_uuid_bytes: bytes
+	# The maximum number of chunks to encrypt with the same @bulk_cipher.
+	# A chunk is produced by one invocation of the Primitive's encrypt()
+	# operation.
+	CHUNKS_PER_STRIPE: Final[int]	= 1024*1024*1024 // CIPHERTEXT_SIZE
 
-	wrapped: Optional[BinaryIO]
-	inbytes: int
-	outbytes: int
+	# The init block is encrypted with the @meta_cipher, everything else
+	# is encrypted with a @bulk_cipher.  The @bulk_cipher is initialized
+	# when the init block is encrypted or decrypted.
+	meta_cipher:			Primitive
+	bulk_cipher_class:		type[Primitive]
+	bulk_cipher:			Optional[Primitive]
 
-	def __init__(self, key: bytes,
-			data_type_id: Optional[int] = None,
-			blob_uuid: Optional[uuid.UUID] = None,
-			wrapped: Optional[BinaryIO] = None):
+	# @nonce_prng is initialized from the init block.  @chunk_counter
+	# counts how many chunks have been encrypted or decrypted.
+	nonce_prng:			Optional[random.Random]
+	chunk_counter:			int
+
+	# The additional authenticated data (@blob_uuid and @data_type_id
+	# concatenated).
+	auth_data:			bytearray
+	blob_uuid:			uuid.UUID
+	data_type_id:			int
+
+	# The file where cleartext is read from or written to.
+	wrapped:			Optional[BinaryIO]
+	bytes_in:			int
+	bytes_out:			int
+
+	# Have we encountered an exception?
+	borked:				Optional[Exception]
+
+	# See if a cipher with @name is defined in the aead module.
+	@classmethod
+	def look_up_cipher(cls, name: str) -> Optional[Primitive]:
 		from cryptography.hazmat.primitives.ciphers import aead
 
-		self.key = key
-		self.cipher = aead.AESGCM(key)
+		cipher = getattr(aead, name, None)
+		if cipher is None or type(cipher) is not type \
+				or not hasattr(cipher, "encrypt"):
+			return None
+		return cipher
 
-		self.data_type_id = data_type_id
+	# Return the list of ciphers defined in the aead module.
+	@classmethod
+	def available_ciphers(cls) -> Iterable[Primitive]:
+		from cryptography.hazmat.primitives.ciphers import aead
 
-		self.blob_uuid = blob_uuid
-		self.blob_uuid_bytes = ensure_uuid(blob_uuid).bytes
+		for sym in dir(aead):
+			cipher = cls.look_up_cipher(sym)
+			if cipher is not None:
+				yield cipher
 
+	# Override @self.CIPHERTEXT_SIZE and @self.CHUNKS_PER_STRIPE
+	# for testing.
+	@classmethod
+	def override_chunk_and_stripe_size(cls,
+			chunk_size: Optional[int],
+			chunks_per_stripe: Optional[int]) -> None:
+		if chunk_size is not None:
+			cls.CIPHERTEXT_SIZE = chunk_size
+			cls.CLEARTEXT_SIZE = cls.CIPHERTEXT_SIZE \
+						- cls.AUTH_TAG_SIZE
+		if chunks_per_stripe is not None:
+			cls.CHUNKS_PER_STRIPE = chunks_per_stripe
+
+	def __init__(self,
+	      		meta_cipher: Primitive,
+	      		bulk_cipher_class: type[Primitive],
+			blob_uuid: uuid.UUID, data_type_id: int,
+	      		wrapped: Optional[BinaryIO] = None):
+		from cryptography.hazmat.primitives.ciphers import aead
+		self.aead = aead
+
+		self.meta_cipher = meta_cipher
+		self.bulk_cipher_class = bulk_cipher_class
+		self.reset(blob_uuid, data_type_id)
 		self.wrapped = wrapped
-		self.inbytes = self.outbytes = 0
 
+	# Allows setting @self.wrapped after the object has been created.
 	def init(self, wrapped: Optional[BinaryIO]) -> None:
 		assert self.wrapped is None
 		self.wrapped = wrapped
 
-	def mkprng(self, seed: int) -> random.Random:
-		prng = random.Random()
-		prng.seed(seed, version=2)
-		return prng
+	# Makes the object ready to encrypt or decrypt another file.
+	# Also the @blob_uuid and/or the data_type_id can be updated.
+	def reset(self, blob_uuid: Optional[uuid.UUID] = None,
+	   		data_type_id: Optional[int] = None,
+	   		wrapped: Optional[BinaryIO] = None) -> None:
+		self.bulk_cipher = None
+
+		# Reset @self.auth_data if a new @blob_uuid or @data_type_id
+		# has been set.
+		if blob_uuid is not None:
+			self.blob_uuid = blob_uuid
+		if data_type_id is not None:
+			self.data_type_id = data_type_id
+		if blob_uuid is not None or data_type_id is not None:
+			self.auth_data = bytearray(self.blob_uuid.bytes)
+			self.auth_data += self.data_type_id.to_bytes(4)
+
+		self.nonce_prng = None
+		self.chunk_counter = 0
+
+		if wrapped is not None:
+			self.wrapped = wrapped
+		self.bytes_in = self.bytes_out = 0
+
+		self.borked = None
+
+	# How large a key @self.bulk_cipher_class needs (in bytes) to achieve
+	# BULK_KEY_BITS-level security.
+	def bulk_key_size(self) -> int:
+		key_size = self.BULK_KEY_BITS // 8
+		if issubclass(self.bulk_cipher_class, self.aead.AESSIV):
+			# SIV-AES needs two keys.
+			key_size *= 2
+		return key_size
+
+	# The size of the init block, considering the bulk_key_size().
+	def init_block_size(self) -> int:
+		return self.NONCE_SIZE \
+			+ self.bulk_key_size() \
+			+ self.NONCE_SEED_BITS // 8 \
+			+ self.AUTH_TAG_SIZE
+
+	# Initialize @self.nonce_prng with a fixed version of the PRNG,
+	# which is guaranteed to produce the same sequence regardless
+	# of the Python version.
+	def init_prng(self, seed: int) -> None:
+		assert self.nonce_prng is None
+		self.nonce_prng = random.Random()
+		self.nonce_prng.seed(seed, version=2)
+
+	# Generate a nonce for the next chunk.
+	def next_bulk_nonce(self) -> bytearray:
+		assert self.nonce_prng is not None
+
+		nonce = bytearray(self.chunk_counter.to_bytes(8))
+		nonce += self.nonce_prng.randbytes(
+				self.NONCE_SIZE - len(nonce))
+		self.chunk_counter += 1
+
+		return nonce
+
+	# If @fun is not exception-safe, but it raises one, save and re-raise
+	# it in case GCS is retrying.
+	T = TypeVar('T')
+	P = ParamSpec('P')
+	def noretry(fun: Callable[P, T]) -> Callable[P, T]:
+		def wrapper(self, *args: P.args, **kwargs: P.kwargs) -> T:
+			if self.borked is not None:
+				raise self.borked
+
+			try:
+				return fun(self, *args, **kwargs)
+			except Exception as ex:
+				self.borked = ex
+				raise
+		return wrapper
 
 class InternalEncrypt(InternalCipher):
+	# The CSRNG to use when one is not provided to the constructor.
 	class CSRNG(random.Random):
 		def getrandbits(self, n: int) -> int:
 			return secrets.randbits(n)
@@ -2001,256 +2187,368 @@ class InternalEncrypt(InternalCipher):
 		def randbytes(self, n: int) -> bytes:
 			return secrets.token_bytes(n)
 
+	# Used to initialize @self.nonce_prng.
 	csrng: random.Random
-	prng: Optional[random.Random]
 
+	# The output buffer.
 	ciphertext: bytearray
 	ciphertext_i: int
 
+	# Has @self.wrapped been read fully?
 	eof: bool
 
-	def __init__(self, key: bytes,
-			data_type_id: int, blob_uuid: uuid.UUID,
-			nonce_rng: Optional[random.Random] = None,
-			wrapped: Optional[BinaryIO] = None):
-		super().__init__(key, data_type_id, blob_uuid, wrapped)
+	# The @csrng can be overridden for testing.
+	def __init__(self,
+	      		meta_cipher: Primitive,
+	      		bulk_cipher_class: type[Primitive],
+			blob_uuid: uuid.UUID, data_type_id: int,
+			csrng: Optional[random.Random] = None,
+	      		wrapped: Optional[BinaryIO] = None):
+		super().__init__(meta_cipher, bulk_cipher_class,
+					blob_uuid, data_type_id, wrapped)
+		self.csrng = csrng or self.CSRNG()
 
-		self.csrng = nonce_rng if nonce_rng is not None \
-				else self.CSRNG()
-		self.prng = None
+	# Also called by super().__init__().
+	def reset(self, blob_uuid: Optional[uuid.UUID] = None,
+	   		data_type_id: Optional[int] = None,
+	   		wrapped: Optional[BinaryIO] = None) -> None:
+		super().reset(blob_uuid, data_type_id, wrapped)
 
 		self.ciphertext = bytearray()
 		self.ciphertext_i = 0
 
 		self.eof = False
 
-	def newbuf(self) -> bytearray:
-		# @rnd is the header's sequence number, which prevents
-		# the reordering of ciphertexts.
-		if not self.prng:
-			rnd = self.csrng.getrandbits(self.RND_BITS)
-			self.prng = self.mkprng(rnd)
+	# Abstraction to invoke the @cipher's encryption function.
+	def encrypt_base(self, cipher: Primitive, nonce: ByteString,
+				cleartext: ByteString) -> bytes:
+		if isinstance(cipher, self.aead.AESSIV):
+			ciphertext = cipher.encrypt(cleartext,
+						[ self.auth_data, nonce ])
 		else:
-			rnd = self.prng.getrandbits(self.RND_BITS)
+			ciphertext = cipher.encrypt(nonce, cleartext,
+						self.auth_data)
 
-		# Bind the ciphertext block to the UUID, preventing it
-		# from being reused in another blob.
-		cleartext = bytearray(self.header_st.size)
-		self.header_st.pack_into(cleartext, 0,
-			rnd, self.data_type_id, self.blob_uuid_bytes)
+		self.bytes_out += len(ciphertext)
+		return ciphertext
 
-		return cleartext
+	# Encrypt the @cleartext with the @self.meta_cipher.
+	def encrypt_meta(self, cleartext: ByteString) -> bytes:
+		# Normally time.time() increases monotonically, ensuring the
+		# uniqueness of the @nonce in most circumstances.  We also add
+		# considerable entropy to make it a guarantee.
+		nonce = bytearray(int(time.time()).to_bytes(4))
+		nonce += self.csrng.randbytes(self.NONCE_SIZE - len(nonce))
 
+		ciphertext = self.encrypt_base(self.meta_cipher, nonce,
+						cleartext)
+		self.bytes_out += len(nonce)
+
+		return nonce + ciphertext
+
+	# Generate a key for @self.bulk_cipher_class.
+	def gen_bulk_key(self) -> bytes:
+		if not isinstance(self.csrng, self.CSRNG):
+			# An external csrng was provided to __init__(),
+			# so let's not use the cipher's own method, which
+			# probably pulls from another random source.
+			return self.csrng.randbytes(self.bulk_key_size())
+
+		return self.bulk_cipher_class.generate_key(
+						self.bulk_key_size() * 8)
+
+	# Return at most @n bytes of ciphertext derived from data read from
+	# @self.wrapped.  If @n is None, encrypt all the remaining cleartext
+	# from @self.wrapped.  This function is not exception-safe, eg. we
+	# don't save the cleartext read from @self.wrapped.
+	@InternalCipher.noretry
 	def read(self, n: Optional[int] = None) \
 			-> Union[memoryview, bytearray]:
 		assert self.wrapped is not None
 
+		# Add the init block to @self.ciphertext if this is the
+		# first chunk and we haven't added it yet.
+		if self.bulk_cipher is None:
+			assert not self.bytes_out
+			assert not self.chunk_counter
+
+			bulk_key = self.gen_bulk_key()
+			self.bulk_cipher = self.bulk_cipher_class(bulk_key)
+
+			nonce_seed = self.csrng.getrandbits(
+						self.NONCE_SEED_BITS)
+			self.init_prng(nonce_seed)
+			nonce_seed = nonce_seed.to_bytes(
+					self.NONCE_SEED_BITS // 8)
+
+			assert not self.ciphertext
+			self.ciphertext += self.encrypt_meta(
+						bulk_key + nonce_seed)
+			assert len(self.ciphertext) == self.init_block_size()
+
+		# If we have enough data accumulated in @self.ciphertext,
+		# return them.
 		assert len(self.ciphertext) >= self.ciphertext_i
 		ciphertext_len = len(self.ciphertext) - self.ciphertext_i
 		if n is not None and n <= ciphertext_len:
 			ciphertext = memoryview(self.ciphertext)[
 					self.ciphertext_i:self.ciphertext_i+n]
 			self.ciphertext_i += n
-			if n == ciphertext_len:
+			if n == ciphertext_len and n > 0:
 				self.ciphertext = bytearray()
 				self.ciphertext_i = 0
-			self.outbytes += len(ciphertext)
 			return ciphertext
 
+		# Trim the bytes from @self.ciphertext that have been returned
+		# above.
 		if self.ciphertext_i > 0:
 			try:
 				del self.ciphertext[:self.ciphertext_i]
 			except BufferError:
 				# There could be an "Existing exports of data:
 				# object cannot be re-sized" error if a view
-				# of self.ciphertext returned earlier is still
+				# of @self.ciphertext returned earlier is still
 				# held somewhere in the program.
 				self.ciphertext = \
 					self.ciphertext[self.ciphertext_i:]
 			self.ciphertext_i = 0
 
-		while n is None or len(self.ciphertext) < n:
-			cleartext = self.newbuf()
-			minbuf = len(cleartext)
+		# Encrypt new chunks of cleartext and add them
+		# to @self.ciphertext.
+		while (n is None or len(self.ciphertext) < n) and not self.eof:
+			cleartext = bytearray()
+			max_cleartext = self.CLEARTEXT_SIZE
+			new_bulk_key = None
+			if not self.chunk_counter:
+				# We've already added the init block to
+				# @self.ciphertext, so we'll need to add
+				# fewer bytes to the @cleartext if we want
+				# @self.ciphertext to be CIPHERTEXT_SIZE
+				# at most after the first chunk.
+				max_cleartext -= self.init_block_size()
+			elif self.chunk_counter % self.CHUNKS_PER_STRIPE == 0:
+				new_bulk_key = self.gen_bulk_key()
+				cleartext += new_bulk_key
 
-			while len(cleartext) < self.CLEARTEXT_SIZE \
-					and not self.eof:
-				prev = len(cleartext)
-				cleartext += self.wrapped.read(
-						self.CLEARTEXT_SIZE - prev)
-				self.inbytes += len(cleartext) - prev
-				if len(cleartext) == prev:
+			# Read up to @max_cleartext from @self.wrapped.
+			min_cleartext = len(cleartext)
+			while len(cleartext) < max_cleartext:
+				prev_cleartext = len(cleartext)
+				to_read = max_cleartext - prev_cleartext
+				try:
+					cleartext += self.wrapped.read(to_read)
+				except OSError as ex:
+					raise FatalError(
+						"couldn't read cleartext:",
+						ex.strerror) from ex
+
+				nread = len(cleartext) - prev_cleartext
+				if not nread:
 					self.eof = True
+					break
+				self.bytes_in += nread
 
-			assert len(cleartext) <= self.CLEARTEXT_SIZE
-			if len(cleartext) == minbuf:
+			assert len(cleartext) <= max_cleartext
+			if len(cleartext) == min_cleartext:
 				# Couldn't get more data from @self.wrapped.
 				assert self.eof
 				break
-			assert len(cleartext) == self.CLEARTEXT_SIZE \
-					or self.eof
+			assert len(cleartext) == max_cleartext or self.eof
 
-			# Make sure the nonce is not repeated
-			# (https://frereit.de/aes_gcm).
-			nonce = int(time.time()).to_bytes(4, "big")
-			nonce += self.csrng.randbytes(
-					self.NONCE_SIZE - len(nonce))
-			self.ciphertext += nonce
-			self.ciphertext += self.cipher.encrypt(
-						nonce, bytes(cleartext), None)
+			self.ciphertext += self.encrypt_base(
+							self.bulk_cipher,
+							self.next_bulk_nonce(),
+							cleartext)
 
-		if n is None or len(self.ciphertext) <= n:
-			ciphertext = self.ciphertext
-			self.ciphertext = bytearray()
-			self.outbytes += len(ciphertext)
-			return ciphertext
-		else:
+			if new_bulk_key is not None:
+				self.bulk_cipher = self.bulk_cipher_class(
+								new_bulk_key)
+
+		# Return the first @n bytes of @self.ciphertext or all of it.
+		if n is not None and n < len(self.ciphertext):
 			ciphertext = memoryview(self.ciphertext)[:n]
 			self.ciphertext_i = n
-			self.outbytes += len(ciphertext)
-			return ciphertext
+		else:
+			ciphertext = self.ciphertext
+			if self.ciphertext:
+				self.ciphertext = bytearray()
+
+		return ciphertext
+
+	# Verify that @self.wrapper has been read and processed fully.
+	def close(self):
+		if self.borked is None:
+			assert self.eof
+			assert not self.ciphertext
+		self.wrapped.close()
 
 class InternalDecrypt(InternalCipher):
-	nonce: Optional[bytearray]
-	prng: Optional[random.Random]
+	# The input buffer.
 	ciphertext: bytearray
 
-	def __init__(self, key: bytes,
-			data_type_id: Optional[int] = None,
-			blob_uuid: Optional[uuid.UUID] = None,
-			wrapped: Optional[BinaryIO] = None):
-		super().__init__(key, data_type_id, blob_uuid, wrapped)
+	def __init__(self,
+	      		meta_cipher: Primitive,
+	      		bulk_cipher_class: type[Primitive],
+			blob_uuid: uuid.UUID, data_type_id: int,
+	      		wrapped: Optional[BinaryIO] = None):
+		super().__init__(meta_cipher, bulk_cipher_class,
+					blob_uuid, data_type_id, wrapped)
 
-		self.nonce = None
-		self.prng = None
+	def reset(self, blob_uuid: Optional[uuid.UUID] = None,
+	   		data_type_id: Optional[int] = None,
+	   		wrapped: Optional[BinaryIO] = None) -> None:
+		super().reset(blob_uuid, data_type_id, wrapped)
 		self.ciphertext = bytearray()
 
-	def extract_nonce(self, buf: ByteString, buf_i: int = 0) \
-			-> Optional[int]:
-		if self.nonce is not None:
-			return buf_i
-
-		assert len(self.ciphertext) < self.NONCE_SIZE
-		if len(self.ciphertext) + (len(buf) - buf_i) < self.NONCE_SIZE:
-			self.ciphertext += buf[buf_i:]
-			return None
-
-		n = self.NONCE_SIZE - len(self.ciphertext)
-		self.ciphertext += buf[buf_i:buf_i+n]
-		self.nonce = self.ciphertext
-		self.ciphertext = bytearray()
-		self.inbytes += self.NONCE_SIZE
-		return buf_i + n
-
-	def verify_header(self, cleartext: memoryview) -> memoryview:
-		rnd, data_type_id, blob_uuid = \
-			self.header_st.unpack_from(cleartext)
-
-		if self.prng:
-			expected_rnd = self.prng.getrandbits(self.RND_BITS)
-			if rnd != expected_rnd:
-				raise SecurityError(
-					"Sequence number (0x%.16X) "
-					"of block at offset in=%d/out=%d "
-					"differs from expected (0x%.16X)"
-					% (rnd, self.inbytes, self.outbytes,
-						expected_rnd))
-		else:
-			self.prng = self.mkprng(rnd)
-
-		if self.data_type_id is None:
-			self.data_type_id = data_type_id
-		elif data_type_id != self.data_type_id:
-			raise SecurityError(
-				"Data type ID (0x%.2X) "
-				"of block at offset in=%d/out=%d "
-				"differs from expected (0x%.2X)"
-				% (data_type_id,
-					self.inbytes, self.outbytes,
-					self.data_type_id))
-
-		if self.blob_uuid is None:
-			self.blob_uuid_bytes = blob_uuid
-			self.blob_uuid = uuid.UUID(bytes=blob_uuid)
-		elif blob_uuid != self.blob_uuid_bytes:
-			blob_uuid = uuid.UUID(bytes=blob_uuid)
-			raise SecurityError(
-				"Snapshot UUID (%s) "
-				"of block at offset in=%d/out=%d "
-				"differs from expected (%s)"
-				% (blob_uuid,
-					self.inbytes, self.outbytes,
-					self.blob_uuid))
-
-		assert len(cleartext) > self.header_st.size
-		return cleartext[self.header_st.size:]
-
-	def decrypt(self, ciphertext: ByteString) -> None:
+	# Abstraction to invoke the @cipher's decryption function.
+	def decrypt_base(self, cipher: Primitive, nonce: ByteString,
+				ciphertext: ByteString) -> bytes:
 		from cryptography import exceptions as cryptography_exceptions
 
-		assert self.nonce is not None
-		assert len(ciphertext) <= self.CIPHERTEXT_SIZE
 		try:
-			cleartext = memoryview(self.cipher.decrypt(
-				self.nonce, bytes(ciphertext), None))
+			if isinstance(cipher, self.aead.AESSIV):
+				auth_data = [ self.auth_data, nonce ]
+				cleartext = cipher.decrypt(ciphertext,
+								auth_data)
+			else:
+				cleartext = cipher.decrypt(nonce, ciphertext,
+							self.auth_data)
 		except cryptography_exceptions.InvalidTag as ex:
 			raise SecurityError(
 				"Decryption of ciphertext block "
-				"at offset %d failed" % self.inbytes) \
+				"at offset %d failed" % self.bytes_in) \
 				from ex
 
-		cleartext = self.verify_header(cleartext)
+		self.bytes_in += len(ciphertext)
+		return cleartext
+
+	# Decrypt the @ciphertext with the @self.meta_cipher.
+	def decrypt_meta(self, ciphertext: ByteString) -> bytes:
+		assert len(ciphertext) >= self.NONCE_SIZE
+
+		ciphertext = memoryview(ciphertext)
+		cleartext = self.decrypt_base(self.meta_cipher,
+						ciphertext[:self.NONCE_SIZE],
+						ciphertext[self.NONCE_SIZE:])
+		self.bytes_in += self.NONCE_SIZE
+
+		return cleartext
+
+	# Decrypt a chunk of @ciphertext and write it to @self.wrapped.
+	def decrypt_bulk(self, ciphertext: ByteString) -> None:
+		rekey_bulk_cipher = self.chunk_counter > 0 \
+					and self.chunk_counter \
+						% self.CHUNKS_PER_STRIPE == 0
+		cleartext = self.decrypt_base(self.bulk_cipher,
+						self.next_bulk_nonce(),
+						ciphertext)
+
+		if rekey_bulk_cipher:
+			# Time to create a new @self.bulk_cipher.
+			bulk_key_size = self.bulk_key_size()
+			assert len(cleartext) >= bulk_key_size
+
+			# The new key is the first @bulk_key_size bytes
+			# of the @cleartext.
+			cleartext = memoryview(cleartext)
+			self.bulk_cipher = self.bulk_cipher_class(
+						cleartext[:bulk_key_size])
+			cleartext = cleartext[bulk_key_size:]
+
 		if self.wrapped is not None:
-			self.wrapped.write(cleartext)
-		self.inbytes += len(ciphertext)
-		self.outbytes += len(cleartext)
+			try:
+				self.wrapped.write(cleartext)
+			except OSError as ex:
+				raise FatalError(
+					"couldn't write cleartext:",
+					ex.strerror) from ex
+		self.bytes_out += len(cleartext)
 
-		self.nonce = None
-		if ciphertext is self.ciphertext:
-			self.ciphertext = bytearray()
+	# Add bytes from @buf to @self.ciphertext until it reaches
+	# @ciphertext_size.  Return None if @buf is too small, otherwise
+	# return the number of bytes consumed from @buf.
+	def load_ciphertext(self, buf: ByteString, ciphertext_size: int) \
+				-> Optional[int]:
+		assert ciphertext_size > len(self.ciphertext)
+		n = ciphertext_size - len(self.ciphertext)
 
+		if len(buf) < n:
+			self.ciphertext += buf
+			return None
+		else:
+			self.ciphertext += buf[:n]
+			return n
+
+	# Return how much data to decrypt next.
+	def next_chunk_size(self) -> int:
+		ciphertext_size = self.CIPHERTEXT_SIZE
+		if self.chunk_counter == 0:
+			# We're about to decrypt the first chunk
+			# (right after the init block).
+			ciphertext_size -= self.init_block_size()
+		return ciphertext_size
+
+	# Decrypt as much as we can of @buf, writing the cleartext to
+	# @self.wrapped, then add the remainder of @buf to @self.ciphertext.
+	# In case of an exception this function is not retryable because
+	# the internal state is not updated atomically.
+	@InternalCipher.noretry
 	def write(self, buf: ByteString) -> None:
-		buf_i = self.extract_nonce(buf)
-		if buf_i is None:
-			return
+		if not isinstance(buf, memoryview):
+			buf = memoryview(buf)
 
-		if self.ciphertext:
-			n = min(len(buf) - buf_i,
-				self.CIPHERTEXT_SIZE - len(self.ciphertext))
-			self.ciphertext += buf[buf_i:buf_i+n]
-			buf_i += n
-
-			if len(self.ciphertext) < self.CIPHERTEXT_SIZE:
-				return
-			self.decrypt(self.ciphertext)
-
-		while True:
-			buf_i = self.extract_nonce(buf, buf_i)
+		if self.bulk_cipher is None:
+			# Extract the init block.
+			init_block_size = self.init_block_size()
+			buf_i = self.load_ciphertext(buf, init_block_size)
 			if buf_i is None:
+				return
+
+			# Create the first stripe's @self.bulk_cipher.
+			cleartext = memoryview(self.decrypt_meta(
+							self.ciphertext))
+			bulk_key_size = self.bulk_key_size()
+			self.bulk_cipher = self.bulk_cipher_class(
+						cleartext[:bulk_key_size])
+			self.init_prng(int.from_bytes(
+						cleartext[bulk_key_size:]))
+
+			self.ciphertext = bytearray()
+		elif self.ciphertext:
+			# Consume @self.ciphertext.
+			ciphertext_size = self.next_chunk_size()
+			buf_i = self.load_ciphertext(buf, ciphertext_size)
+			if buf_i is None:
+				return
+
+			assert len(self.ciphertext) == ciphertext_size
+			self.decrypt_bulk(self.ciphertext)
+			self.ciphertext = bytearray()
+		else:
+			buf_i = 0
+
+		# Consume the rest of @buf.
+		assert not self.ciphertext
+		while True:
+			ciphertext_size = self.next_chunk_size()
+			if len(buf) - buf_i < ciphertext_size:
+				self.ciphertext += buf[buf_i:]
 				break
 
-			assert not self.ciphertext
-			if len(buf) - buf_i < self.CIPHERTEXT_SIZE:
-				self.ciphertext = bytearray(buf[buf_i:])
-				break
+			self.decrypt_bulk(buf[buf_i:buf_i+ciphertext_size])
+			buf_i += ciphertext_size
 
-			self.decrypt(buf[buf_i:buf_i+self.CIPHERTEXT_SIZE])
-			buf_i += self.CIPHERTEXT_SIZE
-
+	# Flush @self.ciphertext and close @self.wrapped.  Must be called
+	# before disposing of the object.
 	def close(self) -> None:
-		if self.ciphertext:
-			if self.nonce is None:
-				raise SecurityError(
-					"%d trailing bytes at the end of the "
-					"ciphertext" % len(self.ciphertext))
-			self.decrypt(self.ciphertext)
-		elif self.nonce is not None:
-			raise SecurityError(
-					"Empty block at the end of the "
-					"ciphertext")
+		if self.ciphertext and self.borked is None:
+			self.decrypt_bulk(self.ciphertext)
+			self.ciphertext = bytearray()
+		if self.wrapped is not None:
+			self.wrapped.close()
 # }}}
 
-# A class abstracting the details of encryption away.
+# A class abstracting the details of internal vs. external encryption away.
 class MetaCipher: # {{{
 	class DataType(enum.IntEnum):
 		PAYLOAD		= 0
@@ -2261,22 +2559,20 @@ class MetaCipher: # {{{
 			return self.name.lower()
 
 	args: EncryptionOptions
-	blob_uuid: Optional[uuid.UUID] = None
 
-	# Shared between MetaCipher instances.  It's either the non-per-UUID
-	# key, or a dict of per-UUID keys we've retrieved before, or None if
-	# no key has been cached.
-	key_cache: Union[dict[Optional[uuid.UUID], bytes], bytes, None] = None
+	# Must be set for any encryption/decryption.  May be left None if the
+	# subclass doesn't need to do either of them.
+	blob_uuid: Optional[uuid.UUID]
 
-	# Like InternalCipher.header_st, but for external encryption.
+	# Cleartext header for external encryption, proving which blob
+	# and DataType it was encrypted for.
 	external_header_st: Final[struct.Struct] = \
-		struct.Struct(f"B{BTRFS_UUID_SIZE}s")
+		struct.Struct(f"!{BTRFS_UUID_SIZE}sI")
 
 	def __init__(self, args: EncryptionOptions,
 			blob_uuid: Optional[uuid.UUID] = None):
 		self.args = args
-		if blob_uuid is not None:
-			self.blob_uuid = blob_uuid
+		self.blob_uuid = blob_uuid
 
 	def get_cipher_cmd_env(self) -> dict[str, str]:
 		env = os.environ.copy()
@@ -2284,60 +2580,38 @@ class MetaCipher: # {{{
 		assert self.args.subvolume is not None
 		env["GICCS_SUBVOLUME"] = self.args.subvolume
 
-		if self.blob_uuid is not None:
-			env["GICCS_BLOB_UUID"] = str(self.blob_uuid)
-
 		return env
 
-	def get_encryption_key(self) -> bytes:
-		if self.args.encryption_key is not None:
-			return self.args.encryption_key
-
-		# Is the @key cached?
-		key_cache = self.__class__.key_cache
-		if not self.args.encryption_key_per_uuid:
-			assert key_cache is None or isinstance(key_cache,
-								bytes)
-			key = key_cache
-		elif key_cache is not None:
-			assert isinstance(key_cache, dict)
-			key = key_cache.get(self.blob_uuid)
-		else:
-			key = None
-		if key is not None:
-			return key
-
-		# Retrieve the @key.
-		assert self.args.encryption_key_command is not None
-		key = subprocess_check_output(
-				self.args.encryption_key_command,
-				env=self.get_cipher_cmd_env())
-
-		# Cache the @key.  This is important if the command above
-		# asks for a password.
-		if not self.args.encryption_key_command_per_uuid:
-			self.__class__.key_cache = key
-		elif key_cache is not None:
-			key_cache[self.blob_uuid] = key
-		else:
-			self.__class__.key_cache = { self.blob_uuid: key }
-
-		return key
-
-	CipherClass = TypeVar("CipherClass", bound=InternalCipher)
-	def internal_cipher(self, cipher_class: type[CipherClass],
-				data_type: DataType, wrapped: BinaryIO) \
-				-> CipherClass:
+	InternalCipherClass = TypeVar("InternalCipherClass",
+					bound=InternalCipher)
+	def internal_cipher(self,
+			internal_cipher_class: type[InternalCipherClass],
+			data_type: DataType,
+			wrapped: Optional[BinaryIO] = None) \
+			-> InternalCipherClass:
 		assert self.args.encrypt_internal()
-		return cipher_class(self.get_encryption_key(),
-					data_type.value, self.blob_uuid,
-					wrapped=wrapped)
 
-	def internal_encrypt(self, data_type: DataType, src: BinaryIO) \
+		if self.args.encryption_key is None:
+			assert self.args.encryption_key_command is not None
+			self.args.encryption_key = subprocess_check_output(
+					self.args.encryption_key_command,
+					env=self.get_cipher_cmd_env())
+
+		assert self.blob_uuid is not None
+		return internal_cipher_class(
+				self.args.meta_cipher(
+					self.args.encryption_key),
+				self.args.bulk_cipher,
+				self.blob_uuid, data_type.value,
+				wrapped=wrapped)
+
+	def internal_encrypt(self, data_type: DataType,
+				src: Optional[BinaryIO] = None) \
 				-> InternalEncrypt:
 		return self.internal_cipher(InternalEncrypt, data_type, src)
 
-	def internal_decrypt(self, data_type: DataType, dst: BinaryIO) \
+	def internal_decrypt(self, data_type: DataType,
+				dst: Optional[BinaryIO] = None) \
 				-> InternalDecrypt:
 		return self.internal_cipher(InternalDecrypt, data_type, dst)
 
@@ -2357,46 +2631,49 @@ class MetaCipher: # {{{
 		return self.external_cipher(self.args.decryption_command)
 
 	def external_header(self, data_type: DataType) -> bytes:
+		assert self.blob_uuid is not None
 		return self.external_header_st.pack(
-					data_type.value,
-					ensure_uuid(self.blob_uuid).bytes)
+					self.blob_uuid.bytes,
+					data_type.value)
 
-	def encrypt(self, data_type: DataType, cleartext: bytes) \
-			-> Union[memoryview, bytearray, bytes]:
+	# Encrypt a short piece of metadata.
+	def encrypt(self, data_type: DataType, cleartext: ByteString) \
+			-> bytes:
 		if self.args.encrypt_internal():
-			return self.internal_encrypt(
-					data_type,
-					io.BytesIO(cleartext)).read()
+			return self.internal_encrypt(data_type) \
+					.encrypt_meta(cleartext)
 		else:	# @self.args.add_header_to_blob is pointedly ignored
-			# for the meaningful security of metadata.
+			# for the meaningful security for metadata.
 			header = self.external_header(data_type)
 			return subprocess_check_output(
 				**self.external_encrypt(),
 				input=header + cleartext)
 
-	def decrypt(self, data_type: DataType, ciphertext: bytes) \
-			-> memoryview:
+	# Decrypt metadata.
+	def decrypt(self, data_type: DataType, ciphertext: ByteString) \
+			-> Union[bytes, memoryview]:
 		if self.args.encrypt_internal():
-			cleartext = io.BytesIO()
-			cipher = self.internal_decrypt(data_type, cleartext)
-			cipher.write(ciphertext)
-			cipher.close()
-
-			if self.blob_uuid is None:
-				self.blob_uuid = cipher.blob_uuid
-
-			return cleartext.getbuffer()
+			return self.internal_decrypt(data_type) \
+					.decrypt_meta(ciphertext)
 
 		# External encryption.
 		cleartext = memoryview(subprocess_check_output(
-				**self.external_decrypt(),
-				input=ciphertext))
+					**self.external_decrypt(),
+					input=ciphertext))
 
 		# Verify the header.
 		if len(cleartext) < self.external_header_st.size:
 			raise SecurityError("Incomplete cleartext header")
-		recv_data_type, recv_uuid = \
+		recv_uuid, recv_data_type = \
 			self.external_header_st.unpack_from(cleartext)
+
+		assert self.blob_uuid is not None
+		if recv_uuid != self.blob_uuid.bytes:
+			raise SecurityError(
+				"Cleartext header mismatch: "
+				"blob UUID (%s) differs from "
+				"expected (%s)"
+				% (uuid.UUID(bytes=recv_uuid), self.blob_uuid))
 
 		if recv_data_type != data_type.value:
 			raise SecurityError(
@@ -2404,15 +2681,6 @@ class MetaCipher: # {{{
 				"data type (0x%.2X) differs from "
 				"expected (0x%.2X)"
 				% (recv_data_type, data_type.value))
-
-		if self.blob_uuid is None:
-			self.blob_uuid = uuid.UUID(bytes=recv_uuid)
-		elif recv_uuid != self.blob_uuid.bytes:
-			raise SecurityError(
-				"Cleartext header mismatch: "
-				"snapshot UUID (%s) differs from "
-				"expected (%s)"
-				% (uuid.UUID(bytes=recv_uuid), self.blob_uuid))
 
 		return cleartext[self.external_header_st.size:]
 # }}}
@@ -2431,8 +2699,16 @@ class MetaBlob(MetaCipher): # {{{
 
 	gcs_blob: google.cloud.storage.Blob
 
+	# The @path with which the object was created the first time.
+	# If metadata is not encrypted, it's the same as the @gcs_blob.name
+	# without @args.prefix.
 	blob_path: str
+
+	# This is stored with the encrypted metadata and is used to verify
+	# @gcs_blob.size.
 	blob_size: Optional[int] = None
+
+	# The size of the payload after decryption and decompression.
 	file_size: Optional[int] = None
 
 	@property
@@ -2474,8 +2750,7 @@ class MetaBlob(MetaCipher): # {{{
 				# The generated @self.blob_uuid conflicts
 				# with an existing one.
 				continue
-			elif backups is None and args.encrypt_metadata \
-					and self.gcs_blob.exists():
+			elif args.encrypt_metadata and self.gcs_blob.exists():
 				# Likewise.
 				continue
 			else:
@@ -2484,7 +2759,9 @@ class MetaBlob(MetaCipher): # {{{
 		self.init_metadata(path, **kw)
 		self.update_metadata()
 
-	# Create a MetaBlob from and existing @gcs_blob.
+	# Create a MetaBlob from and existing @gcs_blob.  @blob_uuid and
+	# @metadata don't have to be provided.  If @classes is not empty,
+	# this method may call itself possibly with those arguments filled in.
 	@classmethod
 	def init_from_gcs(cls, args: EncryptedBucketOptions,
 				gcs_blob: google.cloud.storage.Blob,
@@ -2494,6 +2771,8 @@ class MetaBlob(MetaCipher): # {{{
 				-> Optional[T]:
 		# The caller might not know in advance exactly which of the
 		# @classes represent the @gcs_blob.  Let's try them all.
+		# If metadata is encrypted, we decrypt it first below, then
+		# run the same cycle.
 		if classes and not args.encrypt_metadata:
 			for klass in classes:
 				if not klass.isa(gcs_blob.metadata):
@@ -2513,6 +2792,7 @@ class MetaBlob(MetaCipher): # {{{
 			if metadata is None:
 				metadata = self.init_encrypted_metadata()
 
+			# Do the same as above.
 			if classes:
 				for klass in classes:
 					if not klass.isa(metadata):
@@ -2527,37 +2807,34 @@ class MetaBlob(MetaCipher): # {{{
 						metadata=metadata)
 				else:
 					return None
-		else:	# Metadata is stored directly in the blob's metadata.
+		else:	# @metadata is stored directly in the blob's metadata.
 			assert blob_uuid is None and metadata is None
 			metadata = self.gcs_blob.metadata
-
-		if self.load_metadatum(metadata, "subvolume") \
-				!= self.subvolume:
-			return None
 
 		self.load_metadata(metadata)
 
 		if self.has_signature():
 			# We can only verify the signature once all metadata
 			# has been loaded.
-			signature = self.decrypt_metadata(
+			signature = self.decrypt(
 						self.DataType.SIGNATURE,
 						self.load_metadatum(metadata,
 			  				"signature", bytes))
-
-			# The first decryption should set @self.blob_uuid.
-			assert self.blob_uuid is not None
-
 			if signature != self.calc_signature().digest():
 				raise SecurityError(
-					f"{self.name} has invalid signature")
+					f"{self.name}: metadata/signature "
+					"mismatch")
 		else:	# Assert that there's no signature in @metadata,
 			# otherwise there's a possible misconfiguration.
 			self.has_metadatum(metadata, "signature", False)
 
+		if self.load_metadatum(metadata, "subvolume") \
+				!= self.subvolume:
+			return None
+
 		return self
 
-	# Initialize @self.blob_uuid.
+	# Initialize @self.blob_uuid either from @blob_uuid or @self.name.
 	def init_blob_uuid(self, blob_uuid: Optional[uuid.UUID] = None) \
 				-> None:
 		assert self.args.encrypt_metadata
@@ -2574,19 +2851,18 @@ class MetaBlob(MetaCipher): # {{{
 				"%s has invalid UUID (%s)"
 				% (self.name, blob_uuid)) from ex
 
-	# Decrypt @self.gcs_blob.metadata["metadata"].
+	# Decrypt and decode @self.gcs_blob.metadata["metadata"].
 	def init_encrypted_metadata(self) -> dict[str, Any]:
 		import pickle
 
 		assert self.args.encrypt_metadata
-
-		metadata = self.decrypt_metadata(
-					self.DataType.METADATA,
+		metadata = self.decrypt(self.DataType.METADATA,
 					self.load_metadatum(
 						self.gcs_blob.metadata,
 						"metadata", bytes))
 
-		try:
+		try:	# @metadata has been authenticated, so it's safe
+			# to unpickle it.
 			metadata = pickle.loads(metadata)
 		except pickle.PickleError as ex:
 			raise SecurityError(
@@ -2604,30 +2880,17 @@ class MetaBlob(MetaCipher): # {{{
 	def init_metadata(self, path: str, **kw) -> None:
 		self.blob_path = path
 
-	# Called by update_metadata() to save metadata fields in @metadata.
-	def save_metadata(self, metadata: dict[str, Any]) -> None:
-		self.save_metadatum(metadata, "subvolume", self.subvolume)
-		if self.args.encrypt_metadata:
-			self.save_metadatum(metadata,
-		       				"blob_path", self.blob_path)
-
-		if self.args.encrypt:
-			self.save_metadatum(metadata,
-		       				"blob_size", self.blob_size)
-		self.save_metadatum(metadata, "file_size", self.file_size)
-
-		if self.has_signature():
-			# It's safe to use an encrypted hash as a MAC as long
-			# as the underlying cipher is non-malleable, which is
-			# the case with InternalCipher, being AEAD.
-			self.save_metadatum(
-				metadata, "signature",
-		       		self.encrypt_metadata(
-					self.DataType.SIGNATURE,
-					self.calc_signature().digest()))
-
 	# Called by init_from_gcs() to restore metadata fields from @metadata.
 	def load_metadata(self, metadata: Optional[dict[str, Any]]) -> None:
+		# Don't load @metadata["subvolume"], we already have our
+		# expectation in @self.args.subvolume.
+
+		if self.has_signature():
+			assert self.blob_uuid is None
+			self.blob_uuid = self.load_metadatum(metadata,
+								"blob_uuid",
+								uuid.UUID)
+
 		if self.args.encrypt_metadata:
 			self.blob_path = self.load_metadatum(metadata,
 								"blob_path")
@@ -2647,6 +2910,58 @@ class MetaBlob(MetaCipher): # {{{
 		self.file_size = self.load_metadatum(metadata, "file_size",
 							int, expected=False)
 
+	# Called by update_metadata() to save metadata fields in @metadata.
+	def save_metadata(self, metadata: dict[str, Any]) -> None:
+		self.save_metadatum(metadata, "subvolume", self.subvolume)
+
+		if self.has_signature():
+			self.save_metadatum(metadata,
+		       				"blob_uuid", self.blob_uuid)
+		if self.args.encrypt_metadata:
+			self.save_metadatum(metadata,
+		       				"blob_path", self.blob_path)
+
+		if self.args.encrypt:
+			self.save_metadatum(metadata,
+		       				"blob_size", self.blob_size)
+		self.save_metadatum(metadata, "file_size", self.file_size)
+
+		if self.has_signature():
+			# It's safe to use an encrypted hash as a MAC as long
+			# as the underlying cipher is non-malleable, which is
+			# the case with InternalCipher, being AEAD.
+			self.save_metadatum(
+				metadata, "signature",
+		       		self.encrypt(
+					self.DataType.SIGNATURE,
+					self.calc_signature().digest()))
+
+	# Initialize or update @self.gcs_blob.metadata.
+	def update_metadata(self) -> None:
+		gcs_metadata = self.gcs_blob.metadata
+		if gcs_metadata is None:
+			gcs_metadata = { }
+
+		metadata = { } if self.args.encrypt_metadata else gcs_metadata
+		self.save_metadata(metadata)
+
+		if self.args.encrypt_metadata:
+			# Save all @metadata in a pickle.
+			import pickle
+			self.save_metadatum(
+				gcs_metadata, "metadata",
+		       		self.encrypt(
+					self.DataType.METADATA,
+					pickle.dumps(metadata)),
+				text=True)
+		self.gcs_blob.metadata = gcs_metadata
+
+	# Write new metadata to @self.gcs_blob.
+	def sync_metadata(self) -> None:
+		self.update_metadata()
+		self.gcs_blob.patch()
+
+	# Return whether the blob should have a "signature" metadata.
 	def has_signature(self) -> bool:
 		# If the metadata is encrypted we assume it is authenticated,
 		# so it doesn't need a separate signature.
@@ -2662,6 +2977,8 @@ class MetaBlob(MetaCipher): # {{{
 		hasher.update(self.subvolume.encode())
 		hasher.update(b'\0')
 
+		# @self.blob_uuid is included in the signature's ciphertext
+		# implicitly.
 		hasher.update(self.args.with_prefix(self.blob_path).encode())
 		hasher.update(b'\0')
 
@@ -2673,55 +2990,8 @@ class MetaBlob(MetaCipher): # {{{
 
 		return hasher
 
-	# Update @self.gcs_blob.metadata.
-	def update_metadata(self) -> None:
-		gcs_metadata = self.gcs_blob.metadata
-		if gcs_metadata is None:
-			gcs_metadata = { }
-
-		metadata = { } if self.args.encrypt_metadata else gcs_metadata
-		self.save_metadata(metadata)
-
-		if self.args.encrypt_metadata:
-			# Save all @metadata in a pickle.
-			import pickle
-			self.save_metadatum(
-				gcs_metadata, "metadata",
-		       		self.encrypt_metadata(
-					self.DataType.METADATA,
-					pickle.dumps(metadata)),
-				text=True)
-		self.gcs_blob.metadata = gcs_metadata
-
-	def sync_metadata(self) -> None:
-		self.update_metadata()
-		self.gcs_blob.patch()
-
-	MDT = TypeVar("MetaDataType", int, str, bytes, uuid.UUID)
-	def save_metadatum(self, metadata: dict[str, Any],
-				key: str, value: Optional[MDT],
-		    		text: Optional[bool] = None) -> None:
-		if value is None:
-			try: del metadata[key]
-			except KeyError: pass
-			return
-
-		if text is None:
-			text = not self.args.encrypt_metadata
-		if text:
-			# Convert to string.
-			if isinstance(value, bytes):
-				metadata[key] = \
-					base64.b64encode(value).decode()
-			else:
-				metadata[key] = str(value)
-		else:	# Convert to a primitive type for pickling.
-			if isinstance(value, uuid.UUID):
-				metadata[key] = value.bytes
-			else:
-				assert isinstance(value, (int, str, bytes))
-				metadata[key] = value
-
+	# Return whether @key is in @metadata.  If @expected is True,
+	# it must be present.  If False, it must not be present.
 	def has_metadatum(self, metadata: Optional[dict[str, Any]],
 				key: str, expected: Optional[bool] = None) \
 				-> bool:
@@ -2739,6 +3009,8 @@ class MetaBlob(MetaCipher): # {{{
 			return False
 
 
+	# Return @metadata[@key] converted to @tpe or None if @key is not
+	# in @metadata.
 	def load_metadatum(self, metadata: Optional[dict[str, Any]],
 				key: str, tpe: type[MDT] = str,
 		    		expected: bool = True) -> Optional[MDT]:
@@ -2765,7 +3037,7 @@ class MetaBlob(MetaCipher): # {{{
 				raise SecurityError(
 					"%s[%s]: couldn't decode metadata"
 					% (self.name, key)) from ex
-		else:
+		else:	# @tpe is either int or uuid.UUID.
 			try:
 				return tpe(value)
 			except ValueError as ex:
@@ -2773,18 +3045,47 @@ class MetaBlob(MetaCipher): # {{{
 					"%s[%s]: invalid metadata"
 					% (self.name, key)) from ex
 
-	def decrypt_metadata(self, data_type: MetaCipher.DataType,
-				ciphertext: bytes) -> bytes:
+	# If @value is None, delete @key from @metadata, otherwise set
+	# @metadata[@key] to @value.  If @text, convert @value to string
+	# beforehand.
+	MDT = TypeVar("MetadataType", int, str, bytes, uuid.UUID)
+	def save_metadatum(self,
+		    	metadata: dict[str, Any],
+			key: str, value: Optional[Union[MDT, ByteString]],
+			text: Optional[bool] = None) -> None:
+		if value is None:
+			try: del metadata[key]
+			except KeyError: pass
+			return
+
+		if text is None:
+			text = not self.args.encrypt_metadata
+		if text:
+			# Convert to string.  For some reason a memoryview
+			# is not an instance of ByteString, even though the
+			# documentation of the typing module says so.
+			if isinstance(value, (ByteString, memoryview)):
+				metadata[key] = \
+					base64.b64encode(value).decode()
+			else:
+				metadata[key] = str(value)
+		else:	# Convert to a primitive type for pickling.
+			if isinstance(value, uuid.UUID):
+				metadata[key] = value.bytes
+			elif isinstance(value, (int, str, bytes)):
+				metadata[key] = value
+			else:	# bytearray or memoryview
+				metadata[key] = bytes(value)
+
+	# A wrapper around MetaCipher.decrypt(), enhancing the error message.
+	def decrypt(self, data_type: MetaCipher.DataType,
+			ciphertext: ByteString) -> Union[bytes, memoryview]:
 		try:
-			return bytes(self.decrypt(data_type, ciphertext))
+			return super().decrypt(data_type, ciphertext)
 		except FatalError as ex:
 			raise ex.__class__(
 				"%s[%s]:" % (self.name, data_type.field()),
 				ex) from ex
-
-	def encrypt_metadata(self, data_type: MetaCipher.DataType,
-				cleartext: bytes) -> bytes:
-		return bytes(self.encrypt(data_type, cleartext))
 # }}}
 
 # A MetaBlob of a Backup.
@@ -3027,7 +3328,7 @@ class SizeAccumulator: # {{{
 			self._add("_blob_size", what.gcs_blob.size)
 			self._add("_file_size", what.file_size)
 
-	def _get(self, attr: str, **kw) -> Optional[int]:
+	def _get(self, attr: str, **kw) -> Optional[str]:
 		value = getattr(self, attr)
 		if value is None:
 			return None
@@ -3038,10 +3339,10 @@ class SizeAccumulator: # {{{
 		return value
 
 	def blob_size(self, **kw) -> Optional[str]:
-		return self._get("_blob_size")
+		return self._get("_blob_size", **kw)
 
 	def file_size(self, **kw) -> Optional[str]:
-		return self._get("_file_size")
+		return self._get("_file_size", **kw)
 
 	def get(self, **kw) -> Optional[str]:
 		blob_size = self.blob_size(**kw)
@@ -3090,6 +3391,12 @@ class Pipeline: # {{{
 				cmd = { "args": cmd }
 			self.processes.append(subprocess.Popen(**cmd,
 				stdin=proc_stdin, stdout=proc_stdout))
+
+			if i > 0:
+				# Close the stdout of the previous process,
+				# so it will receive a broken pipe if this
+				# process dies.
+				proc_stdin.close()
 
 			if cmd.get("stderr") == subprocess.PIPE:
 				cmd["stderr"] = self.processes[-1].stderr
@@ -3821,7 +4128,7 @@ header = os.read(sys.stdin.fileno(), encryption_header_st.size)
 if len(header) < encryption_header_st.size:
 	sys.exit("Failed to read encryption header, only got %d bytes."
 			% len(header))
-recv_data_type, recv_uuid = encryption_header_st.unpack_from(header)
+recv_uuid, recv_data_type = encryption_header_st.unpack_from(header)
 
 # Verify the @header.
 if recv_data_type != expected_data_type:
