@@ -13,7 +13,8 @@
 # rename subvolume to volume
 #
 # padding?
-# use HMAC/CMAC/AEAD instead of hash+encrypt?
+#   * Padme: https://lbarman.ch/blog/padme
+#   * https://github.com/covert-encryption/covert/blob/main/docs/Specification.md#padding
 #
 # upload/download: split plan and execution
 # consider using clone sources when uploading
@@ -1510,32 +1511,6 @@ class EncryptionOptions(CmdLineOptions): # {{{
 			self.bulk_cipher = self.resolve_internal_cipher(
 							"bulk-cipher",
 							args.bulk_cipher)
-		if self.meta_cipher is None and self.bulk_cipher is not None:
-			self.meta_cipher = self.resolve_internal_cipher(
-						"meta-cipher",
-						"AESGCMSIV", "AESSIV")
-		if self.bulk_cipher is None and self.meta_cipher is not None:
-			self.bulk_cipher = self.meta_cipher
-
-		if args.encryption_key is not None:
-			try:
-				self.encryption_key = base64.b64decode(
-						args.encryption_key,
-						validate=True)
-			except binascii.Error as ex:
-				raise self.CmdLineError(
-					"encryption-key is not a valid "
-					"base-64 string") from ex
-		elif args.encryption_key_command is not None:
-			self.encryption_key_command = \
-				self.shlex_split(
-					"encryption-key-command",
-					args.encryption_key_command)
-		elif self.encrypt_internal():
-			raise self.CmdLineError(
-					"either encryption-key "
-					"or encryption-key-command "
-					"must be specified")
 
 		if args.encryption_command is not None:
 			self.encryption_command = \
@@ -1556,20 +1531,52 @@ class EncryptionOptions(CmdLineOptions): # {{{
 		assert not (self.encrypt_internal() \
 				and self.encrypt_external())
 
-		if args.encryption_key is not None \
-				or args.encryption_key_command is not None:
-			if self.encrypt_external():
+		if args.encryption_key is not None:
+			has_key = True
+			try:
+				self.encryption_key = base64.b64decode(
+						args.encryption_key,
+						validate=True)
+			except binascii.Error as ex:
 				raise self.CmdLineError(
-					"encryption key cannot be specified "
-					"together with encryption command")
-			elif not self.encrypt_internal():
-				raise self.CmdLineError(
-					"meta-cipher and/or bulk-cipher "
+					"encryption-key is not a valid "
+					"base-64 string") from ex
+		elif args.encryption_key_command is not None:
+			has_key = True
+			self.encryption_key_command = \
+				self.shlex_split(
+					"encryption-key-command",
+					args.encryption_key_command)
+		else:
+			has_key = False
+
+		if self.encrypt_internal() and not has_key:
+			raise self.CmdLineError(
+					"either encryption-key "
+					"or encryption-key-command "
 					"must be specified")
+
+		if has_key and not self.encrypt_external():
+			# Choose safe defaults.
+			if self.meta_cipher is None:
+				self.meta_cipher = \
+					self.resolve_internal_cipher(
+							"meta-cipher",
+							"AESGCMSIV", "AESSIV")
+			if self.bulk_cipher is None:
+				self.bulk_cipher = self.meta_cipher
 
 		self.merge_options_from_ini(args, "encrypt_metadata", tpe=bool)
 		if args.encrypt_metadata is not False:
 			self.encrypt_metadata = self.encrypt
+
+		if self.encrypt_external() and self.encrypt_metadata \
+				and has_key:
+			# We'd only use encryption-key to sign the metadata.
+			# Encryption is performed through encryption-command.
+			raise self.CmdLineError(
+					"encryption-key won't be used "
+					"with encrypt-metadata")
 
 		# One might want to disable this because setting metadata
 		# after blob creation reuires an extra permission.
@@ -2582,6 +2589,23 @@ class MetaCipher: # {{{
 
 		return env
 
+	def get_key(self) -> Optional[bytes]:
+		if self.args.encryption_key is None:
+			if self.args.encryption_key_command is None:
+				return None
+			self.args.encryption_key = subprocess_check_output(
+					self.args.encryption_key_command,
+					env=self.get_cipher_cmd_env())
+
+		# Require at least a 128-bit key.
+		if len(self.args.encryption_key) < 16:
+			raise UserError(
+				"encryption-key too short "
+				"(%d bytes, should be at least 16)"
+				% len(self.args.encryption_key))
+
+		return self.args.encryption_key
+
 	InternalCipherClass = TypeVar("InternalCipherClass",
 					bound=InternalCipher)
 	def internal_cipher(self,
@@ -2591,17 +2615,18 @@ class MetaCipher: # {{{
 			-> InternalCipherClass:
 		assert self.args.encrypt_internal()
 
-		if self.args.encryption_key is None:
-			assert self.args.encryption_key_command is not None
-			self.args.encryption_key = subprocess_check_output(
-					self.args.encryption_key_command,
-					env=self.get_cipher_cmd_env())
+		key = self.get_key()
+		assert key is not None
+
+		try:
+			meta_cipher = self.args.meta_cipher(key)
+		except ValueError as ex:
+			# Invalid key length.
+			raise UserError(ex) from ex
 
 		assert self.blob_uuid is not None
 		return internal_cipher_class(
-				self.args.meta_cipher(
-					self.args.encryption_key),
-				self.args.bulk_cipher,
+				meta_cipher, self.args.bulk_cipher,
 				self.blob_uuid, data_type.value,
 				wrapped=wrapped)
 
@@ -2685,10 +2710,9 @@ class MetaCipher: # {{{
 		return cleartext[self.external_header_st.size:]
 # }}}
 
-# A GCS blob with metadata.
-class MetaBlob(MetaCipher): # {{{
-	T = TypeVar("MetaBlobType", bound=Self)
-
+# Provide a MAC either through BLAKE2 natively or by encrypting the hash
+# with the MetaCipher.
+class MetaMAC: # {{{
 	# hashlib doesn't define an abstract base class, let's have our own.
 	class Hasher(Protocol):
 		def update(self, data: bytes) -> None:
@@ -2696,6 +2720,54 @@ class MetaBlob(MetaCipher): # {{{
 
 		def digest(self) -> bytes:
 			...
+
+	hasher: Hasher
+	meta: Optional[MetaCipher]
+	data_type: MetaCipher.DataType
+
+	def __init__(self, meta: MetaCipher, data_type: MetaCipher.DataType):
+		import hashlib
+
+		self.data_type = data_type
+		persona = self.data_type.value.to_bytes(4)
+
+		key = meta.get_key()
+		if key is not None:
+			self.meta = None
+			self.hasher = hashlib.blake2b(
+					meta.blob_uuid.bytes,
+					key=key, person=persona)
+		else:
+			self.meta = meta
+			self.hasher = hashlib.blake2b(person=persona)
+
+	def update(self, data: bytes) -> None:
+		self.hasher.update(data)
+
+	def sign(self) -> bytes:
+		digest = self.hasher.digest()
+		if self.meta is None:
+			# @self.hasher is keyed.
+			return digest
+
+		# It should be safe to use an encrypted hash as a MAC,
+		# since we expect it to be integrity-protected.
+		return self.meta.encrypt(self.data_type, digest)
+
+	def verify(self, signature: bytes) -> bool:
+		import hmac
+
+		if self.meta is not None:
+			digest = self.meta.decrypt(self.data_type, signature)
+		else:
+			digest = signature
+
+		return hmac.compare_digest(self.hasher.digest(), digest)
+# }}}
+
+# A GCS blob with metadata.
+class MetaBlob(MetaCipher): # {{{
+	T = TypeVar("MetaBlobType", bound=Self)
 
 	gcs_blob: google.cloud.storage.Blob
 
@@ -2816,14 +2888,13 @@ class MetaBlob(MetaCipher): # {{{
 		if self.has_signature():
 			# We can only verify the signature once all metadata
 			# has been loaded.
-			signature = self.decrypt(
-						self.DataType.SIGNATURE,
-						self.load_metadatum(metadata,
-			  				"signature", bytes))
-			if signature != self.calc_signature().digest():
+			if not self.calc_signature().verify(
+					self.load_metadatum(
+						metadata, "signature", bytes)):
 				raise SecurityError(
 					f"{self.name}: metadata/signature "
 					"mismatch")
+
 		else:	# Assert that there's no signature in @metadata,
 			# otherwise there's a possible misconfiguration.
 			self.has_metadatum(metadata, "signature", False)
@@ -2927,14 +2998,9 @@ class MetaBlob(MetaCipher): # {{{
 		self.save_metadatum(metadata, "file_size", self.file_size)
 
 		if self.has_signature():
-			# It's safe to use an encrypted hash as a MAC as long
-			# as the underlying cipher is non-malleable, which is
-			# the case with InternalCipher, being AEAD.
 			self.save_metadatum(
 				metadata, "signature",
-		       		self.encrypt(
-					self.DataType.SIGNATURE,
-					self.calc_signature().digest()))
+				self.calc_signature().sign())
 
 	# Initialize or update @self.gcs_blob.metadata.
 	def update_metadata(self) -> None:
@@ -2968,17 +3034,13 @@ class MetaBlob(MetaCipher): # {{{
 		return self.args.encrypt and not self.args.encrypt_metadata
 
 	# Calculate a hash of metadata fields.
-	def calc_signature(self) -> Hasher:
-		import hashlib
-
-		# SHA-256 is fast and secure.
-		hasher = hashlib.sha256()
+	def calc_signature(self) -> MetaMAC:
+		hasher = MetaMAC(self, self.DataType.SIGNATURE)
 
 		hasher.update(self.subvolume.encode())
 		hasher.update(b'\0')
 
-		# @self.blob_uuid is included in the signature's ciphertext
-		# implicitly.
+		# @self.blob_uuid is included by the @hasher automatically.
 		hasher.update(self.args.with_prefix(self.blob_path).encode())
 		hasher.update(b'\0')
 
@@ -3173,7 +3235,7 @@ class BackupBlob(MetaBlob): # {{{
 			self.has_metadatum(metadata, "parent_uuid", False)
 			self.parent_uuid = None
 
-	def calc_signature(self) -> MetaBlob.Hasher:
+	def calc_signature(self) -> MetaMAC:
 		hasher = super().calc_signature()
 
 		hasher.update(self.snapshot_uuid.bytes)
@@ -3223,6 +3285,9 @@ class Progressometer: # {{{
 				humanize_duration(
 					time.monotonic() - self.started)),
 				end="", flush=True)
+
+		if self.wrapped is not None:
+			self.wrapped.close()
 
 	def make_progress(self) -> None:
 		progress = humanize_size(self.bytes_transferred)
@@ -4191,8 +4256,6 @@ def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 	try:	# The actual download.
 		blob.gcs_blob.download_to_file(dst, **args.get_retry_flags())
 		dst.final_progress()
-		if isinstance(dst.wrapped, InternalDecrypt):
-			dst.wrapped.close()
 	except GoogleAPICallError as ex:
 		raise FatalError from ex
 	finally:
