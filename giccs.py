@@ -11,10 +11,15 @@
 # calculate/verify end-to-end hash? (hash of authentication tags)
 # add timestamp to blob_uuid (to avoid collisions)
 # rename subvolume to volume
+# dd -> splice()
 #
 # padding?
 #   * Padme: https://lbarman.ch/blog/padme
 #   * https://github.com/covert-encryption/covert/blob/main/docs/Specification.md#padding
+#   * either?
+#   * only apply to FTP?
+#   * upload/download rate-limiting
+#   * Progressometer => Preprocessor?
 #
 # upload/download: split plan and execution
 # consider using clone sources when uploading
@@ -83,7 +88,8 @@ import time, datetime
 import re, bisect, uuid
 import base64, binascii
 import random, secrets
-import argparse, configparser
+import hashlib, hmac
+import argparse, configparser, shlex
 import enum, dataclasses, struct
 import contextlib, functools
 
@@ -239,9 +245,8 @@ class CmdLineOptions: # {{{
 		name: Optional[str]
 
 		# The options to add to the argument group.
-		options: list[Union[
-				tuple[Sequence[str], dict[str, Any]],
-				Mutex]]
+		Option: TypeAlias = tuple[Sequence[str], dict[str, Any]]
+		options: list[Union[Option, Mutex]]
 
 		def __init__(self, name: Optional[str] = None):
 			self.name = name
@@ -284,6 +289,17 @@ class CmdLineOptions: # {{{
 
 		def add_disable_flag_no_dflt(self, *flags, **kw) -> None:
 			self.add_disable_flag(*flags, **kw, default=None)
+
+		# Called by CmdLineOptions.find_argument().
+		def find_argument(self, flag: str) -> Optional[Option]:
+			for i, option in enumerate(self.options):
+				if isinstance(option, CmdLineOptions.Mutex):
+					found = option.find_argument(flag)
+					if found is not None:
+						return found
+				elif flag in option[0]:
+					return option
+			return None
 
 		# Called by CmdLineOptions.remove_argument() to remove an
 		# argument from @self.options if it's declared in this section.
@@ -482,7 +498,8 @@ class CmdLineOptions: # {{{
 	def merge_options_from_ini(
 			self, args: argparse.Namespace,
 			*options: Sequence[Union[str, tuple[str]]],
-			tpe: type = str) -> None:
+			tpe: Union[type[bool], type[int], type[str],
+					Container[str]] = str) -> None:
 		def effective_group(groups: Collection[Sequence[str]]) \
 				-> Optional[Sequence[str]]:
 			if not groups:
@@ -554,6 +571,10 @@ class CmdLineOptions: # {{{
 				elif tpe is int:
 					val = self.ini.getint(
 						self.config_section, key)
+				elif tpe is not str and val not in tpe:
+					raise self.CmdLineError(
+						"%s must be one of %s"
+						% (key, ", ".join(tpe)))
 				values[key] = val
 
 			if effective is None:
@@ -584,8 +605,6 @@ class CmdLineOptions: # {{{
 	# Split @s with shlex.split().
 	def shlex_split(self, what: str, s: str, empty_ok: bool = False) \
 			-> list[str]:
-		import shlex
-
 		what = what.replace('_', '-')
 		try:
 			lst = shlex.split(s)
@@ -597,6 +616,14 @@ class CmdLineOptions: # {{{
 		return lst
 
 	# Public methods.
+	# Find the declaration of an argument.
+	def find_argument(self, flag: str) -> Optional[Section.Option]:
+		for section in self.sections.values():
+			found = section.find_argument(flag)
+			if found is not None:
+				return found
+		return None
+
 	# Remove a previously declared argument.
 	def remove_argument(self, flag: str) -> bool:
 		for section in self.sections.values():
@@ -1431,6 +1458,8 @@ class IndexDecompressionOptions(CompressionOptionsBase):
 
 # Add --encryption-command/--encryption-key/--encryption-key-command/etc.
 class EncryptionOptions(CmdLineOptions): # {{{
+	subvolume:		Optional[str] = None
+
 	meta_cipher:		Optional[InternalCipher.Primitive] = None
 	bulk_cipher:		Optional[InternalCipher.Primitive] = None
 
@@ -1441,10 +1470,13 @@ class EncryptionOptions(CmdLineOptions): # {{{
 	decryption_command:	Optional[Sequence[str]] = None
 
 	encrypt_metadata:	bool = False
-	verify_blob_size:	bool = False
 	add_header_to_blob:	bool = False
 
-	subvolume: Optional[str] = None
+	class Integrity(enum.IntEnum):
+		NONE		= enum.auto()
+		SIZE		= enum.auto()
+		HASH		= enum.auto()
+	integrity: Integrity = Integrity.NONE
 
 	def encrypt_internal(self) -> bool:
 		return bool(self.meta_cipher or self.bulk_cipher)
@@ -1474,6 +1506,9 @@ class EncryptionOptions(CmdLineOptions): # {{{
 		section.add_disable_flag_no_dflt("--no-encrypt-metadata")
 		section.add_disable_flag_no_dflt("--no-verify-blob-size")
 		section.add_disable_flag_no_dflt("--no-blob-header")
+
+		choices = tuple(v.name.lower() for v in self.Integrity)
+		section.add_argument("--integrity", choices=choices)
 
 	def resolve_internal_cipher(self, which: str, *names: str) \
 					-> InternalCipher.Primitive:
@@ -1578,12 +1613,6 @@ class EncryptionOptions(CmdLineOptions): # {{{
 					"encryption-key won't be used "
 					"with encrypt-metadata")
 
-		# One might want to disable this because setting metadata
-		# after blob creation reuires an extra permission.
-		self.merge_options_from_ini(args, "verify_blob_size", tpe=bool)
-		if args.verify_blob_size is not False:
-			self.verify_blob_size = self.encrypt
-
 		self.merge_options_from_ini(args, "blob_header", tpe=bool)
 		if args.blob_header is not False:
 			self.add_header_to_blob = self.encrypt
@@ -1592,6 +1621,18 @@ class EncryptionOptions(CmdLineOptions): # {{{
 			raise self.CmdLineError(
 				"--no-blob-header only makes sense with "
 				"--encryption-command/--decryption-command")
+
+		# Integrity-protection requires an extra permission because
+		# it needs to update the blob's metadata after its creation.
+		choices = self.find_argument("--integrity")[1]["choices"]
+		self.merge_options_from_ini(args, "integrity", tpe=choices)
+		if args.integrity is not None:
+			self.integrity = self.Integrity[args.integrity.upper()]
+		elif self.encrypt:
+			self.integrity = self.Integrity.HASH
+		if self.integrity != self.Integrity.NONE and not self.encrypt:
+			raise self.CmdLineError(
+				"integrity-protection requires encryption")
 
 class EncryptedBucketOptions(EncryptionOptions, BucketOptions):
 	# Initialize @self.subvolume if it hasn't been set explicitly.
@@ -2726,8 +2767,6 @@ class MetaMAC: # {{{
 	data_type: MetaCipher.DataType
 
 	def __init__(self, meta: MetaCipher, data_type: MetaCipher.DataType):
-		import hashlib
-
 		self.data_type = data_type
 		persona = self.data_type.value.to_bytes(4)
 
@@ -2755,8 +2794,6 @@ class MetaMAC: # {{{
 		return self.meta.encrypt(self.data_type, digest)
 
 	def verify(self, signature: bytes) -> bool:
-		import hmac
-
 		if self.meta is not None:
 			digest = self.meta.decrypt(self.data_type, signature)
 		else:
@@ -2776,16 +2813,24 @@ class MetaBlob(MetaCipher): # {{{
 	# without @args.prefix.
 	blob_path: str
 
-	# This is stored with the encrypted metadata and is used to verify
-	# @gcs_blob.size.
-	blob_size: Optional[int] = None
+	# The end-to-end hash computed by the Progressometer.  There are
+	# multiple reasons why calcualte this hash:
+	# * Provides an additional layer of defense against reordering
+	#   stripes within blobs or replacing them across blobs.
+	# * Gives integrity protection in case external encryption doesn't
+	#   provide it.
+	blob_hash: Optional[bytes] = None
 
-	# The size of the payload after decryption and decompression.
+	# The size of the payload before encryption and compression.
 	file_size: Optional[int] = None
 
 	@property
 	def name(self) -> str:
 		return self.gcs_blob.name
+
+	@property
+	def blob_size(self) -> int:
+		return self.gcs_blob.size
 
 	@property
 	def subvolume(self) -> str:
@@ -2968,15 +3013,19 @@ class MetaBlob(MetaCipher): # {{{
 		else:
 			self.blob_path = self.args.without_prefix(self.name)
 
-		self.blob_size = self.load_metadatum(
+		expected = self.args.integrity >= self.args.Integrity.SIZE
+		blob_size = self.load_metadatum(
 					metadata, "blob_size", int,
-					expected=self.args.verify_blob_size)
-		if self.blob_size is not None \
-				and self.gcs_blob.size != self.blob_size:
+					expected=expected)
+		if blob_size is not None and self.blob_size != blob_size:
 			raise SecurityError(
 				"%s has unexpected size (%d != %d)"
-				% (self.name, self.gcs_blob.size,
-						self.blob_size))
+				% (self.name, self.blob_size, blob_size))
+
+		expected = self.args.integrity >= self.args.Integrity.HASH
+		self.blob_hash = self.load_metadatum(
+					metadata, "blob_hash", bytes,
+					expected=expected)
 
 		self.file_size = self.load_metadatum(metadata, "file_size",
 							int, expected=False)
@@ -2995,6 +3044,7 @@ class MetaBlob(MetaCipher): # {{{
 		if self.args.encrypt:
 			self.save_metadatum(metadata,
 		       				"blob_size", self.blob_size)
+		self.save_metadatum(metadata, "blob_hash", self.blob_hash)
 		self.save_metadatum(metadata, "file_size", self.file_size)
 
 		if self.has_signature():
@@ -3049,6 +3099,9 @@ class MetaBlob(MetaCipher): # {{{
 				# Use an unlikely value.
 				size = (1 << 8*8) - 1
 			hasher.update(size.to_bytes(8, "big"))
+
+		hasher.update(self.blob_hash if self.blob_hash is not None
+				else b'\0' * 64)
 
 		return hasher
 
@@ -3127,8 +3180,7 @@ class MetaBlob(MetaCipher): # {{{
 			# is not an instance of ByteString, even though the
 			# documentation of the typing module says so.
 			if isinstance(value, (ByteString, memoryview)):
-				metadata[key] = \
-					base64.b64encode(value).decode()
+				metadata[key] = b64encode(value)
 			else:
 				metadata[key] = str(value)
 		else:	# Convert to a primitive type for pickling.
@@ -3244,10 +3296,14 @@ class BackupBlob(MetaBlob): # {{{
 		return hasher
 # }}}
 
-# A class that reads from or writes to a wrapped file-like object, printing
-# the progress periodically, keeping track of the @bytes_transferred, and if
-# the @expected_bytes is known beforehand, ensuring that neither more nor less
-# data is transferred.
+# A class that proxies the read()s and write()s of the GCS library
+# to the wrapped file-like object.  It has several responsibilities:
+#
+#   * Keep track of the @bytes_transferred so far, and print it periodically.
+#   * If the @expected_bytes is known beforehand, ensure that GCS returns
+#     exactly as much data to us, no more or less.
+#   * Calculates the hash of the transferred data and verify it against the
+#     @expected_hash at the end.
 class Progressometer: # {{{
 	wrapped: Optional[BinaryIO]
 	interval: Optional[float]
@@ -3261,33 +3317,29 @@ class Progressometer: # {{{
 	bytes_transferred: int = 0
 	last_checkpoint_bytes: Optional[int] = None
 
+	hasher: Optional[MetaMAC.Hasher] = None
+	expected_hash: Optional[bytes] = None
+
+	class Padding(enum.Enum):
+		PADME		= enum.auto()
+		COVERT		= enum.auto()
+	padding: Optional[Union[Padding, int]]
+
 	def __init__(self, f: Optional[BinaryIO],
 			interval: Optional[float],
 			expected_bytes: Optional[int] = None,
+	      		hashing: Optional[Union[bool, bytes]] = None,
 			final_cb: Optional[Callable[None, None]] = None):
 		self.wrapped = f
 		self.interval = interval
 		self.expected_bytes = expected_bytes
 		self.final_cb = final_cb
 
-	def final_progress(self) -> None:
-		if self.expected_bytes is not None:
-			assert self.bytes_transferred <= self.expected_bytes
-			if self.bytes_transferred < self.expected_bytes:
-				missing = self.expected_bytes \
-						- self.bytes_transferred
-				raise SecurityError(
-					f"Blob is missing {missing} bytes")
-
-		if self.interval is not None:
-			print(" %s (%s)" % (
-				humanize_size(self.bytes_transferred),
-				humanize_duration(
-					time.monotonic() - self.started)),
-				end="", flush=True)
-
-		if self.wrapped is not None:
-			self.wrapped.close()
+		if hashing is not None:
+			persona = MetaCipher.DataType.PAYLOAD.value.to_bytes(4)
+			self.hasher = hashlib.blake2b(person=persona)
+			if isinstance(hashing, bytes):
+				self.expected_hash = hashing
 
 	def make_progress(self) -> None:
 		progress = humanize_size(self.bytes_transferred)
@@ -3312,14 +3364,74 @@ class Progressometer: # {{{
 			self.last_checkpoint_time = now
 			self.last_checkpoint_bytes = self.bytes_transferred
 
-	def tell(self) -> int:
-		return self.bytes_transferred
+	def final_progress(self) -> None:
+		if self.expected_bytes is not None:
+			assert self.bytes_transferred <= self.expected_bytes
+			if self.bytes_transferred < self.expected_bytes:
+				missing = self.expected_bytes \
+						- self.bytes_transferred
+				raise SecurityError(
+					f"Blob is missing {missing} bytes")
 
-	def read(self, n: Optional[int] = None) -> bytes:
+		if self.expected_hash is not None \
+				and not hmac.compare_digest(
+						self.hasher.digest(),
+						self.expected_hash):
+			raise SecurityError(
+				"Blob has invalid hash (\"%s\" != \"%s\")"
+				% (b64encode(self.hasher.digest()),
+					b64encode(self.expected_hash)))
+
+		if self.interval is not None:
+			print(" %s (%s)" % (
+				humanize_size(self.bytes_transferred),
+				humanize_duration(
+					time.monotonic() - self.started)),
+				end="", flush=True)
+
+		if self.wrapped is not None:
+			self.wrapped.close()
+
+	# Return the number of bytes to pad the blob with according to the
+	# Padme scheme (https://lbarman.ch/blog/padme).
+	def padme(self, size: int) -> int:
+		if size <= 64:
+			# Pad small blobs to be 64 bytes at least.
+			return 64 - size
+
+		bit1 = size.bit_length() - 1
+		bit2 = bit1.bit_length()
+
+		more = 1 << (bit1 - bit2)
+		mask = more - 1
+
+		return (more - (size & mask)) & mask
+
+	# Calculate a random amount of padding based on the covert scheme:
+	# https://github.com/covert-encryption/covert/blob/main/docs/Specification.md#padding
+	def covert(self, size: int) -> int:
+		import math
+
+		rnd1 = int.from_bytes(random.randbytes(4))
+		rnd2 = int.from_bytes(random.randbytes(4))
+		p = 0.05
+
+		fixed_padding = max(0, int(p * 500) - size)
+		eff_size = 200 + 1e8 * math.log(1 + 1e-8 * (size + fixed_padding))
+		r = math.log(2**32) - math.log(rnd1 + rnd2 * 2**-32 + 2**-33)
+		total_padding = fixed_padding + int(round(r * p * eff_size))
+
+		return total_padding
+
+	# We're called by the GCS library to provide data to upload.
+	def read(self, n: Optional[int] = None) -> ByteString:
 		assert self.wrapped is not None
 		self.check_progress()
 
 		buf = self.wrapped.read(n)
+		if self.hasher is not None:
+			self.hasher.update(buf)
+
 		if len(buf) < n:
 			# blob.upload_from_file() won't call us anymore,
 			# so it's our only chance to call final_cb().
@@ -3328,6 +3440,7 @@ class Progressometer: # {{{
 		self.bytes_transferred += len(buf)
 		return buf
 
+	# The GCS library is writing downloaded data to us.
 	def write(self, buf: bytes) -> None:
 		self.check_progress()
 
@@ -3339,9 +3452,14 @@ class Progressometer: # {{{
 				raise SecurityError(
 					"Blob is larger than expected")
 
+		if self.hasher is not None:
+			self.hasher.update(buf)
 		if self.wrapped is not None:
 			self.wrapped.write(buf)
 		self.bytes_transferred += len(buf)
+
+	def tell(self) -> int:
+		return self.bytes_transferred
 # }}}
 
 # A file-like object which can open a directory, closing the file descriptor
@@ -3390,32 +3508,33 @@ class SizeAccumulator: # {{{
 			self._file_size_incomplete |= \
 					what._file_size_incomplete
 		else:
-			self._add("_blob_size", what.gcs_blob.size)
+			self._add("_blob_size", what.blob_size)
 			self._add("_file_size", what.file_size)
 
-	def _get(self, attr: str, **kw) -> Optional[str]:
+	def _get(self, attr: str, none: bool = False, **kw) -> Optional[str]:
 		value = getattr(self, attr)
 		if value is None:
-			return None
+			if none:
+				return None
+			if not getattr(self, f"{attr}_incomplete"):
+				return "???"
+			value = 0
 
 		value = humanize_size(value, **kw)
 		if getattr(self, f"{attr}_incomplete"):
 			value += '+'
 		return value
 
-	def blob_size(self, **kw) -> Optional[str]:
-		return self._get("_blob_size", **kw)
+	def blob_size(self, none: bool = False, **kw) -> Optional[str]:
+		return self._get("_blob_size", none=none, **kw)
 
-	def file_size(self, **kw) -> Optional[str]:
-		return self._get("_file_size", **kw)
+	def file_size(self, none: bool = False, **kw) -> Optional[str]:
+		return self._get("_file_size", none=none, **kw)
 
-	def get(self, **kw) -> Optional[str]:
-		blob_size = self.blob_size(**kw)
-		if blob_size is None:
-			return None
-		sizes = [ blob_size ]
+	def get(self, **kw) -> str:
+		sizes = [ self.blob_size(**kw) ]
 
-		file_size = self.file_size(**kw)
+		file_size = self.file_size(none=True, **kw)
 		if file_size is not None:
 			sizes.append(file_size)
 
@@ -3892,6 +4011,10 @@ def ensure_uuid(u: Union[None, uuid.UUID, bytes]) -> uuid.UUID:
 	else:
 		return uuid.UUID(bytes=u)
 
+# I wonder what's the point of returning a base64 string as bytes.
+def b64encode(v: ByteString) -> str:
+	return base64.b64encode(v).decode()
+
 # Wrapper around subprocess.check_output() that handles exceptions.
 def subprocess_check_output(*args, **kwargs) -> bytes:
 	try:
@@ -4082,7 +4205,8 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 	# Check the @pipeline for errors before returning the last read
 	# to upload_from_file().  If pipeline.wait() throws an exception
 	# the upload will fail and not create the blob.
-	src = Progressometer(src, args.progress, final_cb=pipeline.wait)
+	src = Progressometer(src, args.progress, final_cb=pipeline.wait,
+				hashing=args.integrity >= args.Integrity.HASH)
 	if count_bytes_in and bytes_in_counter is None:
 		bytes_in_counter = src
 
@@ -4157,10 +4281,11 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			assert False
 		blob.file_size = bytes_in
 
-	if args.verify_blob_size:
-		blob.blob_size = src.bytes_transferred
+	if args.integrity >= args.Integrity.HASH:
+		blob.blob_hash = src.hasher.digest()
 
-	if (bytes_in_counter is not None or args.verify_blob_size) \
+	if (bytes_in_counter is not None \
+				or args.integrity >= args.Integrity.SIZE) \
 			and not wet_run:
 		# In case of failure the blob won't be usable without
 		# --no-verify-blob-size, so it's okay not to delete it.
@@ -4251,7 +4376,8 @@ def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 	if args.encrypt_internal():
 		dst = blob.internal_decrypt(blob.DataType.PAYLOAD, dst)
 
-	dst = Progressometer(dst, args.progress, blob.gcs_blob.size)
+	dst = Progressometer(dst, args.progress, blob.gcs_blob.size,
+				hashing=blob.blob_hash)
 
 	try:	# The actual download.
 		blob.gcs_blob.download_to_file(dst, **args.get_retry_flags())
@@ -5240,6 +5366,8 @@ def upload_snapshot(args: CmdUpload, blob: MetaBlob,
 			btrfs_send: Sequence[str]) -> int:
 	if args.wet_run_no_data:
 		btrfs_send = (*btrfs_send, "--no-data")
+	elif args.compressor is None:
+		btrfs_send = (*btrfs_send, "--compressed-data")
 	return upload_blob(args, blob, btrfs_send,
 				count_bytes_in=args.store_snapshot_size,
 				wet_run=args.wet_run,
