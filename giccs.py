@@ -11,14 +11,14 @@
 # calculate/verify end-to-end hash? (hash of authentication tags)
 # add timestamp to blob_uuid (to avoid collisions)
 # rename subvolume to volume
-# dd -> splice()
 #
-# padding?
+# padding:
 #   * Padme: https://lbarman.ch/blog/padme
 #   * https://github.com/covert-encryption/covert/blob/main/docs/Specification.md#padding
 #   * either?
 #   * only apply to FTP?
-#   * upload/download rate-limiting
+#   * upload/download rate-limiting or latency-shaper
+#     * never let a read/write appear faster than before
 #   * Progressometer => Preprocessor?
 #
 # upload/download: split plan and execution
@@ -30,6 +30,7 @@
 # tabbing?
 # dynamic discovery
 # get, put
+# put: upload from stdin/command
 # cat [-c <bytes>], page?
 # mv [--dir/--fname]
 # mkdir, rmdir?
@@ -82,7 +83,7 @@ from typing import	TypeVar, ParamSpec, Protocol, Self, \
 
 import sys, os
 import io, fcntl, stat
-import subprocess
+import subprocess, multiprocessing
 import pathlib, glob2
 import time, datetime
 import re, bisect, uuid
@@ -1076,7 +1077,7 @@ class DryRunOptions(CmdLineOptions): # {{{
 		return self.dry_run
 # }}}
 
-# Add --wet-run and --wet-run-no-data.
+# Add --wet-run.
 class WetRunOptions(DryRunOptions): # {{{
 	wet_run: bool = False
 
@@ -3309,7 +3310,7 @@ class Progressometer: # {{{
 	interval: Optional[float]
 
 	expected_bytes: Optional[int]
-	final_cb: Optional[Callable[None, None]]
+	final_cb: Optional[Callable[[], None]]
 
 	started: Optional[float] = None
 	last_checkpoint_time: Optional[float] = None
@@ -3329,7 +3330,7 @@ class Progressometer: # {{{
 			interval: Optional[float],
 			expected_bytes: Optional[int] = None,
 	      		hashing: Optional[Union[bool, bytes]] = None,
-			final_cb: Optional[Callable[None, None]] = None):
+			final_cb: Optional[Callable[[], None]] = None):
 		self.wrapped = f
 		self.interval = interval
 		self.expected_bytes = expected_bytes
@@ -3547,11 +3548,166 @@ class Pipeline: # {{{
 	# Allow it to be an int for subprocess.PIPE and DEVNULL.
 	StdioType = Union[int, io.IOBase]
 
+	# A subset of subprocess.Popen used by this class.
+	class SubprocessIface(Protocol): # {{{
+		pid: int
+		returncode: Optional[int]
+
+		stdin: Optional[io.IOBase]
+		stdout: Optional[io.IOBase]
+		stderr: Optional[io.IOBase]
+
+		def kill(self) -> None:
+			...
+
+		def wait(self) -> int:
+			...
+		# }}}
+
+	# An adaptor of multiprocessing.Process to SubprocessIface.
+	class Subprocess(SubprocessIface): # {{{
+		wrapped: multiprocessing.Process
+
+		def __init__(self,
+				executable: Callable[..., None],
+				name: Optional[str] = None,
+				args: Optional[Union[
+					Sequence[Any],
+					dict[str, Any],
+				]] = None,
+				env: Optional[dict[str, str]] = None,
+				text: bool = False,
+				stdin: Optional[StdioType] = None,
+				stdout: Optional[StdioType] = None,
+				stderr: Optional[StdioType] = None,
+				preexec_fn: Optional[Callable[[], None]] = None,
+			):
+			read_mode = 'r' if text else "rb"
+			write_mode = 'w' if text else "wb"
+
+			if stdin == subprocess.PIPE:
+				stdin_r, stdin_w = os.pipe()
+			if stdout == subprocess.PIPE:
+				stdout_r, stdout_w = os.pipe()
+			if stderr == subprocess.PIPE:
+				stderr_r, stderr_w = os.pipe()
+
+			def fun():
+				if stdin == subprocess.PIPE:
+					os.close(stdin_w)
+					sys.stdin = os.fdopen(stdin_r,
+								read_mode)
+				elif stdin == subprocess.DEVNULL:
+					# @sys.stdin has been redirected to
+					# /dev/null by the multiprocessing
+					# module automatically.
+					pass
+				elif stdin is not None:
+					assert isinstance(stdin, io.IOBase)
+					sys.stdin = stdin
+				if stdin is not None:
+					# Make sure sys.stdin.fileno() is 0.
+					os.dup2(sys.stdin.fileno(), 0)
+
+				if stdout == subprocess.PIPE:
+					os.close(stdout_r)
+					sys.stdout = os.fdopen(stdout_w,
+								write_mode)
+				elif stdout == subprocess.DEVNULL:
+					sys.stdout = open(os.devnull,
+								write_mode)
+				elif stdout is not None:
+					assert isinstance(stdout, io.IOBase)
+					sys.stdout = stdout
+				if stdout is not None:
+					os.dup2(sys.stdout.fileno(), 1)
+
+				if stderr == subprocess.PIPE:
+					os.close(stderr_r)
+					sys.stderr = os.fdopen(stderr_w,
+								write_mode)
+				elif stderr == subprocess.DEVNULL:
+					sys.stderr = open(os.devnull,
+								write_mode)
+				elif stderr == subprocess.STDOUT:
+					sys.stderr = sys.stdout
+				elif stderr is not None:
+					assert isinstance(stderr, io.IOBase)
+					sys.stderr = stderr
+				if stderr is not None:
+					os.dup2(sys.stderr.fileno(), 2)
+
+				if env is not None:
+					# Replacing @os.environ directly would
+					# lose its magic.
+					os.environ.clear()
+					os.environ.update(env)
+
+				if preexec_fn is not None:
+					preexec_fn()
+
+				if args is None:
+					executable()
+				elif isinstance(args, dict):
+					executable(**args)
+				else:
+					executable(*args)
+
+			if name is None:
+				name = executable.__name__
+			self.wrapped = multiprocessing.Process(target=fun,
+								name=name)
+			self.wrapped.start()
+
+			if stdin == subprocess.PIPE:
+				os.close(stdin_r)
+				self.stdin = os.fdopen(stdin_w, write_mode)
+			else:
+				self.stdin = None
+
+			if stdout == subprocess.PIPE:
+				os.close(stdout_w)
+				self.stdout = os.fdopen(stdout_r, read_mode)
+			else:
+				self.stdout = None
+
+			if stderr == subprocess.PIPE:
+				os.close(stderr_w)
+				self.stderr = os.fdopen(stderr_r, read_mode)
+			else:
+				self.stderr = None
+
+		@property
+		def name(self) -> str:
+			return self.wrapped.name
+
+		@property
+		def pid(self) -> int:
+			return self.wrapped.pid
+
+		@property
+		def returncode(self) -> Optional[int]:
+			return self.wrapped.exitcode
+
+		def kill(self) -> None:
+			self.wrapped.kill()
+
+		def wait(self) -> int:
+			self.wrapped.join()
+			return self.wrapped.exitcode
+		# }}}
+
+	processes: list[SubprocessIface]
+
 	_stdin: Optional[StdioType]
 	_stdout: Optional[StdioType]
 
 	def __init__(self,
-			cmds: Sequence[Union[Sequence[str], dict[str, Any]]],
+			cmds: Sequence[Union[
+				Callable[..., None],
+				Sequence[str],
+				dict[str, Any],
+			]],
 			stdin: Optional[StdioType] = subprocess.DEVNULL,
 			stdout: Optional[StdioType] = None):
 		if isinstance(stdin, int):
@@ -3561,29 +3717,50 @@ class Pipeline: # {{{
 
 		self.processes = [ ]
 		for i, cmd in enumerate(cmds):
-			if not self.processes:
-				proc_stdin = stdin
-			else:
-				proc_stdin = self.processes[-1].stdout
+			if callable(cmd):
+				cmd = { "executable": cmd }
+			elif not isinstance(cmd, dict):
+				cmd = { "args": cmd }
+
+			if i > 0:
+				cmd["stdin"] = self.processes[-1].stdout
+
+				# Don't leak the pipeline's stdin,
+				# because it can cause a deadlock.
+				preexec = cmd.get("preexec_fn")
+				def new_preexec() -> None:
+					stdin = self.stdin()
+					if stdin is not None:
+						stdin.close()
+					if preexec is not None:
+						preexec()
+				cmd["preexec_fn"] = new_preexec
+			else:	# First process in the pipeline.
+				cmd["stdin"] = stdin
 
 			if i < len(cmds) - 1:
-				proc_stdout = subprocess.PIPE
-			else:
-				proc_stdout = stdout
+				cmd["stdout"] = subprocess.PIPE
+			else:	# Last process in the pipeline.
+				cmd["stdout"] = stdout
 
-			if not isinstance(cmd, dict):
-				cmd = { "args": cmd }
-			self.processes.append(subprocess.Popen(**cmd,
-				stdin=proc_stdin, stdout=proc_stdout))
+			postexec = cmd.pop("postexec_fn", None)
+			if callable(cmd.get("executable")):
+				proc = self.Subprocess(**cmd)
+			else:
+				proc = subprocess.Popen(**cmd)
+			self.processes.append(proc)
 
 			if i > 0:
 				# Close the stdout of the previous process,
 				# so it will receive a broken pipe if this
 				# process dies.
-				proc_stdin.close()
+				cmd["stdin"].close()
 
 			if cmd.get("stderr") == subprocess.PIPE:
-				cmd["stderr"] = self.processes[-1].stderr
+				cmd["stderr"] = proc.stderr
+
+			if postexec is not None:
+				postexec()
 
 		self._stdin = stdin
 		self._stdout = stdout
@@ -3592,8 +3769,8 @@ class Pipeline: # {{{
 				and stdout == subprocess.PIPE:
 			# This is deadlock-prone.
 			stdin, stdout = os.pipe()
-			self._stdin = open(stdin, "rb")
-			self._stdout = open(stdout, "wb")
+			self._stdin = os.fdopen(stdin, "rb")
+			self._stdout = os.fdopen(stdout, "wb")
 
 	def __del__(self):
 		for proc in self.processes:
@@ -3606,7 +3783,7 @@ class Pipeline: # {{{
 	def __len__(self) -> int:
 		return len(self.processes)
 
-	def __getitem__(self, i: int) -> subprocess.Popen:
+	def __getitem__(self, i: int) -> SubprocessIface:
 		return self.processes[i]
 
 	# Return a file that can be written to.
@@ -3616,8 +3793,8 @@ class Pipeline: # {{{
 		elif self._stdout is subprocess.DEVNULL:
 			return open(os.devnull, "wb")
 		else:
-			assert isinstance(self._stdout,
-						(type(None), io.IOBase))
+			assert self._stdout is None \
+				or isinstance(self._stdout, io.IOBase)
 			return self._stdout
 
 	# Return a file that can be read from.
@@ -3627,8 +3804,8 @@ class Pipeline: # {{{
 		elif self._stdin is subprocess.DEVNULL:
 			return open(os.devnull, "b")
 		else:
-			assert isinstance(self._stdin,
-						(type(None), io.IOBase))
+			assert self._stdin is None \
+				or isinstance(self._stdin, io.IOBase)
 			return self._stdin
 
 	def wait(self) -> None:
@@ -4024,15 +4201,27 @@ def subprocess_check_output(*args, **kwargs) -> bytes:
 		ex.cmd = ex.cmd[0]
 		raise FatalError from ex
 
+# Write @comm to /proc/self/comm, shallowing exceptions.
+def update_comm(comm: str) -> None:
+	try:
+		with open("/proc/self/comm", "w") as f:
+			f.write(comm)
+	except IOError:
+		pass
+
 # Wait for a subprocess and raise a FatalError if it exited with non-0 status.
-def wait_proc(proc: subprocess.Popen) -> None:
-	try:	# @proc might have execve()d another program (as is the case
-		# with the @HEADER_VERIFICATION_SCRIPT), try to determine the
-		# real identity of the executing program from its COMM.
+def wait_proc(proc: Pipeline.SubprocessIface) -> None:
+	# When we execute Python functions in separate processes, we use
+	# update_comm() to identify what it is actually doing.
+	try:
 		comm = open("/proc/%d/comm" % proc.pid)
-	except FileNotFoundError:
+	except IOError:
 		# Could be already reaped if we're called repeatedly.
-		prog = proc.args[0]
+		if isinstance(proc, subprocess.Popen):
+			prog = proc.args[0]
+		else:
+			assert isinstance(proc, Pipeline.Subprocess)
+			prog = proc.name
 	else:	# Wait until the subprocess finishes but don't reap it yet;
 		# read its final COMM beforehand.
 		os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
@@ -4120,17 +4309,57 @@ def discover_remote_blobs(args: EncryptedBucketOptions,
 				is not None:
 			yield blob
 
-# Write @blob.blob_uuid as binary to @sys.stdout.
-def write_header(blob: MetaBlob) -> Callable[[], None]:
-	def write_header():
+# Transfer data from @inp to @out as fast as possible, optionally writing
+# the number of bytes transferred to the @counter.
+def cat(inp: Optional[int] = None, out: Optional[int] = None,
+		counter: Optional[BinaryIO] = None) -> None:
+	update_comm("cat")
+
+	if inp is None:
+		inp = sys.stdin.fileno()
+	if out is None:
+		out = sys.stdout.fileno()
+
+	# Try to increase the pipe buffers to the maximum.
+	try:
+		maxbuf = int(open("/proc/sys/fs/pipe-max-size").readline())
+	except (OSError, ValueError):
+		maxbuf = 1024*1024
+
+	try:
+		fcntl.fcntl(inp, fcntl.F_SETPIPE_SZ, maxbuf)
+		fcntl.fcntl(out, fcntl.F_SETPIPE_SZ, maxbuf)
+	except OSError:
+		pass
+
+	# splice(2) has been measured to be marginally faster than dd(1).
+	total = 0
+	while (n := os.splice(inp, out, maxbuf)) > 0:
+		total += n
+
+	if counter is not None:
+		# For some reason it's not flushed automatically
+		# when the process finishes.
+		counter.write(total.to_bytes(8))
+		counter.flush()
+
+# Write @blob.blob_uuid as binary to @sys.stdout, then optionally shovel
+# stdin to stdout until EOF.
+def write_external_encryption_header(blob: MetaBlob, then_cat: bool = False) \
+		-> Callable[..., None]:
+	def write_header(counter: Optional[BinaryIO] = None) -> None:
 		# Redirect this function's stdout to stderr, so it doesn't
 		# go into the pipeline by accident.
 		stdout, sys.stdout = sys.stdout, sys.stderr
+
+		update_comm("write_header")
 
 		try:
 			os.write(
 				stdout.fileno(),
 				blob.external_header(blob.DataType.PAYLOAD))
+			if then_cat:
+				cat(out=stdout.fileno(), counter=counter)
 		except Exception as ex:
 			# The contents of exceptions are not passed back
 			# to the main interpreter, so let's print it here.
@@ -4148,15 +4377,21 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 
 	if args.encrypt_external() and args.add_header_to_blob:
 		# Write @blob_uuid into the pipeline before the @command
-		# is executed.  We rely on the pipe having capacity for
-		# ~16 bytes, otherwise there will be a deadlock.
-		#
-		# If we're using InternalEncrypt, it will add the headers
-		# itself.
-		command = {
-			"args": command or ("cat",),
-			"preexec_fn": write_header(blob),
-		}
+		# is executed.  If we're using InternalEncrypt, it will add
+		# the headers itself.
+		if command is not None:
+			command = {
+				"args": command,
+				"preexec_fn":
+					write_external_encryption_header(blob),
+			}
+		else:
+			command = {
+				"name": "cat",
+				"executable":
+					write_external_encryption_header(
+						blob, then_cat=True),
+			}
 
 	pipeline = [ ]
 	if command is not None:
@@ -4166,13 +4401,21 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 	if args.encrypt_external():
 		pipeline.append(blob.external_encrypt())
 
+	# If @pipeline is empty or it only contains @command, @bytes_in_counter
+	# will be either InternalEncrypt or the Progressometer.  If @pipeline
+	# is not empty but there's no @command we're uploading @pipeline_stdin.
 	bytes_in_counter = None
 	if pipeline and (command is None or len(pipeline) > 1) \
 			and count_bytes_in:
-		if not isinstance(pipeline_stdin, io.IOBase):
-			# Insert @bytes_in_counter after the @command,
-			# counting its output.
-			assert command is not None
+		if command is not None:
+			assert pipeline[0] is command
+		if isinstance(command, dict) and "executable" in command:
+			# @command will also count its output.
+			assert command["name"] == "cat"
+			bytes_in_counter = command
+		elif command is not None:
+			# Insert @bytes_in_counter right after @command
+			# to count its output.
 			bytes_in_counter = { }
 			pipeline.insert(1, bytes_in_counter)
 		elif stat.S_ISREG(os.stat(pipeline_stdin.fileno()).st_mode):
@@ -4180,15 +4423,36 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			# it when we're done (who knows, it might change
 			# meanwhile).
 			bytes_in_counter = pipeline_stdin
-		else:	# Insert @bytes_in_counter before anything else.
+		else:	# Insert @bytes_in_counter before anything else,
 			# counting @pipeline_stdin.
 			bytes_in_counter = { }
 			pipeline.insert(0, bytes_in_counter)
 
 		if isinstance(bytes_in_counter, dict):
-			# Use dd(1) to count its input.
-			bytes_in_counter["args"] = ("dd", "bs=4M")
-			bytes_in_counter["stderr"] = subprocess.PIPE
+			# Create a pipe through which @bytes_in_counter
+			# can tell us the number of bytes transferred.
+			counter_r, counter_w = os.pipe()
+			counter_r = os.fdopen(counter_r, "rb")
+			counter_w = os.fdopen(counter_w, "wb")
+
+			if "executable" not in bytes_in_counter:
+				bytes_in_counter["executable"] = cat
+
+			assert "args" not in bytes_in_counter
+			bytes_in_counter["args"] = { "counter": counter_w }
+
+			# Close the reader side of the pipe in the child.
+			assert "preexec_fn" not in bytes_in_counter
+			bytes_in_counter["preexec_fn"] = \
+				lambda: counter_r.close()
+
+			# Close the writer side in the parent after forking.
+			assert "postexec_fn" not in bytes_in_counter
+			bytes_in_counter["postexec_fn"] = \
+				lambda: counter_w.close()
+
+			# @bytes_in_counter is in the @pipeline already.
+			bytes_in_counter = counter_r
 
 	# @pipeline could be empty.
 	kw = { "stdout": subprocess.PIPE }
@@ -4266,19 +4530,28 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 				% (blob.gcs_blob.size, src.bytes_transferred))
 
 	if bytes_in_counter is not None:
-		if isinstance(bytes_in_counter, io.IOBase):
-			bytes_in = os.stat(pipeline_stdin.fileno()).st_size
-		elif isinstance(bytes_in_counter, dict):
-			# Parse the stderr of dd(1).
-			out = bytes_in_counter["stderr"].read().decode()
-			m = re.search(r"^(\d+) bytes ", out, re.MULTILINE)
-			bytes_in = int(m.group(1))
-		elif isinstance(bytes_in_counter, InternalEncrypt):
-			bytes_in = bytes_in_counter.inbytes
-		elif isinstance(bytes_in_counter, Progressometer):
+		if isinstance(bytes_in_counter, Progressometer):
 			bytes_in = bytes_in_counter.bytes_transferred
-		else:
-			assert False
+		elif isinstance(bytes_in_counter, InternalEncrypt):
+			bytes_in = bytes_in_counter.bytes_in
+		elif bytes_in_counter is pipeline_stdin:
+			assert isinstance(bytes_in_counter, io.IOBase)
+			assert stat.S_ISREG(os.stat(
+				bytes_in_counter.fileno()).st_mode)
+			bytes_in = os.stat(bytes_in_counter.fileno()).st_size
+		else:	# This is written by cat().
+			assert isinstance(bytes_in_counter, io.BufferedReader)
+			bytes_in = bytes_in_counter.read()
+			assert len(bytes_in) == 8
+			bytes_in = int.from_bytes(bytes_in)
+
+			# Discount the header written by write_header().
+			if isinstance(command, dict) \
+					and "executable" not in command:
+				header = blob.external_header(
+						blob.DataType.PAYLOAD)
+				assert bytes_in >= len(header)
+				bytes_in -= len(header)
 		blob.file_size = bytes_in
 
 	if args.integrity >= args.Integrity.HASH:
@@ -4293,45 +4566,32 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 
 	return src.bytes_transferred
 
-# Read a pair of UUIDs from stdin and compare them to the expected ones
-# passed through sys.argv.  If they check out, execute sys.argv[4].
-HEADER_VERIFICATION_SCRIPT = """
-import sys, os
-import struct, uuid
+# Read blob.external_header_st from the standard input and verify that it
+# belogs to @blob, then either exec(@then_exec) or forward the remaining
+# stdin to stdout.
+def verify_external_encryption_header(blob: MetaBlob,
+		then_exec: Optional[Sequence[str]] = None) -> None:
+	update_comm("verify_header")
 
-# Set a more informative COMM than "python3" for wait_proc().
-try:
-	fd = os.open("/proc/self/comm", os.O_WRONLY)
-except FileNotFoundError:
-	pass
-else:
-	os.write(fd, b"verify_header")
-	os.close(fd)
+	# Read and parse the @header.
+	header = os.read(sys.stdin.fileno(), blob.external_header_st.size)
+	if len(header) < blob.external_header_st.size:
+		sys.exit("Failed to read encryption header, only got %d bytes."
+				% len(header))
+	recv_uuid, recv_data_type = blob.external_header_st.unpack_from(header)
 
-# sys.argv[0] is "-c".
-expected_data_type = int(sys.argv[1])
-expected_uuid = uuid.UUID(sys.argv[2])
+	# Verify the @header.
+	if recv_data_type != blob.DataType.PAYLOAD.value:
+		sys.exit("Data type ID (0x%.2X) differs from expected (0x%.2X)."
+				% (recv_data_type, blob.DataType.PAYLOAD.value))
+	if recv_uuid != blob.blob_uuid.bytes:
+		sys.exit("Blob UUID (%s) differs from expected (%s)."
+				% (uuid.UUID(bytes=recv_uuid), blob.blob_uuid))
 
-# Read and parse the @header.
-encryption_header_st = struct.Struct("{encryption_header_st}")
-header = os.read(sys.stdin.fileno(), encryption_header_st.size)
-if len(header) < encryption_header_st.size:
-	sys.exit("Failed to read encryption header, only got %d bytes."
-			% len(header))
-recv_uuid, recv_data_type = encryption_header_st.unpack_from(header)
-
-# Verify the @header.
-if recv_data_type != expected_data_type:
-	sys.exit("Data type ID (0x%.2X) differs from expected (0x%.2X)."
-			% (recv_data_type, expected_data_type))
-
-if recv_uuid != expected_uuid.bytes:
-	sys.exit("Blob UUID (%s) differs from expected (%s)."
-			% (uuid.UUID(bytes=recv_uuid), expected_uuid))
-
-# Execute btrfs receive.
-os.execvp(sys.argv[3], sys.argv[3:])
-""".format(encryption_header_st=MetaCipher.external_header_st.format)
+	if then_exec is not None:
+		os.execvp(then_exec[0], then_exec)
+	else:
+		cat()
 
 def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 		command: Union[None, Sequence[str], dict[str, Any]] = None,
@@ -4341,23 +4601,21 @@ def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 	assert command is not None or pipeline_stdout is not None
 
 	if args.encrypt_external() and args.add_header_to_blob:
-		# Wrap @command with the @HEADER_VERIFICATION_SCRIPT,
-		# and pass it the expected DataType and UUID.
 		if command is None:
-			command_args = ("cat",)
-		elif isinstance(command, dict):
-			command_args = command["args"]
-		else:
-			command_args = command
+			command = { "name": "cat" }
+		else:	# We can't use subprocess.Popen() with preexec_fn
+			# because Popen() doesn't return before preexec_fn
+			# finishes, so there'd a deadlock.
+			if isinstance(command, dict):
+				prog = command.pop("args")
+			else:
+				prog, command = command, { }
 
-		if not isinstance(command, dict):
-			command = { }
-		command["executable"] = sys.executable
-		command["args"] = \
-			("python3", "-c", HEADER_VERIFICATION_SCRIPT,
-				str(blob.DataType.PAYLOAD.value),
-				str(blob.blob_uuid)) \
-			+ command_args
+			command["name"] = prog[0]
+			command["args"] = { "then_exec": prog }
+
+		command["executable"] = verify_external_encryption_header
+		command.setdefault("args", { })["blob"] = blob
 
 	pipeline = [ ]
 	if args.encrypt_external():
@@ -5095,7 +5353,7 @@ def cmd_get_index(args: CmdGetIndex) -> None:
 	to_retrieve = choose_snapshots(args, backups)
 	if not to_retrieve:
 		print("Nothing to retrieve.",
-			file=sys.stderr if self.output is None else sys.stdout)
+			file=sys.stderr if args.output is None else sys.stdout)
 		return
 
 	output_dir = output = None
@@ -5389,7 +5647,14 @@ def upload_full(args: CmdUpload, snapshot: Snapshot, backups: Backups) -> int:
 
 		cmd = ("btrfs", "-q", "send", os.path.join(
 			args.dir, snapshot.snapshot_name))
-		return upload_snapshot(args, blob, cmd)
+		ret = upload_snapshot(args, blob, cmd)
+
+		if backup is None:
+			backups.add(Backup(blob))
+		elif backup.full is None:
+			backup.add_blob(blob)
+
+		return ret
 	finally:
 		print()
 
@@ -5412,8 +5677,14 @@ def upload_delta(args: CmdUpload, snapshot: Snapshot, parent: Snapshot,
 		cmd = ("btrfs", "-q", "send",
 			"-p", os.path.join(args.dir, parent.snapshot_name),
 			os.path.join(args.dir, snapshot.snapshot_name))
+		ret = upload_snapshot(args, blob, cmd)
 
-		return upload_snapshot(args, blob, cmd)
+		if backup is None:
+			backups.add(Backup(blob))
+		elif backup.delta is None:
+			backup.add_blob(blob)
+
+		return ret
 	finally:
 		print()
 
@@ -5567,9 +5838,7 @@ def cmd_upload(args: CmdUpload) -> None:
 			bytes_transferred += upload_delta(args,
 						snapshot, parent, backups)
 			snapshots_transferred += 1
-		if should_upload_full or should_upload_delta:
-			backups.add(snapshot)
-		else:
+		if not (should_upload_full or should_upload_delta):
 			assert backup is not None
 			if not args.reupload:
 				print(f"{snapshot} is already backed up.")
