@@ -8,9 +8,6 @@
 # put: doesn't work well with --chroot # XXX
 #
 # consistency check of remote backups
-# calculate/verify end-to-end hash? (hash of authentication tags)
-# add timestamp to blob_uuid (to avoid collisions)
-# rename subvolume to volume
 #
 # padding:
 #   * Padme: https://lbarman.ch/blog/padme
@@ -1459,7 +1456,7 @@ class IndexDecompressionOptions(CompressionOptionsBase):
 
 # Add --encryption-command/--encryption-key/--encryption-key-command/etc.
 class EncryptionOptions(CmdLineOptions): # {{{
-	subvolume:		Optional[str] = None
+	volume:			Optional[str] = None
 
 	meta_cipher:		Optional[InternalCipher.Primitive] = None
 	bulk_cipher:		Optional[InternalCipher.Primitive] = None
@@ -1493,7 +1490,7 @@ class EncryptionOptions(CmdLineOptions): # {{{
 		super().declare_arguments()
 
 		section = self.sections["bucket"]
-		section.add_argument("--subvolume", "-V")
+		section.add_argument("--volume", "-V")
 
 		section = self.sections["encryption"]
 		section.add_argument("--meta-cipher")
@@ -1530,8 +1527,8 @@ class EncryptionOptions(CmdLineOptions): # {{{
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
 
-		self.merge_options_from_ini(args, "subvolume")
-		self.subvolume = args.subvolume
+		self.merge_options_from_ini(args, "volume")
+		self.volume = args.volume
 
 		self.merge_options_from_ini(args,
 			("encryption_command", "decryption_command"),
@@ -1636,16 +1633,16 @@ class EncryptionOptions(CmdLineOptions): # {{{
 				"integrity-protection requires encryption")
 
 class EncryptedBucketOptions(EncryptionOptions, BucketOptions):
-	# Initialize @self.subvolume if it hasn't been set explicitly.
+	# Initialize @self.volume if it hasn't been set explicitly.
 	@property
 	def bucket(self) -> google.cloud.storage.Bucket:
 		bucket = super().bucket
 
-		if self.subvolume is None:
-			subvolume = [ bucket.name ]
+		if self.volume is None:
+			volume = [ bucket.name ]
 			if self.prefix is not None:
-				subvolume.append(self.prefix)
-			self.subvolume = '/'.join(subvolume)
+				volume.append(self.prefix)
+			self.volume = '/'.join(volume)
 
 		return bucket
 # }}}
@@ -2286,7 +2283,7 @@ class InternalEncrypt(InternalCipher):
 		# Normally time.time() increases monotonically, ensuring the
 		# uniqueness of the @nonce in most circumstances.  We also add
 		# considerable entropy to make it a guarantee.
-		nonce = bytearray(int(time.time()).to_bytes(4))
+		nonce = bytearray((int(time.time()) & 0xFFFFFFFF).to_bytes(4))
 		nonce += self.csrng.randbytes(self.NONCE_SIZE - len(nonce))
 
 		ciphertext = self.encrypt_base(self.meta_cipher, nonce,
@@ -2626,8 +2623,8 @@ class MetaCipher: # {{{
 	def get_cipher_cmd_env(self) -> dict[str, str]:
 		env = os.environ.copy()
 
-		assert self.args.subvolume is not None
-		env["GICCS_SUBVOLUME"] = self.args.subvolume
+		assert self.args.volume is not None
+		env["GICCS_VOLUME"] = self.args.volume
 
 		return env
 
@@ -2834,8 +2831,8 @@ class MetaBlob(MetaCipher): # {{{
 		return self.gcs_blob.size
 
 	@property
-	def subvolume(self) -> str:
-		return self.args.subvolume
+	def volume(self) -> str:
+		return self.args.volume
 
 	@classmethod
 	def isa(cls, metadata: Optional[dict[str, Any]]) -> bool:
@@ -2851,7 +2848,15 @@ class MetaBlob(MetaCipher): # {{{
 		while True:
 			if args.encrypt:
 				# Generate a random @self.blob_uuid.
-				self.blob_uuid = uuid.uuid4()
+				# It is really important to make it unique,
+				# so mix in the local time.  This information
+				# will be known to the server anyway.
+				uuid_bytes = \
+					(int(time.time()) & 0xFFFFFFFF) \
+					.to_bytes(4)
+				uuid_bytes += secrets.token_bytes(
+					len(UUID0.bytes) - len(uuid_bytes))
+				self.blob_uuid = uuid.UUID(bytes=uuid_bytes)
 
 			blob_name = args.with_prefix(
 						str(self.blob_uuid) \
@@ -2945,8 +2950,7 @@ class MetaBlob(MetaCipher): # {{{
 			# otherwise there's a possible misconfiguration.
 			self.has_metadatum(metadata, "signature", False)
 
-		if self.load_metadatum(metadata, "subvolume") \
-				!= self.subvolume:
+		if self.load_metadatum(metadata, "volume") != self.volume:
 			return None
 
 		return self
@@ -2999,8 +3003,8 @@ class MetaBlob(MetaCipher): # {{{
 
 	# Called by init_from_gcs() to restore metadata fields from @metadata.
 	def load_metadata(self, metadata: Optional[dict[str, Any]]) -> None:
-		# Don't load @metadata["subvolume"], we already have our
-		# expectation in @self.args.subvolume.
+		# Don't load @metadata["volume"], we already have our
+		# expectation in @self.args.volume.
 
 		if self.has_signature():
 			assert self.blob_uuid is None
@@ -3033,7 +3037,7 @@ class MetaBlob(MetaCipher): # {{{
 
 	# Called by update_metadata() to save metadata fields in @metadata.
 	def save_metadata(self, metadata: dict[str, Any]) -> None:
-		self.save_metadatum(metadata, "subvolume", self.subvolume)
+		self.save_metadatum(metadata, "volume", self.volume)
 
 		if self.has_signature():
 			self.save_metadatum(metadata,
@@ -3088,7 +3092,7 @@ class MetaBlob(MetaCipher): # {{{
 	def calc_signature(self) -> MetaMAC:
 		hasher = MetaMAC(self, self.DataType.SIGNATURE)
 
-		hasher.update(self.subvolume.encode())
+		hasher.update(self.volume.encode())
 		hasher.update(b'\0')
 
 		# @self.blob_uuid is included by the @hasher automatically.
