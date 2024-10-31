@@ -2,6 +2,7 @@
 #
 # TODO: {{{
 # pytype
+# build python3-cryptography with BorginSSL for faster AES-GCM-SIV
 # args -> self
 # DirEnt.volatile -> obj?
 # put: print the total number of bytes uploaded
@@ -1467,6 +1468,7 @@ class EncryptionOptions(CmdLineOptions): # {{{
 	encryption_command:	Optional[Sequence[str]] = None
 	decryption_command:	Optional[Sequence[str]] = None
 
+	random_blob_uuid:	bool = False
 	encrypt_metadata:	bool = False
 	add_header_to_blob:	bool = False
 
@@ -1501,8 +1503,8 @@ class EncryptionOptions(CmdLineOptions): # {{{
 		mutex.add_argument("--encryption-key", "--key")
 		mutex.add_argument("--encryption-key-command", "--key-cmd")
 
+		section.add_enable_flag_no_dflt("--random-blob-uuid")
 		section.add_disable_flag_no_dflt("--no-encrypt-metadata")
-		section.add_disable_flag_no_dflt("--no-verify-blob-size")
 		section.add_disable_flag_no_dflt("--no-blob-header")
 
 		choices = tuple(v.name.lower() for v in self.Integrity)
@@ -1598,6 +1600,10 @@ class EncryptionOptions(CmdLineOptions): # {{{
 							"AESGCMSIV", "AESSIV")
 			if self.bulk_cipher is None:
 				self.bulk_cipher = self.meta_cipher
+
+		self.merge_options_from_ini(args, "random_blob_uuid", tpe=bool)
+		if args.random_blob_uuid:
+			self.random_blob_uuid = True
 
 		self.merge_options_from_ini(args, "encrypt_metadata", tpe=bool)
 		if args.encrypt_metadata is not False:
@@ -2846,11 +2852,17 @@ class MetaBlob(MetaCipher): # {{{
 		super().__init__(args)
 
 		while True:
-			if args.encrypt:
-				# Generate a random @self.blob_uuid.
-				# It is really important to make it unique,
-				# so mix in the local time.  This information
-				# will be known to the server anyway.
+			if not args.encrypt:
+				pass
+			elif args.random_blob_uuid:
+				# Generate a fully random @self.blob_uuid.
+				# It is very unlikely, though possible, that
+				# the UUID won't be unique, which is highly
+				# undesirable by us.
+				self.blob_uuid = uuid.uuid4()
+			else:	# To avoid that possibility, mix in the local
+				# time. This leaks information, but the server
+				# will be aware of the creation time anyway.
 				uuid_bytes = \
 					(int(time.time()) & 0xFFFFFFFF) \
 					.to_bytes(4)
@@ -4565,7 +4577,7 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 				or args.integrity >= args.Integrity.SIZE) \
 			and not wet_run:
 		# In case of failure the blob won't be usable without
-		# --no-verify-blob-size, so it's okay not to delete it.
+		# --integrity none, so it's okay not to delete it.
 		blob.sync_metadata()
 
 	return src.bytes_transferred
