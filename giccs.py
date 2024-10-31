@@ -13,8 +13,7 @@
 # padding:
 #   * Padme: https://lbarman.ch/blog/padme
 #   * https://github.com/covert-encryption/covert/blob/main/docs/Specification.md#padding
-#   * either?
-#   * only apply to FTP?
+#   * only apply to FTP; meaningful even without encryption
 #   * upload/download rate-limiting or latency-shaper
 #     * never let a read/write appear faster than before
 #   * Progressometer => Preprocessor?
@@ -1663,7 +1662,7 @@ class TransferOptions(CmdLineOptions): # {{{
 		super().declare_arguments()
 
 		section = self.sections["transfer"]
-		if isinstance(self, CmdUpload):
+		if isinstance(self, (CmdUpload, CmdFTP)):
 			section.add_int_argument("--upload-chunk-size")
 		section.add_int_argument("--progress")
 		section.add_int_argument("--timeout")
@@ -1671,7 +1670,7 @@ class TransferOptions(CmdLineOptions): # {{{
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
 
-		if isinstance(self, CmdUpload):
+		if isinstance(self, (CmdUpload, CmdFTP)):
 			self.merge_options_from_ini(
 					args, "upload_chunk_size", tpe=int)
 			self.upload_chunk_size = self.positive(
@@ -4389,7 +4388,12 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 		pipeline_stdin: Optional[Pipeline.StdioType] = None,
 		count_bytes_in: bool = True, wet_run: bool = False,
 		overwrite: Optional[bool] = None) -> int:
-	assert command is not None or pipeline_stdin is not None
+	if command is None:
+		assert pipeline_stdin is not None
+		assert isinstance(pipeline_stdin, io.IOBase)
+		pipeline_stdin_stat = os.stat(pipeline_stdin.fileno())
+	else:
+		pipeline_stdin_stat = None
 
 	if args.encrypt_external() and args.add_header_to_blob:
 		# Write @blob_uuid into the pipeline before the @command
@@ -4434,15 +4438,13 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			# to count its output.
 			bytes_in_counter = { }
 			pipeline.insert(1, bytes_in_counter)
-		elif stat.S_ISREG(os.stat(pipeline_stdin.fileno()).st_mode):
-			# We don't need to count the file size, just retrieve
-			# it when we're done (who knows, it might change
-			# meanwhile).
-			bytes_in_counter = pipeline_stdin
-		else:	# Insert @bytes_in_counter before anything else,
+		elif not stat.S_ISREG(pipeline_stdin_stat.st_mode):
+			# Insert @bytes_in_counter before anything else,
 			# counting @pipeline_stdin.
 			bytes_in_counter = { }
 			pipeline.insert(0, bytes_in_counter)
+		else:	# We know the file size already.
+			bytes_in_counter = pipeline_stdin_stat.st_size
 
 		if isinstance(bytes_in_counter, dict):
 			# Create a pipe through which @bytes_in_counter
@@ -4482,10 +4484,17 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 		if count_bytes_in and bytes_in_counter is None:
 			bytes_in_counter = src
 
+	# We know the @expected_bytes to transfer if @src is a regular file.
+	if src is pipeline_stdin and stat.S_ISREG(pipeline_stdin_stat.st_mode):
+		expected_bytes = pipeline_stdin_stat.st_size
+	else:
+		expected_bytes = None
+
 	# Check the @pipeline for errors before returning the last read
 	# to upload_from_file().  If pipeline.wait() throws an exception
 	# the upload will fail and not create the blob.
-	src = Progressometer(src, args.progress, final_cb=pipeline.wait,
+	src = Progressometer(src, args.progress, expected_bytes=expected_bytes,
+				final_cb=pipeline.wait,
 				hashing=args.integrity >= args.Integrity.HASH)
 	if count_bytes_in and bytes_in_counter is None:
 		bytes_in_counter = src
@@ -4550,11 +4559,8 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			bytes_in = bytes_in_counter.bytes_transferred
 		elif isinstance(bytes_in_counter, InternalEncrypt):
 			bytes_in = bytes_in_counter.bytes_in
-		elif bytes_in_counter is pipeline_stdin:
-			assert isinstance(bytes_in_counter, io.IOBase)
-			assert stat.S_ISREG(os.stat(
-				bytes_in_counter.fileno()).st_mode)
-			bytes_in = os.stat(bytes_in_counter.fileno()).st_size
+		elif isinstance(bytes_in_counter, int):
+			bytes_in = bytes_in_counter
 		else:	# This is written by cat().
 			assert isinstance(bytes_in_counter, io.BufferedReader)
 			bytes_in = bytes_in_counter.read()
