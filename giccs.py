@@ -1471,6 +1471,8 @@ class EncryptionOptions(CmdLineOptions): # {{{
 	encrypt_metadata:	bool = False
 	add_header_to_blob:	bool = False
 
+	padding: Optiona[Progressometer.Padding] = None
+
 	class Integrity(enum.IntEnum):
 		NONE		= enum.auto()
 		SIZE		= enum.auto()
@@ -1505,6 +1507,10 @@ class EncryptionOptions(CmdLineOptions): # {{{
 		section.add_enable_flag_no_dflt("--random-blob-uuid")
 		section.add_disable_flag_no_dflt("--no-encrypt-metadata")
 		section.add_disable_flag_no_dflt("--no-blob-header")
+
+		choices = [ "none" ]
+		choices += tuple(v.name.lower() for v in Progressometer.Padding)
+		section.add_argument("--padding", choices=choices)
 
 		choices = tuple(v.name.lower() for v in self.Integrity)
 		section.add_argument("--integrity", choices=choices)
@@ -1624,6 +1630,25 @@ class EncryptionOptions(CmdLineOptions): # {{{
 			raise self.CmdLineError(
 				"--no-blob-header only makes sense with "
 				"--encryption-command/--decryption-command")
+
+		# It makes some sense to enable padding even if encryption
+		# (at rest) is not enabled, because it makes the analysis
+		# of traffic in transit (which is still encrypted) harder
+		# by outsiders.  But this is probably not something the user
+		# would expect by default.
+		choices = self.find_argument("--padding")[1]["choices"]
+		self.merge_options_from_ini(args, "padding", tpe=choices)
+		if args.padding is None:
+			# Since the amount of padding will be stored with the
+			# metadata, it needs to be encrypted.
+			if self.encrypt_metadata:
+				# The Covert-scheme seems to be more secure
+				# and efficient than Padme as long as the user
+				# doesn't upload the same file multiple times.
+				self.padding = Progressometer.Padding.COVERT
+		elif args.padding != "none":
+			self.padding = \
+				Progressometer.Padding[args.padding.upper()]
 
 		# Integrity-protection requires an extra permission because
 		# it needs to update the blob's metadata after its creation.
@@ -1995,6 +2020,152 @@ class Backups(Snapshots): # {{{
 		return restorable
 # }}}
 
+# A cryptographycally-secure deterministic random number generator based on
+# AES-CTR.
+class CSPRNG: #  {{{
+	# The cipher we'll obtain the random bytes from by feeding it zeroes.
+	class Primitive(Protocol):
+		def update_into(data: ByteString, buf: ByteString) -> int:
+			...
+	generator: Primitive
+
+	# The key of the cipher, either supplied by the user or generated
+	# randomly.  Two CSPRNG:s seeded with the same value should produce
+	# the same byte sequence.
+	seed: bytes
+
+	# The size of the seed to generate by default.
+	DFLT_SEED_SIZE: int = 128 // 8
+
+	# The number of random bytes we'll generate at a time.  The cipher
+	# has been measured to be the fasted with this input size.
+	MAXBUF: int = 128*1024
+
+	# The input of the cipher, MAXBUF number of zero bytes.
+	zeroes: memoryview
+
+	# How much the output buffer needs to be larger than the input.
+	SURPLUS: int
+
+	# The output buffer filled by the cipher.  Its size is not a multiply
+	# of MAXBUF.
+	buf: bytearray
+
+	# The number of bytes that have been returned from the output buffer.
+	buf_i: int
+
+	# Points at the first unfilled byte in the output buffer.
+	buf_n: int
+
+	def __init__(self, seed: Optional[bytes] = None):
+		# We import the library on-demand.
+		from cryptography.hazmat.primitives.ciphers \
+			import Cipher, algorithms, modes
+
+		if seed is None:
+			# Use AES-128 by default.
+			seed = secrets.token_bytes(self.DFLT_SEED_SIZE)
+		else:
+			assert len(seed) >= self.DFLT_SEED_SIZE
+		algo = algorithms.AES(seed)
+		self.seed = seed
+
+		# The nonce is also a sequence of zeroes.  This is OK,
+		# since the key is not supposed to be reused.
+		block_size = algo.block_size // 8
+		mode = modes.CTR(bytes(block_size))
+		self.SURPLUS = block_size - 1
+
+		self.generator = Cipher(algo, mode).encryptor()
+		self.zeroes = memoryview(bytes(self.MAXBUF))
+
+		self.buf = bytearray()
+		self.buf_i = self.buf_n = 0
+
+	# Return @n random bytes.
+	def generate(self, n: int) -> memoryview:
+		# Can we readily return @n bytes from the output buffer?
+		if n <= self.buf_n - self.buf_i:
+			i = self.buf_i
+			self.buf_i += n
+			return memoryview(self.buf)[i:i+n]
+
+		# We need to enlarge the buffer by an integer times of MAXBUF,
+		# such that we'll have enough output to return @n bytes.
+		# We can ignore the already returned portion of the buffer
+		# (everything up to @self.buf_i).
+		#
+		#                                .MAXBUF.MAXBUF.MAXBUF.MAXBUF.
+		# |........|.....................|......|......|......|..+...|
+		# buf      buf_i                 buf_n                   |
+		#          `------------------------+--------------------'
+		#                                   n  
+		#
+		# @newbuf is how much more to allocate.  It's slightly more
+		# than necessary because in theory the cipher could return
+		# SURPLUS more bytes for every MAXBUF input.
+		q, r = divmod(n - (self.buf_n - self.buf_i), self.MAXBUF)
+		newbuf = (q + (r > 0)) * (self.MAXBUF + self.SURPLUS)
+
+		assert self.buf_i <= self.buf_n
+		self.buf_n -= self.buf_i
+
+		# Allocate the new buffer and copy the unreturned bytes from
+		# @oldbuf.  This is faster than trimming and extending the
+		# buffer.
+		oldbuf = memoryview(self.buf)
+		self.buf = bytearray(self.buf_n + newbuf)
+		self.buf[:self.buf_n] = \
+			oldbuf[self.buf_i:self.buf_i+self.buf_n]
+
+		# Fill in the rest of the buffer, MAXBUF at a time.
+		view = memoryview(self.buf)
+		while self.buf_n < n:
+			self.buf_n += self.generator.update_into(
+					self.zeroes, view[self.buf_n:])
+
+		# Return the requested number of bytes.
+		self.buf_i = n
+		return view[:n]
+
+	# Check whether @rnd matches what is coming up in the sequence.
+	# If so, returns None, otherwise the offset of the first difference.
+	# This is more efficient than generate()ing the sequence and comparing
+	# it with @rnd.
+	def verify(self, rnd: ByteString) -> Optional[int]:
+		# Run until @rnd is consumed.
+		n, i = len(rnd), 0
+		rnd = memoryview(rnd)
+		while n > 0:
+			# Are there any bytes remaining in the buffer?
+			if self.buf_i >= self.buf_n:
+				# No, let's generate the next batch.
+				self.buf = bytearray(self.MAXBUF+self.SURPLUS)
+				self.buf_n = self.generator.update_into(
+							self.zeroes, self.buf)
+				self.buf_i = 0
+
+			# Compare the next @cmp bytes.  For some reason
+			# comparing two memoryview:s is very slow, so we
+			# use @self.buf as-is.
+			cmp = min(n, self.buf_n - self.buf_i)
+			if self.buf[self.buf_i:self.buf_i+cmp] != rnd[i:i+cmp]:
+				# Find the first differing offset.
+				while True:
+					assert i < cmp
+					if self.buf[self.buf_i] != rnd[i]:
+						return i
+					i += 1
+					self.buf_i += 1
+
+			i += cmp
+			n -= cmp
+			self.buf_i += cmp
+
+		assert n == 0
+		return None
+# }}}
+
 # The internal encryption and decryption classes.
 class InternalCipher: # {{{
 	# The cryptography.hazmat.primitives.ciphers.aead module,
@@ -2054,6 +2225,14 @@ class InternalCipher: # {{{
 	#   * next bulk key (bulk_key_size())
 	#   * bulk data (CLEARTEXT_SIZE - bulk_key_size())
 	#   * verification tag (AUTH_TAG_SIZE)
+	#
+	# The additional authenticated data are the @blob_uuid and
+	# @data_type_id, but they are not included in the ciphertext.
+	#
+	# The nonces are changing randomly (rather than increasing
+	# sequentially) and are not included in the ciphertext (except for
+	# the init block) to protect against the ill chance of generating
+	# the same @blob_uuid for multiple blobs.
 	# }}}
 
 	# Tunable security parameters.
@@ -2824,8 +3003,13 @@ class MetaBlob(MetaCipher): # {{{
 	#   provide it.
 	blob_hash: Optional[bytes] = None
 
-	# The size of the payload before encryption and compression.
+	# The size of the payload before compression and encryption.
 	file_size: Optional[int] = None
+
+	# Padding added to the payload after compression and encryption,
+	# generated from @padding_seed.
+	padding: int = 0
+	padding_seed: Optional[bytes] = None
 
 	@property
 	def name(self) -> str:
@@ -3046,6 +3230,11 @@ class MetaBlob(MetaCipher): # {{{
 		self.file_size = self.load_metadatum(metadata, "file_size",
 							int, expected=False)
 
+		self.padding = self.load_metadatum(metadata, "padding", int)
+		self.padding_seed = self.load_metadatum(
+					metadata, "padding_seed", bytes,
+					expected=self.padding > 0)
+
 	# Called by update_metadata() to save metadata fields in @metadata.
 	def save_metadata(self, metadata: dict[str, Any]) -> None:
 		self.save_metadatum(metadata, "volume", self.volume)
@@ -3062,6 +3251,9 @@ class MetaBlob(MetaCipher): # {{{
 		       				"blob_size", self.blob_size)
 		self.save_metadatum(metadata, "blob_hash", self.blob_hash)
 		self.save_metadatum(metadata, "file_size", self.file_size)
+
+		self.save_metadatum(metadata, "padding", self.padding)
+		self.save_metadatum(metadata, "padding_seed", self.padding_seed)
 
 		if self.has_signature():
 			self.save_metadatum(
@@ -3115,6 +3307,10 @@ class MetaBlob(MetaCipher): # {{{
 				# Use an unlikely value.
 				size = (1 << 8*8) - 1
 			hasher.update(size.to_bytes(8, "big"))
+
+		hasher.update(self.padding.to_bytes(8, "big"))
+		hasher.update(self.padding_seed if self.padding_seed is not None
+				else b'\0' * CSPRNG.DFLT_SEED_SIZE)
 
 		hasher.update(self.blob_hash if self.blob_hash is not None
 				else b'\0' * 64)
@@ -3315,41 +3511,80 @@ class BackupBlob(MetaBlob): # {{{
 # A class that proxies the read()s and write()s of the GCS library
 # to the wrapped file-like object.  It has several responsibilities:
 #
-#   * Keep track of the @bytes_transferred so far, and print it periodically.
-#   * If the @expected_bytes is known beforehand, ensure that GCS returns
+#   * Keep track of the @transferred_gross so far, and print it periodically.
+#   * If the @expected_gross is known beforehand, ensure that GCS returns
 #     exactly as much data to us, no more or less.
-#   * Calculates the hash of the transferred data and verify it against the
+#   * Add padding to the transferred data when uploading and verify it when
+#     downloading.
+#   * Calculate the hash of the transferred data and verify it against the
 #     @expected_hash at the end.
 class Progressometer: # {{{
+	# The file we'll ultimately read() from or write() to.  If None,
+	# write() will simply discard what it would have written.
 	wrapped: Optional[BinaryIO]
+
+	# If not None, the minimum number of seconds between showing progress.
 	interval: Optional[float]
 
-	expected_bytes: Optional[int]
+	# The number of bytes (including padding) read() will return or write()
+	# will accept.  Could be None if we don't know it yet or not at all.
+	expected_gross: Optional[int]
+
+	# A user-specified callback to invoke before read() returns for the
+	# last time.
 	final_cb: Optional[Callable[[], None]]
 
+	# Used to decide when to print a new progress.
 	started: Optional[float] = None
 	last_checkpoint_time: Optional[float] = None
-
-	bytes_transferred: int = 0
 	last_checkpoint_bytes: Optional[int] = None
 
-	hasher: Optional[MetaMAC.Hasher] = None
-	expected_hash: Optional[bytes] = None
+	# The number of bytes (including padding) returned by read() or taken
+	# by write() so far.
+	transferred_gross: int = 0
 
+	# If not None, add or expect padding.  It could be a concreate number
+	# of bytes, or the algorithm to calculate it from when the number of
+	# non-padding bytes becomes known (ie. when we've consumed the @wrapped
+	# file).
 	class Padding(enum.Enum):
 		PADME		= enum.auto()
 		COVERT		= enum.auto()
-	padding: Optional[Union[Padding, int]]
+	padding: Optional[Union[Padding, int]] = None
+
+	# The generator of random padding bytes.
+	csprng: Optional[CSPRNG] = None
+
+	# The hasher used to calculate and possibly verify the hash of the
+	# transferred bytes (including padding).
+	hasher: Optional[MetaMAC.Hasher] = None
+	expected_hash: Optional[bytes] = None
 
 	def __init__(self, f: Optional[BinaryIO],
 			interval: Optional[float],
-			expected_bytes: Optional[int] = None,
+			expected_net: Optional[int] = None,
+			expected_gross: Optional[int] = None,
+			padding: Optional[Union[Padding, int]] = None,
+			padding_seed: Optional[bytes] = None,
 	      		hashing: Optional[Union[bool, bytes]] = None,
 			final_cb: Optional[Callable[[], None]] = None):
 		self.wrapped = f
 		self.interval = interval
-		self.expected_bytes = expected_bytes
 		self.final_cb = final_cb
+
+		self.padding = padding
+		self.expected_gross = expected_gross
+		if expected_net is not None and expected_gross is not None:
+			assert expected_net <= expected_gross
+			self.padding = self.calc_padding(expected_net)
+			assert self.padding == expected_gross - expected_net
+		elif expected_net is not None:
+			self.padding = self.calc_padding(expected_net)
+			self.expected_gross = expected_net + self.padding
+		elif expected_gross is not None:
+			self.padding = self.calc_padding()
+		if self.padding:
+			self.csprng = CSPRNG(seed=padding_seed)
 
 		if hashing is not None:
 			persona = MetaCipher.DataType.PAYLOAD.value.to_bytes(4)
@@ -3358,10 +3593,10 @@ class Progressometer: # {{{
 				self.expected_hash = hashing
 
 	def make_progress(self) -> None:
-		progress = humanize_size(self.bytes_transferred)
-		if self.expected_bytes is not None:
-			assert self.bytes_transferred <= self.expected_bytes
-			done = self.bytes_transferred / self.expected_bytes
+		progress = humanize_size(self.transferred_gross)
+		if self.expected_gross is not None:
+			assert self.transferred_gross <= self.expected_gross
+			done = self.transferred_gross / self.expected_gross
 			progress = "%d%% (%s)" % (int(done * 100), progress)
 		print(f" %s..." % progress, end="", flush=True)
 
@@ -3375,17 +3610,18 @@ class Progressometer: # {{{
 			self.last_checkpoint_time = now
 		elif now - self.last_checkpoint_time >= self.interval \
 				and self.last_checkpoint_bytes \
-					!= self.bytes_transferred:
+					!= self.transferred_gross:
 			self.make_progress()
 			self.last_checkpoint_time = now
-			self.last_checkpoint_bytes = self.bytes_transferred
+			self.last_checkpoint_bytes = self.transferred_gross
 
+	# Called by the user when it's finished with reading/writing.
 	def final_progress(self) -> None:
-		if self.expected_bytes is not None:
-			assert self.bytes_transferred <= self.expected_bytes
-			if self.bytes_transferred < self.expected_bytes:
-				missing = self.expected_bytes \
-						- self.bytes_transferred
+		if self.expected_gross is not None:
+			assert self.transferred_gross <= self.expected_gross
+			if self.transferred_gross < self.expected_gross:
+				missing = self.expected_gross \
+						- self.transferred_gross
 				raise SecurityError(
 					f"Blob is missing {missing} bytes")
 
@@ -3400,7 +3636,7 @@ class Progressometer: # {{{
 
 		if self.interval is not None:
 			print(" %s (%s)" % (
-				humanize_size(self.bytes_transferred),
+				humanize_size(self.transferred_gross),
 				humanize_duration(
 					time.monotonic() - self.started)),
 				end="", flush=True)
@@ -3428,9 +3664,9 @@ class Progressometer: # {{{
 	def covert(self, size: int) -> int:
 		import math
 
+		p = 0.05
 		rnd1 = int.from_bytes(random.randbytes(4))
 		rnd2 = int.from_bytes(random.randbytes(4))
-		p = 0.05
 
 		fixed_padding = max(0, int(p * 500) - size)
 		eff_size = 200 + 1e8 * math.log(1 + 1e-8 * (size + fixed_padding))
@@ -3439,30 +3675,85 @@ class Progressometer: # {{{
 
 		return total_padding
 
+	# Calculate the amount of padding based on the chosen method and the
+	# net bytes (to be or already have been) transferred.
+	def calc_padding(self, size: Optional[int] = None) -> int:
+		if self.padding is None:
+			return 0
+		elif isinstance(self.padding, int):
+			assert self.padding >= 0
+			return self.padding
+
+		assert size is not None
+		if self.padding == self.Padding.PADME:
+			return self.padme(size)
+		elif self.padding == self.Padding.COVERT:
+			return self.covert(size)
+		else:
+			assert False
+
 	# We're called by the GCS library to provide data to upload.
 	def read(self, n: Optional[int] = None) -> ByteString:
 		assert self.wrapped is not None
 		self.check_progress()
 
-		buf = self.wrapped.read(n)
+		if self.expected_gross is None:
+			# Haven't consumed @self.wrapped.
+			buf = self.wrapped.read(n)
+		else:	# May have consumed @self.wrapped.
+			assert isinstance(self.padding, int)
+			maxnet = self.expected_gross - self.padding
+			if maxnet > self.transferred_gross:
+				maxread = maxnet - self.transferred_gross
+				buf = self.wrapped.read(min(n, maxread))
+			else:	# We have consumed @self.wrapped.
+				buf = bytearray()
+
+		assert len(buf) <= n
+		n -= len(buf)
+		self.transferred_gross += len(buf)
+
+		if n > 0 and self.padding:
+			# Add padding to @buf.
+			if not isinstance(self.padding, int):
+				self.padding = self.calc_padding(
+						self.transferred_gross)
+				assert self.expected_gross is None
+			if self.expected_gross is None:
+				self.expected_gross = \
+					self.transferred_gross + self.padding
+
+			maxpad = self.expected_gross - self.transferred_gross
+			padding = min(maxpad, n)
+
+			assert self.csprng is not None
+			buf += self.csprng.generate(padding)
+			n -= padding
+			self.transferred_gross += padding
+
 		if self.hasher is not None:
 			self.hasher.update(buf)
 
-		if len(buf) < n:
+		if n > 0:
+			# We have consumed @self.wrapped and/or
+			# reached @self.expected_gross.
+			assert self.expected_gross is None \
+				or self.transferred_gross \
+					== self.expected_gross
+
 			# blob.upload_from_file() won't call us anymore,
-			# so it's our only chance to call final_cb().
+			# so it's our only chance to call @self.final_cb().
 			self.final_cb()
 
-		self.bytes_transferred += len(buf)
 		return buf
 
 	# The GCS library is writing downloaded data to us.
 	def write(self, buf: bytes) -> None:
 		self.check_progress()
 
-		if self.expected_bytes is not None:
-			if self.bytes_transferred + len(buf) \
-					> self.expected_bytes:
+		if self.expected_gross is not None:
+			if self.transferred_gross + len(buf) \
+					> self.expected_gross:
 				# Server is sending more data
 				# than the blob's nominal size.
 				raise SecurityError(
@@ -3470,12 +3761,43 @@ class Progressometer: # {{{
 
 		if self.hasher is not None:
 			self.hasher.update(buf)
-		if self.wrapped is not None:
-			self.wrapped.write(buf)
-		self.bytes_transferred += len(buf)
+
+		# @maxwrite := the maximum number of non-padding bytes
+		# in @buf that need to be written to @self.wrapped.
+		# Can be negative.
+		if buf and self.padding:
+			assert self.expected_gross is not None
+			assert isinstance(self.padding, int)
+			maxwrite = self.expected_gross - self.padding \
+						- self.transferred_gross
+		else:	# Empty @buf or no @self.padding.
+			maxwrite = len(buf)
+
+		padding = None
+		if maxwrite >= len(buf):
+			# Also covers len(@buf) == 0.
+			if self.wrapped is not None:
+				self.wrapped.write(buf)
+		elif maxwrite > 0:
+			# Part of @buf is padding, verify it.
+			buf = memoryview(buf)
+			if self.wrapped is not None:
+				self.wrapped.write(buf[:maxwrite])
+			padding = buf[maxwrite:]
+		else:
+			padding = buf
+
+		if padding is not None:
+			assert self.csprng is not None
+			if (offset := self.csprng.verify(padding)) is not None:
+				raise SecurityError(
+					"Invalid padding at offset %d"
+					% (self.transferred_gross + offset))
+
+		self.transferred_gross += len(buf)
 
 	def tell(self) -> int:
-		return self.bytes_transferred
+		return self.transferred_gross
 # }}}
 
 # A file-like object which can open a directory, closing the file descriptor
@@ -4386,6 +4708,7 @@ def write_external_encryption_header(blob: MetaBlob, then_cat: bool = False) \
 def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 		command: Optional[Sequence[str]] = None,
 		pipeline_stdin: Optional[Pipeline.StdioType] = None,
+		padding: Optional[Progressometer.Padding] = None,
 		count_bytes_in: bool = True, wet_run: bool = False,
 		overwrite: Optional[bool] = None) -> int:
 	if command is None:
@@ -4493,8 +4816,9 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 	# Check the @pipeline for errors before returning the last read
 	# to upload_from_file().  If pipeline.wait() throws an exception
 	# the upload will fail and not create the blob.
-	src = Progressometer(src, args.progress, expected_bytes=expected_bytes,
+	src = Progressometer(src, args.progress,
 				final_cb=pipeline.wait,
+				expected_net=expected_bytes, padding=padding,
 				hashing=args.integrity >= args.Integrity.HASH)
 	if count_bytes_in and bytes_in_counter is None:
 		bytes_in_counter = src
@@ -4543,7 +4867,7 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 
 	src.final_progress()
 
-	if not wet_run and blob.gcs_blob.size != src.bytes_transferred:
+	if not wet_run and blob.gcs_blob.size != src.transferred_gross:
 		# GCS has a different idea about the blob's size than us.
 		try:
 			blob.gcs_blob.delete()
@@ -4552,11 +4876,11 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 				"but unable to delete it!", file=sys.stderr)
 		raise ConsistencyError(
 				"Blob size mismatch (%d != %d)"
-				% (blob.gcs_blob.size, src.bytes_transferred))
+				% (blob.gcs_blob.size, src.transferred_gross))
 
 	if bytes_in_counter is not None:
 		if isinstance(bytes_in_counter, Progressometer):
-			bytes_in = bytes_in_counter.bytes_transferred
+			bytes_in = bytes_in_counter.transferred_gross
 		elif isinstance(bytes_in_counter, InternalEncrypt):
 			bytes_in = bytes_in_counter.bytes_in
 		elif isinstance(bytes_in_counter, int):
@@ -4576,17 +4900,24 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 				bytes_in -= len(header)
 		blob.file_size = bytes_in
 
+	if padding is not None:
+		assert isinstance(src.padding, int)
+		assert src.csprng is not None
+		blob.padding = src.padding
+		blob.padding_seed = src.csprng.seed
+
 	if args.integrity >= args.Integrity.HASH:
 		blob.blob_hash = src.hasher.digest()
 
 	if (bytes_in_counter is not None \
+				or src.padding \
 				or args.integrity >= args.Integrity.SIZE) \
 			and not wet_run:
 		# In case of failure the blob won't be usable without
 		# --integrity none, so it's okay not to delete it.
 		blob.sync_metadata()
 
-	return src.bytes_transferred
+	return src.transferred_gross
 
 # Read blob.external_header_st from the standard input and verify that it
 # belogs to @blob, then either exec(@then_exec) or forward the remaining
@@ -4656,7 +4987,10 @@ def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 	if args.encrypt_internal():
 		dst = blob.internal_decrypt(blob.DataType.PAYLOAD, dst)
 
-	dst = Progressometer(dst, args.progress, blob.gcs_blob.size,
+	dst = Progressometer(dst, args.progress,
+				expected_gross=blob.gcs_blob.size,
+				padding=blob.padding,
+				padding_seed=blob.padding_seed,
 				hashing=blob.blob_hash)
 
 	try:	# The actual download.
@@ -4679,8 +5013,8 @@ def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 
 	# If there's a mismatch Progressometer.final_progress() should have
 	# caught it.
-	assert dst.bytes_transferred == blob.gcs_blob.size
-	return dst.bytes_transferred
+	assert dst.transferred_gross == blob.gcs_blob.size
+	return dst.transferred_gross
 # }}}
 
 # Subvolume-related functions {{{
@@ -6867,7 +7201,9 @@ def upload_file(self: _CmdFTPPut,
 
 	print(f"Uploading {src}...", end="", flush=True)
 	try:
-		return upload_blob(self, blob, pipeline_stdin=open(src, "rb"))
+		return upload_blob(self, blob,
+					pipeline_stdin=open(src, "rb"),
+					padding=self.padding)
 	finally:
 		print()
 		self.remote.lookup(dst, create=True).commit(blob)
