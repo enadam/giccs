@@ -10,14 +10,6 @@
 #
 # consistency check of remote backups
 #
-# padding:
-#   * Padme: https://lbarman.ch/blog/padme
-#   * https://github.com/covert-encryption/covert/blob/main/docs/Specification.md#padding
-#   * only apply to FTP; meaningful even without encryption
-#   * upload/download rate-limiting or latency-shaper
-#     * never let a read/write appear faster than before
-#   * Progressometer => Preprocessor?
-#
 # upload/download: split plan and execution
 # consider using clone sources when uploading
 #
@@ -52,10 +44,11 @@
 # document dependency on python3-glob2
 #
 # protect against:
-#   * blob swapping: header
-#   * block swapping between blobs: header
-#   * block reordering: random sequence number
-#   * blob truncation: expected number of blocks
+#   * swapping entire blobs: authenticated data includes the blob UUID
+#   * swapping chunks between blobs: same + end-to-end hash
+#   * reordering chunks: PRNG nonces + end-to-end hash
+#   * blob truncation: expected number of bytes + end-to-end hash
+#   * traffic analysis: padding, latency-shaping
 # external encryption must generate and verify the MAC
 # }}}
 
@@ -1682,6 +1675,7 @@ class TransferOptions(CmdLineOptions): # {{{
 	upload_chunk_size:	Optional[int] = None
 	progress:		Optional[int] = None
 	timeout:		Optional[int] = None
+	laggy:			bool = False
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
@@ -1691,6 +1685,7 @@ class TransferOptions(CmdLineOptions): # {{{
 			section.add_int_argument("--upload-chunk-size")
 		section.add_int_argument("--progress")
 		section.add_int_argument("--timeout")
+		section.add_enable_flag_no_dflt("--laggy")
 
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
@@ -1710,6 +1705,10 @@ class TransferOptions(CmdLineOptions): # {{{
 
 		self.merge_options_from_ini(args, "timeout", tpe=int)
 		self.timeout = self.positive("--timeout", args.timeout)
+
+		self.merge_options_from_ini(args, "laggy", tpe=bool)
+		if args.laggy:
+			self.laggy = args.laggy
 
 	def get_retry_flags(self) -> dict[str, Any]:
 		kwargs = { }
@@ -2229,10 +2228,11 @@ class InternalCipher: # {{{
 	# The additional authenticated data are the @blob_uuid and
 	# @data_type_id, but they are not included in the ciphertext.
 	#
-	# The nonces are changing randomly (rather than increasing
-	# sequentially) and are not included in the ciphertext (except for
-	# the init block) to protect against the ill chance of generating
-	# the same @blob_uuid for multiple blobs.
+	# Except for the init block, the first 8 bytes of the nonce
+	# is the chunk's sequence number, concatenated with a PRNG,
+	# which is not included in the ciphertext.  This is to protect
+	# against the ill chance of generating the same @blob_uuid for
+	# multiple blobs, which would allow swapping chunks between blobs.
 	# }}}
 
 	# Tunable security parameters.
@@ -3539,6 +3539,12 @@ class Progressometer: # {{{
 	last_checkpoint_time: Optional[float] = None
 	last_checkpoint_bytes: Optional[int] = None
 
+	# The minimum time read() and write() should take to finish to make it
+	# harder for the server to infer anything from time measurements, like
+	# how much the data is compressible or whether it's receiving padding
+	# bytes.  This field is managed by delay().
+	minlag: Optional[float] = None
+
 	# The number of bytes (including padding) returned by read() or taken
 	# by write() so far.
 	transferred_gross: int = 0
@@ -3567,7 +3573,8 @@ class Progressometer: # {{{
 			padding: Optional[Union[Padding, int]] = None,
 			padding_seed: Optional[bytes] = None,
 	      		hashing: Optional[Union[bool, bytes]] = None,
-			final_cb: Optional[Callable[[], None]] = None):
+			final_cb: Optional[Callable[[], None]] = None,
+			autolag: bool = False):
 		self.wrapped = f
 		self.interval = interval
 		self.final_cb = final_cb
@@ -3592,6 +3599,9 @@ class Progressometer: # {{{
 			if isinstance(hashing, bytes):
 				self.expected_hash = hashing
 
+		if autolag:
+			self.minlag = 0
+
 	def make_progress(self) -> None:
 		progress = humanize_size(self.transferred_gross)
 		if self.expected_gross is not None:
@@ -3600,11 +3610,10 @@ class Progressometer: # {{{
 			progress = "%d%% (%s)" % (int(done * 100), progress)
 		print(f" %s..." % progress, end="", flush=True)
 
-	def check_progress(self) -> None:
+	def check_progress(self, now: float) -> None:
 		if self.interval is None:
 			return
 
-		now = time.monotonic()
 		if self.last_checkpoint_time is None:
 			self.started = now
 			self.last_checkpoint_time = now
@@ -3614,6 +3623,16 @@ class Progressometer: # {{{
 			self.make_progress()
 			self.last_checkpoint_time = now
 			self.last_checkpoint_bytes = self.transferred_gross
+
+	def delay(self, started: float) -> None:
+		if self.minlag is None:
+			return
+
+		elapsed = time.monotonic() - started
+		if self.minlag > elapsed:
+			time.sleep(self.minlag - elapsed)
+		else:
+			self.minlag = elapsed
 
 	# Called by the user when it's finished with reading/writing.
 	def final_progress(self) -> None:
@@ -3695,7 +3714,9 @@ class Progressometer: # {{{
 	# We're called by the GCS library to provide data to upload.
 	def read(self, n: Optional[int] = None) -> ByteString:
 		assert self.wrapped is not None
-		self.check_progress()
+
+		started = time.monotonic()
+		self.check_progress(started)
 
 		if self.expected_gross is None:
 			# Haven't consumed @self.wrapped.
@@ -3745,11 +3766,13 @@ class Progressometer: # {{{
 			# so it's our only chance to call @self.final_cb().
 			self.final_cb()
 
+		self.delay(started)
 		return buf
 
 	# The GCS library is writing downloaded data to us.
 	def write(self, buf: bytes) -> None:
-		self.check_progress()
+		started = time.monotonic()
+		self.check_progress(started)
 
 		if self.expected_gross is not None:
 			if self.transferred_gross + len(buf) \
@@ -3795,6 +3818,7 @@ class Progressometer: # {{{
 					% (self.transferred_gross + offset))
 
 		self.transferred_gross += len(buf)
+		self.delay(started)
 
 	def tell(self) -> int:
 		return self.transferred_gross
@@ -4817,6 +4841,7 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 	# to upload_from_file().  If pipeline.wait() throws an exception
 	# the upload will fail and not create the blob.
 	src = Progressometer(src, args.progress,
+				autolag=args.laggy,
 				final_cb=pipeline.wait,
 				expected_net=expected_bytes, padding=padding,
 				hashing=args.integrity >= args.Integrity.HASH)
@@ -4988,6 +5013,7 @@ def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 		dst = blob.internal_decrypt(blob.DataType.PAYLOAD, dst)
 
 	dst = Progressometer(dst, args.progress,
+				autolag=args.laggy,
 				expected_gross=blob.gcs_blob.size,
 				padding=blob.padding,
 				padding_seed=blob.padding_seed,
