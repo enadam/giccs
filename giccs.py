@@ -1,69 +1,7 @@
-#!/usr/bin/python3
-#
-# TODO: {{{
-# pytype
-# build python3-cryptography with BorginSSL for faster AES-GCM-SIV
-# args -> self
-# DirEnt.volatile -> obj?
-# put: print the total number of bytes uploaded
-# put: doesn't work well with --chroot # XXX
-#
-# consistency check of remote backups
-#
-# upload/download: split plan and execution
-# consider using clone sources when uploading
-#
-# CmdFTPGet, CmdFTPPut: DryRunOptions, WetRunOptions, AutodeleteOptions?
-# CmdFTPGet: --no-keep-mtime
-#
-# tabbing?
-# dynamic discovery
-# get, put
-# put: upload from stdin/command
-# cat [-c <bytes>], page?
-# mv [--dir/--fname]
-# mkdir, rmdir?
-#
-# overwrite:
-#   * skip
-#   * error
-#   * ask
-#   * force
-# overwrite-mode:
-#   * truncate
-#   * atomic
-#
-# document max blob size (5 TiB)
-# document required permissions
-#   * storage.objects.create
-#   * storage.objects.update (for patch())
-#   * storage.buckets.list (for list buckets)
-#   * storage.objects.list
-#   * storage.objects.get
-# document the use of gpg-agent
-# document dependency on python3-glob2
-#
-# protect against:
-#   * swapping entire blobs: authenticated data includes the blob UUID
-#   * swapping chunks between blobs: same + end-to-end hash
-#   * reordering chunks: PRNG nonces + end-to-end hash
-#   * blob truncation: expected number of bytes + end-to-end hash
-#   * traffic analysis: padding, latency-shaping
-# external encryption must generate and verify the MAC
-# }}}
+#!/home/adam/prog/src/gcs/volatile/venv/bin/python3
 
 # Modules {{{
 from __future__ import annotations
-
-import sys, os, pathlib
-libdir = str(pathlib.Path(sys.argv[0]).resolve().parent.joinpath("crypto/lib").resolve())
-if "LD_LIBRARY_PATH" not in os.environ:
-	os.environ["LD_LIBRARY_PATH"] = libdir
-	os.execv(sys.argv[0], sys.argv)
-elif libdir not in os.environ["LD_LIBRARY_PATH"].split(';'):
-	os.environ["LD_LIBRARY_PATH"] += f";{libdir}"
-	os.execv(sys.argv[0], sys.argv)
-sys.path.append("/home/adam/volatile/btrfs/giccs/lib")
 
 from typing import	TypeVar, ParamSpec, Protocol, Self, \
 			Any, Union, Optional, Final, \
@@ -813,7 +751,8 @@ class CmdTop(CmdLineCommand): # {{{
 			print("Interrupted.", file=sys.stderr)
 			raise
 		except (FatalError, UserError,
-				Globber.MatchError, FileNotFoundError,
+				Globber.MatchError,
+				FileNotFoundError, FileExistsError,
 				NotADirectoryError, IsADirectoryError) as ex:
 			if self.debug:
 				# Print the backtrace when debugging.
@@ -948,7 +887,11 @@ class BucketOptions(AccountOptions): # {{{
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
 
-		self.merge_options_from_ini(args, "bucket", "bucket_labels")
+		if not isinstance(self, CmdListBuckets):
+			# Ignore the settings in the config for the
+			# "list buckets" command.
+			self.merge_options_from_ini(args, "bucket", "bucket_labels")
+
 		if args.bucket is not None:
 			self.bucket_name = args.bucket
 			bucket_labels = None
@@ -966,7 +909,7 @@ class BucketOptions(AccountOptions): # {{{
 		else:
 			bucket_labels = None
 
-		# Parse --bucket-label.
+		# Transform a list of LABEL=VALUE items into a dictionary.
 		if bucket_labels is not None:
 			self.bucket_labels = { }
 			for label in bucket_labels:
@@ -3040,8 +2983,8 @@ class MetaBlob(MetaCipher): # {{{
 			elif args.random_blob_uuid:
 				# Generate a fully random @self.blob_uuid.
 				# It is very unlikely, though possible, that
-				# the UUID won't be unique, which is highly
-				# undesirable by us.
+				# the UUID won't be unique and the server lies
+				# about it, which is highly undesirable by us.
 				self.blob_uuid = uuid.uuid4()
 			else:	# To avoid that possibility, mix in the local
 				# time. This leaks information, but the server
@@ -4252,9 +4195,17 @@ class Globber(glob2.Globber): # {{{
 class VirtualGlobber(Globber): # {{{
 	@dataclasses.dataclass
 	class DirEnt:
-		_fname_or_path: Union[str, pathlib.PurePath]
-		children: Optional[dict[str, DirEnt]] = None
-		parent: Optional[DirEnt] = None
+		# Either '/' or a single path component.  A top-level directory
+		# (as defined by is_tld()) may have either.
+		fname: str
+
+		# Either the entry's parent directory (if there is one)
+		# or the full path of its parent before the entry was made
+		# a root with make_root().
+		parent: Optional[Self | pathlib.PurePath] = None
+
+		# None if the entry is a file, otherwise it's a directory.
+		children: Optional[dict[str, Self]] = None
 
 		# Whether this entry was created on-demand by lookup().
 		volatile: bool = False
@@ -4263,30 +4214,27 @@ class VirtualGlobber(Globber): # {{{
 		obj: Any = None
 
 		@classmethod
-		def mkfile(cls, fname: str,
-	     			obj: Any = None, volatile: bool = False) \
-				-> DirEnt:
-			return cls(fname, None, obj=obj, volatile=volatile)
+		def mkroot(cls, obj: Any = None) -> Self:
+			return cls('/', children={ }, obj=obj)
 
 		@classmethod
 		def mkdir(cls, fname: Union[str, pathlib.PurePath],
 	    			obj: Any = None, volatile: bool = False) \
-				-> DirEnt:
-			return cls(fname, { }, obj=obj, volatile=volatile)
+				-> Self:
+			return cls(fname, children={ },
+					obj=obj, volatile=volatile)
 
-		@property
-		def fname(self) -> str:
-			if isinstance(self._fname_or_path, str):
-				return self._fname_or_path
-			else:	# @_fname_or_path is @self's original path()
-				# if it has been chroot()ed into.
-				return '/'
+		@classmethod
+		def mkfile(cls, fname: str,
+	     			obj: Any = None, volatile: bool = False) \
+				-> Self:
+			return cls(fname, obj=obj, volatile=volatile)
 
 		# For sorted() in __iter__().
-		def __lt__(self, other: DirEnt) -> bool:
+		def __lt__(self, other: Self) -> bool:
 			return self.fname < other.fname
 
-		def __eq__(self, other: DirEnt) -> bool:
+		def __eq__(self, other: Self) -> bool:
 			return id(self) == id(other)
 
 		def __hash__(self) -> int:
@@ -4294,7 +4242,7 @@ class VirtualGlobber(Globber): # {{{
 
 		def __repr__(self) -> str:
 			parent = self.parent
-			if parent is not None:
+			if isinstance(parent, __class__):
 				parent = "..."
 
 			children = self.children
@@ -4305,41 +4253,46 @@ class VirtualGlobber(Globber): # {{{
 				% (self.__class__.__name__, self.fname,
        					children, parent)
 
-		def path(self, relative_to: Optional[DirEnt] = None,
-	   			full_path: Optional[bool] = False) \
-				-> pathlib.PurePath:
+		def path(self, relative_to: Optional[Self] = None,
+	   			full_path: bool = False) -> pathlib.PurePath:
 			assert not full_path or relative_to is None
 
-			if isinstance(self._fname_or_path, pathlib.PurePath) \
-					and full_path:
-				# XXX verify the callers don't mutate it
-				return self._fname_or_path
-
+			prefix = CurDir
 			dent, parts = self, [ ]
 			while dent is not relative_to:
-				if dent.parent is None:
-					if relative_to is not None:
-						p1 = self.path()
-						p2 = relative_to.path()
-						raise ValueError(
-							"%s is not under %s"
-							% (p1, p2))
-
-					if full_path:
-						p = dent._fname_or_path
-						assert isinstance(
-							p, pathlib.PurePath)
-						parts += reversed(p.parts)
-					else:
-						parts.append(dent.fname)
-
-					break
-				else:
+				if not dent.is_tld():
 					parts.append(dent.fname)
+					dent = dent.parent
+					continue
 
-				dent = dent.parent
+				if relative_to is not None:
+					this_path = self.path()
+					other_path = relative_to.path()
+					raise ValueError(
+						"%s is not under %s"
+						% (this.path, other_path))
 
-			return pathlib.PurePath(*reversed(parts))
+				if dent.parent is None:
+					parts.append(dent.fname)
+					break
+
+				assert isinstance(dent.parent,
+							pathlib.PurePath)
+				if full_path:
+					parts.append(dent.fname)
+					prefix = dent.parent
+				else:
+					prefix = RootDir
+				break
+
+			return prefix / pathlib.PurePath(*reversed(parts))
+
+		def make_root(self) -> None:
+			if self.parent is None:
+				self.fname = '/'
+			elif isinstance(self.parent, __class__):
+				self.parent = self.parent.path(full_path=True)
+			self.volatile = False
 
 		def isdir(self):
 			return self.children is not None
@@ -4348,14 +4301,21 @@ class VirtualGlobber(Globber): # {{{
 			if not self.isdir():
 				raise NotADirectoryError(self.path())
 
-		def is_parent(self, parent: DirEnt) -> bool:
+		# Returns whether the entry is a top-level directory, that is
+		# its parent is None or a PurePath.
+		def is_tld(self) -> bool:
+			return not isinstance(self.parent, __class__)
+
+		# Returns whether the entry or one of its ancestors is @parent
+		# up to the nearest TLD.
+		def has_parent(self, parent: Self) -> bool:
 			dent = self
 			while True:
 				if dent is parent:
 					return True
-				dent = dent.parent
-				if dent is None:
+				elif dent.is_tld():
 					return False
+				dent = dent.parent
 
 		def __iter__(self) -> Iterator[Self]:
 			self.must_be_dir()
@@ -4365,18 +4325,19 @@ class VirtualGlobber(Globber): # {{{
 			self.must_be_dir()
 			return fname in self.children
 
-		def __getitem__(self, fname: str) -> DirEnt:
+		def __getitem__(self, fname: str) -> Self:
 			self.must_be_dir()
 			child = self.children.get(fname)
 			if child is None:
 				raise FileNotFoundError(self.path() / fname)
 			return child
 
-		def get(self, fname: str) -> Optional[DirEnt]:
+		def get(self, fname: str) -> Optional[Self]:
 			self.must_be_dir()
 			return self.children.get(fname)
 
-		def add(self, child: DirEnt) -> DirEnt:
+		def add(self, child: Self) -> Self:
+			assert child.fname != '/'
 			assert child.parent is None
 			self.must_be_dir()
 
@@ -4389,7 +4350,7 @@ class VirtualGlobber(Globber): # {{{
 
 			return child
 
-		def remove(self, child: DirEnt) -> DirEnt:
+		def remove(self, child: Self) -> Self:
 			self.must_be_dir()
 			del self.children[child.fname]
 			child.parent = None
@@ -4405,7 +4366,7 @@ class VirtualGlobber(Globber): # {{{
 			self.must_be_dir()
 			return sorted(self.children.keys())
 
-		def scan(self, include_self: bool = True) -> Iterator[DirEnt]:
+		def scan(self, include_self: bool = True) -> Iterator[Self]:
 			if include_self:
 				yield self
 			if self.isdir():
@@ -4421,23 +4382,26 @@ class VirtualGlobber(Globber): # {{{
 			dent = self
 			while dent.volatile:
 				dent.volatile = False
+				assert not dent.is_tld()
 				dent = dent.parent
 
 		# Remove this entry's branch if it's volatile.
 		def rollback(self) -> None:
 			if not self.volatile:
 				return
+			assert not self.is_tld()
 
 			child, parent = self, self.parent
 			while parent.volatile:
+				assert not parent.is_tld()
 				child, parent = parent, parent.parent
 			parent.remove(child)
 
-	root: DirEnt
-	cwd: DirEnt
+	root:	DirEnt
+	cwd:	DirEnt
 
 	def __init__(self, files: Iterable[Any]):
-		self.cwd = self.root = self.DirEnt.mkdir(RootDir)
+		self.cwd = self.root = self.DirEnt.mkroot()
 		for file in files:
 			parent = self.root
 			path = pathlib.PurePath(str(file))
@@ -4484,7 +4448,8 @@ class VirtualGlobber(Globber): # {{{
 						dent = self.DirEnt.mkfile(
 							fname, volatile=True)
 					parent.add(dent)
-			elif dent.parent is not None:
+			elif not dent.is_tld():
+				# @fname == "..", go one level up if we can.
 				dent = dent.parent
 		if must_be_dir:
 			dent.must_be_dir()
@@ -4502,15 +4467,12 @@ class VirtualGlobber(Globber): # {{{
 		dent = self.lookup(path, create)
 		dent.must_be_dir()
 
-		if not self.cwd.is_parent(dent):
+		if not self.cwd.has_parent(dent):
 			# @self.cwd is not under the new root.
 			self.cwd = dent
 		self.root = dent
 
-		# Preserve the original path for path(full_path=True)
-		# on any node in the subtree.
-		dent._fname_or_path = dent.path(full_path=True)
-		dent.parent = None
+		dent.make_root()
 
 	def listdir(self, path: str) -> list[str]:
 		return self.lookup(path).ls()
@@ -6591,9 +6553,9 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 	cmd = "ftp"
 	help = "TODO"
 
-	load_all_blobs: bool = False
-	chdir: Optional[str] = None
-	chroot: Optional[str] = None
+	load_all_blobs:	bool = False # XXX unfinished (dynamic discovery)
+	chdir:		Optional[str] = None
+	chroot:		Optional[str] = None
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
@@ -7081,6 +7043,7 @@ class CmdFTPRm(CmdExec):
 		self.what = args.what
 
 	def execute(self: _CmdFTPRm) -> None:
+		# @to_delete := list of DirEnt:s to delete
 		to_delete = [ ]
 		for match in self.remote.globs(self.what):
 			dent = self.remote.lookup(match)
@@ -7099,6 +7062,7 @@ class CmdFTPRm(CmdExec):
 				deleted.add(dent)
 
 				if not dent.isdir():
+					assert dent.obj is not None
 					if self.verbose:
 						print("Deleting %s..."
 							% dent.path())
@@ -7111,7 +7075,7 @@ class CmdFTPRm(CmdExec):
 				if top is self.remote.root:
 					# rm -rf /
 					self.remote.cwd = top
-				elif self.remote.cwd.is_parent(top):
+				elif self.remote.cwd.has_parent(top):
 					# @cwd is or is under @top.
 					self.remote.cwd = top.parent
 
@@ -7122,6 +7086,7 @@ class CmdFTPRm(CmdExec):
 				dent.parent.remove(dent)
 
 		if self.verbose:
+			print()
 			print("Deleted %d file(s) of %s."
 				% (nfiles, humanize_size(size)))
 
@@ -7221,11 +7186,28 @@ class CmdFTPPut(CmdExec):
 		cmd_ftp_put(self)
 
 def upload_file(self: _CmdFTPPut,
-		src: Union[str, os.PathLike], dst: os.PathLike) -> int:
+		src: Union[str, pathlib.PurePath], dst: pathlib.PurePath) \
+		-> int:
 	# Make @dst non-absolute, looks nicer in the GCS console.
-	blob = MetaBlob(self, str(dst.relative_to(RootDir)))
+	full_dst = self.remote.root.path(full_path=True)
+	full_dst /= dst.relative_to(RootDir)
+	blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
 
-	print(f"Uploading {src}...", end="", flush=True)
+	try:
+		self.remote.lookup(dst)
+	except FileNotFoundError:
+		src = str(src)
+		msg = f"Uploading {src}"
+
+		# @dst is absolute, @src can be either.
+		dst = str(dst)
+		if dst != src and dst != f"/{src}":
+			msg += f" as {dst}"
+
+		print(f"{msg}...", end="", flush=True)
+	else:
+		raise FileExistsError(dst)
+
 	try:
 		return upload_blob(self, blob,
 					pipeline_stdin=open(src, "rb"),
@@ -7235,20 +7217,26 @@ def upload_file(self: _CmdFTPPut,
 		self.remote.lookup(dst, create=True).commit(blob)
 
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
+	# @local := list of source paths as strings
 	if isinstance(self.parent, CmdFTPShell):
 		local = self.local.globs(map(os.path.expanduser, self.src))
 	else:
 		local = self.src
-	try:
-		local = [ (src, os.stat(src).st_mode) for src in local ]
-	except OSError as ex:
-		raise FatalError from ex
 
-	for src, mode in local:
+	# @local := [ (local path string, st_mode), ... ]
+	# Also verify that all the paths are reachable and is either a regular
+	# file or directory.
+	for i, src in enumerate(local):
+		try:
+			mode = os.stat(src).st_mode
+		except OSError as ex:
+			raise FatalError from ex
 		if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
 			raise UserError(
 				f"{src}: not a regular file or directory")
+		local[i] = (src, mode)
 
+	# @remote := the destination DirEnt (possibly created provisionally)
 	if self.dst is not None:
 		remote = self.remote.lookup(
 				self.remote.glob(self.dst,
@@ -7259,33 +7247,47 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	else:
 		remote = self.remote.cwd
 
+	# If @remote is not a directory, @local must be a single regular file.
 	if (len(local) > 1 or stat.S_ISDIR(local[0][1])) \
 			and not remote.isdir():
 		if remote.volatile:
+			# @remote was provisionally created.
 			remote.rollback()
 			raise FileNotFoundError(remote.path())
 		else:
 			raise NotADirectoryError(remote.path())
 
+	# The set of directories we've processed.  Used to protect against
+	# symlink loops.
 	seen = set() if self.follow_symlinks else None
+
+	nfiles = nbytes = 0
+	started = time.monotonic()
 	for src, mode in local:
 		if stat.S_ISREG(mode):
 			dst = remote.path()
 			if remote.isdir():
 				dst /= os.path.basename(src)
-			upload_file(self, src, dst)
+			nbytes += upload_file(self, src, dst)
+			nfiles += 1
 			continue
 
 		# @src is a directory.
 		src_top = pathlib.PurePath(src)
 		dst_top = remote.path()
 		if not remote.volatile and not self.re_baseless.search(src):
+			# put foo bar -> upload foo/* under bar/foo/*
+			# Otherwise upload foo/* under bar/*.
 			dst_top /= src_top.name
 
+		# Walk the tree of @src_top.
 		for dirpath, dirs, files in os.walk(
 				src_top, followlinks=self.follow_symlinks):
+			# Replace @src_top with @dst_top in @dirpath.
 			dirpath = pathlib.PurePath(dirpath)
 			dst_dir = dst_top / dirpath.relative_to(src_top)
+
+			# Upload the @files in a predictable order.
 			for fname in sorted(files):
 				src = dirpath / fname
 				try:
@@ -7293,6 +7295,9 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 				except OSError as ex:
 					import errno
 
+					# Skip dangling and self-referencing
+					# symlinks, and also files gone during
+					# the scan.
 					if ex.errno in (errno.ENOENT,
 		     					errno.ELOOP):
 						print(f"{ex.filename}: "
@@ -7302,13 +7307,15 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 					raise FatalError from ex
 
 				if stat.S_ISREG(mode):
-					upload_file(self, src, dst_dir / fname)
-				else:
+					nbytes += upload_file(self,
+							src, dst_dir / fname)
+					nfiles += 1
+				else:	# Skip pipes, devices etc.
 					print(f"{src}: not a regular file",
 						file=sys.stderr)
 
-			# Don't descend into @dirs we've @seen.
 			if seen is not None:
+				# Remove directories from @dirs we've @seen.
 				sbuf = os.stat(dirpath)
 				seen.add((sbuf.st_dev, sbuf.st_ino))
 
@@ -7323,7 +7330,16 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 
 				for i in remove:
 					del dirs[i]
+
+			# Traverse @dirs in a predictable order.
 			dirs.sort()
+
+	if nfiles > 1:
+		print()
+		duration = time.monotonic() - started
+		print("Uploaded %d file(s) (%s) in %s."
+			% (nfiles, humanize_size(nbytes),
+				humanize_duration(duration)))
 
 class _CmdFTPChDir(CmdFTP, CmdFTPChDir): pass
 class _CmdFTPPwd(CmdFTP, CmdFTPPwd): pass
