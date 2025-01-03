@@ -2931,6 +2931,9 @@ class MetaMAC: # {{{
 class MetaBlob(MetaCipher): # {{{
 	T = TypeVar("MetaBlobType", bound=Self)
 
+	# Classes to try in create_best_from_gcs().
+	subclasses: list[T] = [ ]
+
 	gcs_blob: google.cloud.storage.Blob
 
 	# The @path with which the object was created the first time.
@@ -2954,6 +2957,11 @@ class MetaBlob(MetaCipher): # {{{
 	padding: int = 0
 	padding_seed: Optional[bytes] = None
 
+	@classmethod
+	def register_subclass(cls, subclass: T):
+		cls.subclasses.append(subclass)
+		return subclass
+
 	@property
 	def name(self) -> str:
 		return self.gcs_blob.name
@@ -2966,6 +2974,8 @@ class MetaBlob(MetaCipher): # {{{
 	def volume(self) -> str:
 		return self.args.volume
 
+	# Can an instance of @cls represent a blob with these @metadata?
+	# Should be overridden by subclasses.
 	@classmethod
 	def isa(cls, metadata: Optional[dict[str, Any]]) -> bool:
 		return True
@@ -3020,78 +3030,78 @@ class MetaBlob(MetaCipher): # {{{
 		self.init_metadata(path, **kw)
 		self.update_metadata()
 
-	# Create a MetaBlob from and existing @gcs_blob.  @blob_uuid and
-	# @metadata don't have to be provided.  If @classes is not empty,
-	# this method may call itself possibly with those arguments filled in.
+	# Try to create a MetaBlob or a subclass thereof and set it up
+	# to represent @gcs_blob.
 	@classmethod
-	def init_from_gcs(cls, args: EncryptedBucketOptions,
-				gcs_blob: google.cloud.storage.Blob,
-				classes: Optional[Sequence[type]] = None,
-		   		blob_uuid: Optional[uuid.UUID] = None,
-		   		metadata: Optional[dict[str, Any]] = None) \
-				-> Optional[T]:
-		# The caller might not know in advance exactly which of the
-		# @classes represent the @gcs_blob.  Let's try them all.
-		# If metadata is encrypted, we decrypt it first below, then
-		# run the same cycle.
-		if classes and not args.encrypt_metadata:
-			for klass in classes:
-				if not klass.isa(gcs_blob.metadata):
-					continue
-				elif klass is cls:
-					break
-				return klass.init_from_gcs(args, gcs_blob)
-			else:	# None of them.
-				return None
-
-		self = super().__new__(cls)
-		super().__init__(self, args)
-
-		self.gcs_blob = gcs_blob
-		if args.encrypt_metadata:
-			self.init_blob_uuid(blob_uuid)
-			if metadata is None:
-				metadata = self.init_encrypted_metadata()
-
-			# Do the same as above.
-			if classes:
-				for klass in classes:
-					if not klass.isa(metadata):
-						continue
-					elif klass is cls:
-						break
-
-					# Reuse the decrypted @metadata.
-					return klass.init_from_gcs(
-						args, gcs_blob,
-						blob_uuid=self.blob_uuid,
-						metadata=metadata)
-				else:
-					return None
-		else:	# @metadata is stored directly in the blob's metadata.
-			assert blob_uuid is None and metadata is None
-			metadata = self.gcs_blob.metadata
+	def create_from_gcs_with_metadata(
+			cls, args: EncryptedBucketOptions,
+			gcs_blob: google.cloud.storage.Blob,
+			blob_uuid: Optional[uuid.UUID] = None,
+			metadata: Optional[dict[str, Any]] = None) \
+			-> tuple[
+				Optional[T],
+				Optional[uuid.UUID],
+				Optional[dict[str, Any]]]:
+		self, blob_uuid, metadata = cls.create_self(
+			args, gcs_blob, blob_uuid, metadata)
+		if self is None:
+			return self, blob_uuid, metadata
 
 		self.load_metadata(metadata)
-
 		if self.has_signature():
 			# We can only verify the signature once all metadata
 			# has been loaded.
-			if not self.calc_signature().verify(
-					self.load_metadatum(
-						metadata, "signature", bytes)):
+			signature = self.load_metadatum(metadata, "signature",
+							bytes)
+			if not self.calc_signature().verify(signature):
 				raise SecurityError(
 					f"{self.name}: metadata/signature "
 					"mismatch")
-
 		else:	# Assert that there's no signature in @metadata,
 			# otherwise there's a possible misconfiguration.
 			self.has_metadatum(metadata, "signature", False)
 
 		if self.load_metadatum(metadata, "volume") != self.volume:
-			return None
+			return None, blob_uuid, metadata
 
-		return self
+		return self, blob_uuid, metadata
+
+	# Return an instance of @cls if it can represent this @gcs_blob.
+	# If @blob_uuid and @metadata are not provided, they are obtained
+	# from @gcs_blob and returned for future reuse.
+	@classmethod
+	def create_self(cls, args: EncryptedBucketOptions,
+			gcs_blob: google.cloud.storage.Blob,
+			blob_uuid: Optional[uuid.UUID] = None,
+			metadata: Optional[dict[str, Any]] = None) \
+			-> tuple[
+				Optional[T],
+				Optional[uuid.UUID],
+				Optional[dict[str, Any]]]:
+		if not args.encrypt_metadata:
+			assert blob_uuid is None
+			if metadata is None:
+				# @metadata is stored directly
+				# with the @gcs_blob.
+				metadata = gcs_blob.metadata
+			else:
+				assert metadata == gcs_blob.metadata
+			if not cls.isa(metadata):
+				return None, blob_uuid, metadata
+
+		self = super().__new__(cls)
+		super().__init__(self, args)
+		self.gcs_blob = gcs_blob
+
+		if args.encrypt_metadata:
+			self.init_blob_uuid(blob_uuid)
+			if metadata is None:
+				metadata = self.init_encrypted_metadata()
+
+			if not self.isa(metadata):
+				return None, self.blob_uuid, metadata
+
+		return self, self.blob_uuid, metadata
 
 	# Initialize @self.blob_uuid either from @blob_uuid or @self.name.
 	def init_blob_uuid(self, blob_uuid: Optional[uuid.UUID] = None) \
@@ -3135,11 +3145,50 @@ class MetaBlob(MetaCipher): # {{{
 
 		return metadata
 
+	# Return an instance of MetaBlob or a subclass thereof that represents
+	# @gcs_blob the best.
+	@classmethod
+	def create_best_from_gcs(
+			cls, args: EncryptedBucketOptions,
+			gcs_blob: google.cloud.storage.Blob,
+			subclasses: Union[
+				None, type[T], Iterable[type[T]]
+			] = None) -> Optional[T]:
+		if subclasses is None:
+			# Choose from the registered subclasses.
+			subclasses = cls.subclasses
+		elif issubclass(subclasses, __class__):
+			# Only one subclass was provided.
+			subclasses = (subclasses,)
+
+		blob_uuid = metadata = None
+		for subclass in subclasses:
+			self, blob_uuid, metadata = \
+				subclass.create_from_gcs_with_metadata(
+					args, gcs_blob, blob_uuid, metadata)
+			if self is not None:
+				return self
+
+		# Don't try MetaBlob implicitly if @subclasses were provided.
+		if subclasses is not cls.subclasses:
+			return None
+		return __class__.create_from_gcs_with_metadata(
+				args, gcs_blob, blob_uuid, metadata)[0]
+
+	# Return an instance of @cls if it can represent this @gcs_blob.
+	# Use it if you want to create an object from a particular class.
+	@classmethod
+	def create_from_gcs(
+			cls, args: EncryptedBucketOptions,
+			gcs_blob: google.cloud.storage.Blob) -> Optional[T]:
+		return cls.create_from_gcs_with_metadata(args, gcs_blob)[0]
+
 	# Called by __init__() to initialize metadata fields.
 	def init_metadata(self, path: str, **kw) -> None:
 		self.blob_path = path
 
-	# Called by init_from_gcs() to restore metadata fields from @metadata.
+	# Called by create_from_gcs_with_metadata() to restore metadata fields
+	# from @metadata.
 	def load_metadata(self, metadata: Optional[dict[str, Any]]) -> None:
 		# Don't load @metadata["volume"], we already have our
 		# expectation in @self.args.volume.
@@ -3360,6 +3409,7 @@ class MetaBlob(MetaCipher): # {{{
 # }}}
 
 # A MetaBlob of a Backup.
+@MetaBlob.register_subclass
 class BackupBlob(MetaBlob): # {{{
 	@enum.unique
 	class PayloadType(enum.IntEnum):
@@ -4618,20 +4668,14 @@ def discover_remote_blobs(args: EncryptedBucketOptions,
 	if prefix is not None:
 		prefix += '/'
 
-	if expected is None:
-		# We may create any subclass of MetaBlob.
-		expected = (BackupBlob, MetaBlob)
-	elif issubclass(expected, MetaBlob):
-		expected = (expected,)
-
 	for blob in args.bucket.list_blobs(prefix=prefix):
 		if args.encrypt_metadata and args.prefix is None \
 				and '/' in blob.name:
 			# Skip blobs belonging to a non-empty prefix.
 			continue
 
-		if (blob := MetaBlob.init_from_gcs(args, blob, expected)) \
-				is not None:
+		blob = MetaBlob.create_best_from_gcs(args, blob, expected)
+		if blob is not None:
 			yield blob
 
 # Transfer data from @inp to @out as fast as possible, optionally writing
