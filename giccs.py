@@ -3173,7 +3173,9 @@ class MetaBlob(MetaCipher): # {{{
 		self.file_size = self.load_metadatum(metadata, "file_size",
 							int, expected=False)
 
-		self.padding = self.load_metadatum(metadata, "padding", int)
+		self.padding = self.load_metadatum(
+					metadata, "padding",
+					int, expected=False) or 0
 		self.padding_seed = self.load_metadatum(
 					metadata, "padding_seed", bytes,
 					expected=self.padding > 0)
@@ -3195,7 +3197,7 @@ class MetaBlob(MetaCipher): # {{{
 		self.save_metadatum(metadata, "blob_hash", self.blob_hash)
 		self.save_metadatum(metadata, "file_size", self.file_size)
 
-		self.save_metadatum(metadata, "padding", self.padding)
+		self.save_metadatum(metadata, "padding", self.padding or None)
 		self.save_metadatum(metadata, "padding_seed", self.padding_seed)
 
 		if self.has_signature():
