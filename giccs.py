@@ -5474,7 +5474,8 @@ def cmd_list_remote(args: CmdListRemote) -> None:
 				print("", blob.payload_type.field(),
 					time.strftime("%Y-%m-%d %H:%M:%S",
 						time.localtime(created)),
-	  				SizeAccumulator(blob).get(), blob.name,
+					SizeAccumulator(blob).get(),
+					args.without_prefix(blob.name),
 					sep="\t")
 
 	if args.verbose and nbackups > 1:
