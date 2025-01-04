@@ -4631,7 +4631,7 @@ class GCSGlobber(VirtualGlobber):
 				delimiter='/',
 				include_folders_as_prefixes=True)
 		for blob in lst:
-			blob = MetaBlob.create_from_gcs(self.args, blob)
+			blob = MetaBlob.create_best_from_gcs(self.args, blob)
 			if blob is None:
 				continue
 
@@ -4655,7 +4655,7 @@ class GCSGlobber(VirtualGlobber):
 		root_path = self.root.path(full_path=True).relative_to(RootDir)
 		for blob in self.args.bucket.list_blobs(
 				prefix=self.gcs_prefix(dent)):
-			blob = MetaBlob.create_from_gcs(self.args, blob)
+			blob = MetaBlob.create_best_from_gcs(self.args, blob)
 			if blob is None:
 				continue
 
