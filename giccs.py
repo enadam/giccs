@@ -6737,6 +6737,7 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdFTPDir(self), CmdFTPDu(self), CmdFTPRm(self),
+			CmdFTPCat(self), CmdFTPPage(self),
 			CmdFTPGet(self), CmdFTPPut(self))
 
 	# Like shlex.split(), split a line of input into tokens,
@@ -6876,6 +6877,7 @@ class CmdFTPShell(CmdTop):
 		 		CmdFTPChDir(self), CmdFTPPwd(self),
 		 		CmdFTPDir(self), CmdFTPPDir(self),
 		 		CmdFTPDu(self), CmdFTPRm(self),
+		 		CmdFTPCat(self), CmdFTPPage(self),
 		 		CmdFTPGet(self), CmdFTPPut(self))
 		return subcommands
 
@@ -7243,6 +7245,57 @@ class CmdFTPRm(CmdExec):
 			print()
 			print("Deleted %d file(s) of %s."
 				% (nfiles, humanize_size(size)))
+
+class CmdFTPCat(CmdExec):
+	cmd = "cat"
+	help = "TODO"
+
+	what: list[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("what", nargs='+')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.what = args.what
+
+	def files_to_cat(self) -> VirtualGlobber.DirEnt:
+		# Prevent the Progressometer from messing up the output.
+		with self.override_flags(progress=None):
+			for match in self.remote.globs(self.what):
+				src = self.remote.lookup(match)
+				if src.isdir():
+					raise IsADirectoryError(src.path())
+				yield src
+
+	def execute(self) -> None:
+		# Just pass the file contents through, it could be binary.
+		output = os.fdopen(sys.stdout.fileno(), "wb", closefd=False)
+		for src in self.files_to_cat():
+			download_blob(self, src.obj, pipeline_stdout=output)
+
+class CmdFTPPage(CmdFTPCat):
+	cmd = ("page", "less")
+	help = "TODO"
+
+	def execute(self) -> None:
+		for src in self.files_to_cat():
+			# If less(1) is the pager, show the file name
+			# in the status line.
+			env = os.environ.copy()
+			lessopt = "-Ps" + str(src.path())
+			if "LESS" in env:
+				env["LESS"] += ' ' + lessopt
+			else:
+				env["LESS"] = lessopt
+
+			pager = subprocess.Popen(
+				("sensible-pager",), env=env,
+				stdin=subprocess.PIPE)
+			download_blob(self, src.obj, pipeline_stdout=pager.stdin)
+			pager.stdin.close()
+			pager.wait()
 
 class CmdFTPGet(CmdExec):
 	cmd = "get"
