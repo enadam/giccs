@@ -4247,17 +4247,16 @@ class Globber(glob2.Globber): # {{{
 class VirtualGlobber(Globber): # {{{
 	@dataclasses.dataclass
 	class DirEnt:
-		# Either '/' or a single path component.  A top-level directory
-		# (as defined by is_tld()) may have either.
+		globber: VirtualGlobber
+
+		# '/' if the entry is the original VirtualGlobber.root,
+		# or a single path component.
 		fname: str
 
-		# Either the entry's parent directory (if there is one)
-		# or the full path of its parent before the entry was made
-		# a root with make_root().
+		# None if the entry is the original VirtualGlobber.root,
+		# a PurePath of the entry's former parent if it was made
+		# a root with make_root(), or the parent of a non-TLD.
 		parent: Optional[Self | pathlib.PurePath] = None
-
-		# None if the entry is a file, otherwise it's a directory.
-		children: Optional[dict[str, Self]] = None
 
 		# Whether this entry was created on-demand by lookup().
 		volatile: bool = False
@@ -4266,21 +4265,38 @@ class VirtualGlobber(Globber): # {{{
 		obj: Any = None
 
 		@classmethod
-		def mkroot(cls, obj: Any = None) -> Self:
-			return cls('/', children={ }, obj=obj)
+		def mkroot(cls, globber: VirtualGlobber, obj: Any = None) \
+				-> Self:
+			return cls(globber, '/', obj=obj)
 
 		@classmethod
-		def mkdir(cls, fname: Union[str, pathlib.PurePath],
+		def mkdir(cls, globber: VirtualGlobber, fname: str,
+				children: Optional[dict[str, Self]] = None,
 	    			obj: Any = None, volatile: bool = False) \
 				-> Self:
-			return cls(fname, children={ },
-					obj=obj, volatile=volatile)
+			self = cls(globber, fname, obj=obj, volatile=volatile)
+			if children is not None:
+				self.children = children
+			return self
 
 		@classmethod
-		def mkfile(cls, fname: str,
+		def mkfile(cls, globber: VirtualGlobber, fname: str,
 	     			obj: Any = None, volatile: bool = False) \
 				-> Self:
-			return cls(fname, obj=obj, volatile=volatile)
+			self = cls(globber, fname, obj=obj, volatile=volatile)
+
+			# Prevents the children() method from ever being called
+			# and makes isdir() return False.
+			self.children = None
+
+			return self
+
+		@functools.cached_property
+		def children(self) -> dict[str, Self]:
+			# Set the property to avoid infinite recursion.
+			self.children = { }
+			self.globber.load_children(self)
+			return self.children
 
 		# For sorted() in __iter__().
 		def __lt__(self, other: Self) -> bool:
@@ -4296,15 +4312,15 @@ class VirtualGlobber(Globber): # {{{
 			parent = self.parent
 			if isinstance(parent, __class__):
 				parent = "..."
-
-			children = self.children
-			if children is not None:
-				children = "..."
+			children = "..." if self.isdir() else None
 
 			return "%s(fname=%r, children=%s, parent=%s)" \
 				% (self.__class__.__name__, self.fname,
        					children, parent)
 
+		# Return the DirEnt's path relative to another path,
+		# or as an absolute path, either from the VirtualGlobber's
+		# current @root or the original root if @full_path is True.
 		def path(self, relative_to: Optional[Self] = None,
 	   			full_path: bool = False) -> pathlib.PurePath:
 			assert not full_path or relative_to is None
@@ -4341,20 +4357,28 @@ class VirtualGlobber(Globber): # {{{
 
 		def make_root(self) -> None:
 			if self.parent is None:
-				self.fname = '/'
+				assert self.fname == '/'
 			elif isinstance(self.parent, __class__):
 				self.parent = self.parent.path(full_path=True)
 			self.volatile = False
 
+		# Whether @self.globber.load_children() or load_subtree()
+		# has been called for this DirEnt.
+		def children_loaded(self):
+			return "children" in self.__dict__
+
 		def isdir(self):
-			return self.children is not None
+			# Need to be careful because @children is a cached
+			# property.
+			return not self.children_loaded() \
+				or self.children is not None
 
 		def must_be_dir(self) -> None:
 			if not self.isdir():
 				raise NotADirectoryError(self.path())
 
-		# Returns whether the entry is a top-level directory, that is
-		# its parent is None or a PurePath.
+		# Returns whether the entry is the original VirtualGlobber.root
+		# (@parent is None) or has been make_root().
 		def is_tld(self) -> bool:
 			return not isinstance(self.parent, __class__)
 
@@ -4389,6 +4413,7 @@ class VirtualGlobber(Globber): # {{{
 			return self.children.get(fname)
 
 		def add(self, child: Self) -> Self:
+			assert child.globber is self.globber
 			assert child.fname != '/'
 			assert child.parent is None
 			self.must_be_dir()
@@ -4418,10 +4443,26 @@ class VirtualGlobber(Globber): # {{{
 			self.must_be_dir()
 			return sorted(self.children.keys())
 
+		def load_subtree(self) -> None:
+			self.must_be_dir()
+
+			if not self.children_loaded():
+				# Load all our descendents at once.
+				self.children = { }
+				self.globber.load_subtree(self)
+				return
+
+			# Make sure all our descendents are loaded as well.
+			for child in self:
+				if child.isdir():
+					child.load_subtree()
+
 		def scan(self, include_self: bool = True) -> Iterator[Self]:
 			if include_self:
 				yield self
+
 			if self.isdir():
+				self.load_subtree()
 				for child in self:
 					yield from child.scan()
 
@@ -4452,19 +4493,29 @@ class VirtualGlobber(Globber): # {{{
 	root:	DirEnt
 	cwd:	DirEnt
 
-	def __init__(self, files: Iterable[Any]):
-		self.cwd = self.root = self.DirEnt.mkroot()
+	def __init__(self, files: Iterable[Any] = ()):
+		self.cwd = self.root = self.DirEnt.mkroot(self)
 		for file in files:
-			parent = self.root
-			path = pathlib.PurePath(str(file))
-			start = 1 if path.is_absolute() else 0
-			for fname in path.parts[start:-1]:
-				child = parent.get(fname)
-				if child is None:
-					child = self.DirEnt.mkdir(fname)
-					parent.add(child)
-				parent = child
-			parent.add(self.DirEnt.mkfile(path.parts[-1], file))
+			self.add_file(pathlib.PurePath(str(file)), file)
+
+	def add_file(self, path: pathlib.PurePath, obj: Any = None) -> None:
+		parent = self.root
+		start = 1 if path.is_absolute() else 0
+		for fname in path.parts[start:-1]:
+			child = parent.get(fname)
+			if child is None:
+				child = self.DirEnt.mkdir(self, fname, { })
+				parent.add(child)
+			parent = child
+		parent.add(self.DirEnt.mkfile(self, path.name, obj))
+
+	# Called by DirEnt.children().
+	def load_children(self, dent: DirEnt) -> None:
+		pass
+
+	# Called by DirEnt.scan().
+	def load_subtree(self, dent: DirEnt) -> None:
+		self.load_children(dent)
 
 	def lookup(self, path: Union[str, pathlib.PurePath],
 			create: bool = False) -> DirEnt:
@@ -4495,10 +4546,13 @@ class VirtualGlobber(Globber): # {{{
 					parent = dent
 					if i < len(parts) - 1 or must_be_dir:
 						dent = self.DirEnt.mkdir(
-							fname, volatile=True)
+								self, fname,
+								children={ },
+								volatile=True)
 					else:
 						dent = self.DirEnt.mkfile(
-							fname, volatile=True)
+								self, fname,
+								volatile=True)
 					parent.add(dent)
 			elif not dent.is_tld():
 				# @fname == "..", go one level up if we can.
@@ -4545,6 +4599,69 @@ class VirtualGlobber(Globber): # {{{
 			return False
 		else:
 			return True
+
+# A globber which supports incremental loading of blobs from a bucket.
+class GCSGlobber(VirtualGlobber):
+	args: EncryptedBucketOptions
+
+	def __init__(self, args: EncryptedBucketOptions):
+		super().__init__()
+		self.args = args
+
+	# Return a prefix that matches all blobs under @dent.
+	def gcs_prefix(self, dent: VirtualGlobber.DirEnt) -> Optional[str]:
+		path = dent.path(full_path=True)
+		if self.args.prefix is not None or path != RootDir:
+			path = path.relative_to(RootDir)
+			if self.args.prefix is not None:
+				path = self.args.prefix / path
+			return f'{path}/'
+		else:	# path is RootDir and there's no args.prefix
+			return None
+
+	def load_children(self, dent: VirtualGlobber.DirEnt) -> None:
+		if self.args.encrypt_metadata:
+			# Reconstruct the whole hierarchy from the files
+			# directly under @dent.
+			self.load_subtree(dent)
+			return
+
+		lst = self.args.bucket.list_blobs(
+				prefix=self.gcs_prefix(dent),
+				delimiter='/',
+				include_folders_as_prefixes=True)
+		for blob in lst:
+			blob = MetaBlob.create_from_gcs(self.args, blob)
+			if blob is None:
+				continue
+
+			fname = pathlib.PurePath(blob.blob_path).name
+			dent.add(self.DirEnt.mkfile(self, fname, blob))
+
+		for prefix in lst.prefixes:
+			fname = pathlib.PurePath(prefix).name
+			dent.add(self.DirEnt.mkdir(self, fname))
+
+	def load_subtree(self, dent: VirtualGlobber.DirEnt) -> None:
+		if self.args.encrypt_metadata:
+			# We're expected to be called only once,
+			# to load all the blobs directly under the
+			# GCS prefix.
+			assert dent == self.root
+			assert dent.fname == '/'
+
+		# Trim @root_path from @blob.blob_path in case we've
+		# changed root directory.
+		root_path = self.root.path(full_path=True).relative_to(RootDir)
+		for blob in self.args.bucket.list_blobs(
+				prefix=self.gcs_prefix(dent)):
+			blob = MetaBlob.create_from_gcs(self.args, blob)
+			if blob is None:
+				continue
+
+			path = pathlib.PurePath(blob.blob_path) \
+					.relative_to(root_path)
+			self.add_file(path, blob)
 # }}}
 
 # Utilities {{{
@@ -4659,25 +4776,6 @@ def woulda(args: DryRunOptions, verb: str) -> str:
 
 
 # Blob-related functions {{{
-def discover_remote_blobs(args: EncryptedBucketOptions,
-				expected: Union[
-					None, type[MetaBlob.T],
-					Sequence[type[MetaBlob.T]]] = None) \
-				-> Iterable[MetaBlob.T]:
-	prefix = args.prefix
-	if prefix is not None:
-		prefix += '/'
-
-	for blob in args.bucket.list_blobs(prefix=prefix):
-		if args.encrypt_metadata and args.prefix is None \
-				and '/' in blob.name:
-			# Skip blobs belonging to a non-empty prefix.
-			continue
-
-		blob = MetaBlob.create_best_from_gcs(args, blob, expected)
-		if blob is not None:
-			yield blob
-
 # Transfer data from @inp to @out as fast as possible, optionally writing
 # the number of bytes transferred to the @counter.
 def cat(inp: Optional[int] = None, out: Optional[int] = None,
@@ -5118,9 +5216,17 @@ def discover_local_snapshots(path: str) -> Snapshots:
 # Go through the blobs of a GCS bucket and create Backup:s from them.
 def discover_remote_backups(args: EncryptedBucketOptions,
 				keep_index_only: bool = False) -> Backups:
+	prefix = args.prefix
+	if prefix is not None:
+		prefix += '/'
+
 	by_name = { }
 	by_uuid = Backups()
-	for blob in discover_remote_blobs(args, BackupBlob):
+	for blob in args.bucket.list_blobs(prefix=prefix):
+		blob = BackupBlob.create_from_gcs(args, blob)
+		if blob is None:
+			continue
+
 		try:
 			backup = by_uuid[blob.snapshot_uuid]
 		except KeyError:
@@ -6565,7 +6671,7 @@ class FTPClient:
 	def remote(self):
 		assert isinstance(self, CmdFTP)
 
-		remote = VirtualGlobber(discover_remote_blobs(self))
+		remote = GCSGlobber(self)
 		if self.chdir is not None:
 			remote.chdir(self.chdir)
 		elif self.chroot is not None:
@@ -6980,6 +7086,8 @@ class CmdFTPDir(CmdExec):
 
 		self.print_files(files)
 		for i, (remote, dent) in enumerate(dirs):
+			if self.recursive and dent.isdir():
+				dent.load_subtree()
 			self.print_dir(remote, dent,
 					divisor=bool(files or i > 0),
 					header=bool(files or len(dirs) > 1

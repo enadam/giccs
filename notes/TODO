@@ -16,14 +16,23 @@ deprecate index list/delete (in favor of ftp commands)
 	we could also simplify delete remote
 CmdFTPGet: --no-keep-mtime
 
-dynamic discovery
+caching:
+	single file in the root dir
+	two caches:
+		directory structure:
+			make DirEnt.obj dynamic
+			built into GCSGlobber
+		Backup:s:
+			snapshot name and uuid
+			make BackupBlob:s dynamic
+
 get, put
 put: upload from stdin/command
 cat [-c <bytes>], page?
 mkdir, rmdir
 rm -r: delete empty folders
 mv [--dir/--fname] (rename/move blob, rename folder)
-tabbing?
+tab-completion?
 
 overwrite:
   * skip
