@@ -5860,7 +5860,7 @@ def cmd_get_index(args: CmdGetIndex) -> None:
 		print()
 
 		try:
-			output = open(args.output, 'w')
+			output = open(args.output, 'wb')
 		except IsADirectoryError:
 			output_dir = args.output
 	else:	# sys.stdout is text, but the index could be binary.
@@ -5883,7 +5883,7 @@ def cmd_get_index(args: CmdGetIndex) -> None:
 				output_fname = f"{backup.snapshot_name}.lst"
 				output_path = \
 					os.path.join(output_dir, output_fname)
-				output = open(output_path, 'w')
+				output = open(output_path, 'wb')
 
 			with args.override_flags(
 					decompressor=args.index_decompressor):
