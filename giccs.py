@@ -4779,7 +4779,9 @@ def woulda(args: DryRunOptions, verb: str) -> str:
 # Transfer data from @inp to @out as fast as possible, optionally writing
 # the number of bytes transferred to the @counter.
 def cat(inp: Optional[int] = None, out: Optional[int] = None,
-		counter: Optional[BinaryIO] = None) -> None:
+		counter: Optional[
+				multiprocessing.connection.Connection
+			] = None) -> None:
 	update_comm("cat")
 
 	if inp is None:
@@ -4805,16 +4807,15 @@ def cat(inp: Optional[int] = None, out: Optional[int] = None,
 		total += n
 
 	if counter is not None:
-		# For some reason it's not flushed automatically
-		# when the process finishes.
-		counter.write(total.to_bytes(8))
-		counter.flush()
+		counter.send(total)
 
 # Write @blob.blob_uuid as binary to @sys.stdout, then optionally shovel
 # stdin to stdout until EOF.
 def write_external_encryption_header(blob: MetaBlob, then_cat: bool = False) \
 		-> Callable[..., None]:
-	def write_header(counter: Optional[BinaryIO] = None) -> None:
+	def write_header(counter: Optional[
+				multiprocessing.connection.Connection
+			] = None) -> None:
 		# Redirect this function's stdout to stderr, so it doesn't
 		# go into the pipeline by accident.
 		stdout, sys.stdout = sys.stdout, sys.stderr
@@ -4902,9 +4903,8 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 		if isinstance(bytes_in_counter, dict):
 			# Create a pipe through which @bytes_in_counter
 			# can tell us the number of bytes transferred.
-			counter_r, counter_w = os.pipe()
-			counter_r = os.fdopen(counter_r, "rb")
-			counter_w = os.fdopen(counter_w, "wb")
+			counter_r, counter_w = \
+				multiprocessing.Pipe(duplex=False)
 
 			if "executable" not in bytes_in_counter:
 				bytes_in_counter["executable"] = cat
@@ -5017,10 +5017,10 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 		elif isinstance(bytes_in_counter, int):
 			bytes_in = bytes_in_counter
 		else:	# This is written by cat().
-			assert isinstance(bytes_in_counter, io.BufferedReader)
-			bytes_in = bytes_in_counter.read()
-			assert len(bytes_in) == 8
-			bytes_in = int.from_bytes(bytes_in)
+			assert isinstance(bytes_in_counter,
+				multiprocessing.connection.Connection)
+			bytes_in = bytes_in_counter.recv()
+			assert isinstance(bytes_in, int)
 
 			# Discount the header written by write_header().
 			if isinstance(command, dict) \
