@@ -4799,6 +4799,7 @@ def woulda(args: DryRunOptions, verb: str) -> str:
 # Transfer data from @inp to @out as fast as possible, optionally writing
 # the number of bytes transferred to the @counter.
 def cat(inp: Optional[int] = None, out: Optional[int] = None,
+		maxbytes: Optional[int] = None,
 		counter: Optional[
 				multiprocessing.connection.Connection
 			] = None) -> None:
@@ -4823,8 +4824,18 @@ def cat(inp: Optional[int] = None, out: Optional[int] = None,
 
 	# splice(2) has been measured to be marginally faster than dd(1).
 	total = 0
-	while (n := os.splice(inp, out, maxbuf)) > 0:
+	while maxbytes is None or total < maxbytes:
+		if maxbytes is None or maxbuf <= maxbytes - total:
+			n = maxbuf
+		else:
+			n = maxbytes - total
+
+		if (n := os.splice(inp, out, n)) <= 0:
+			break
+
 		total += n
+		if maxbytes is not None:
+			assert total <= maxbytes
 
 	if counter is not None:
 		counter.send(total)
