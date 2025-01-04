@@ -4816,11 +4816,9 @@ def cat(inp: Optional[int] = None, out: Optional[int] = None,
 	except (OSError, ValueError):
 		maxbuf = 1024*1024
 
-	try:
-		fcntl.fcntl(inp, fcntl.F_SETPIPE_SZ, maxbuf)
-		fcntl.fcntl(out, fcntl.F_SETPIPE_SZ, maxbuf)
-	except OSError:
-		pass
+	for fd in (inp, out):
+		try: fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, maxbuf)
+		except OSError: pass
 
 	# splice(2) has been measured to be marginally faster than dd(1).
 	total = 0
@@ -7271,14 +7269,19 @@ class CmdFTPCat(CmdExec):
 	cmd = "cat"
 	help = "TODO"
 
+	head: Optional[int] = None
 	what: list[str]
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
+
+		self.sections["operation"].add_int_argument("--head", "-c")
 		self.sections["positional"].add_argument("what", nargs='+')
 
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
+
+		self.head = args.head
 		self.what = args.what
 
 	def files_to_cat(self) -> VirtualGlobber.DirEnt:
@@ -7290,11 +7293,48 @@ class CmdFTPCat(CmdExec):
 					raise IsADirectoryError(src.path())
 				yield src
 
-	def execute(self) -> None:
-		# Just pass the file contents through, it could be binary.
-		output = os.fdopen(sys.stdout.fileno(), "wb", closefd=False)
-		for src in self.files_to_cat():
+	def cat(self, src: VirtualGlobber.DirEnt,
+			output: Optional[Pipeline.StdioType] = None) -> None:
+		if self.head is None:
+			# Send all of @src to @output.
+			assert output is not None
 			download_blob(self, src.obj, pipeline_stdout=output)
+			return
+
+		# Add cat(maxbytes=self.head) to the download Pipeline.
+		cmd = { "executable": cat }
+		cnt_r, cnt_w = Pipeline.Subprocess.add_pipe(cmd)
+		cmd["args"] = { "maxbytes": self.head, "counter": cnt_w }
+
+		# Since cat() won't read all the downloaded bytes,
+		# a BrokenPipeError will be raised even on success.
+		# Use the pipe created above to determine whether
+		# this is the case.
+		try:
+			download_blob(self, src.obj, command=cmd,
+					pipeline_stdout=output)
+		except FatalError as ex:
+			isok = False
+			if isinstance(ex.__cause__, BrokenPipeError):
+				try:	n = cnt_r.recv()
+				except:	pass
+				else:	# cat() finished successfully.
+					assert n <= self.head
+					isok = True
+			if not isok:
+				raise
+
+	def execute(self) -> None:
+		if self.head is None:
+			# Just pass the file contents through,
+			# it could be binary.
+			output = os.fdopen(sys.stdout.fileno(), "wb",
+						closefd=False)
+		else:
+			output = None
+
+		for src in self.files_to_cat():
+			self.cat(src, output)
 
 class CmdFTPPage(CmdFTPCat):
 	cmd = ("page", "less")
@@ -7314,7 +7354,8 @@ class CmdFTPPage(CmdFTPCat):
 			pager = subprocess.Popen(
 				("sensible-pager",), env=env,
 				stdin=subprocess.PIPE)
-			download_blob(self, src.obj, pipeline_stdout=pager.stdin)
+			self.cat(src, pager.stdin)
+
 			pager.stdin.close()
 			pager.wait()
 

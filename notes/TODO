@@ -28,7 +28,6 @@ caching:
 
 get, put
 put: upload from stdin/command
-cat [-c <bytes>], page?
 mkdir, rmdir
 rm -r: delete empty folders
 mv [--dir/--fname] (rename/move blob, rename folder)
