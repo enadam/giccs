@@ -3924,6 +3924,26 @@ class Pipeline: # {{{
 	class Subprocess(SubprocessIface): # {{{
 		wrapped: multiprocessing.Process
 
+		# Create a multiprocessing.Pipe and add it to the Subprocess
+		# descriptor @cmd.
+		@staticmethod
+		def add_pipe(cmd: dict[str, Any], duplex=False) \
+				-> tuple[
+					multiprocessing.connection.Connection,
+					multiprocessing.connection.Connection,
+				]:
+			conn_r, conn_w = multiprocessing.Pipe(duplex=duplex)
+
+			# Close the reader side of the pipe in the child.
+			assert "preexec_fn" not in cmd
+			cmd["preexec_fn"] = lambda: conn_r.close()
+
+			# Close the writer side in the parent after forking.
+			assert "postexec_fn" not in cmd
+			cmd["postexec_fn"] = lambda: conn_w.close()
+
+			return conn_r, conn_w
+
 		def __init__(self,
 				executable: Callable[..., None],
 				name: Optional[str] = None,
@@ -4904,23 +4924,13 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			# Create a pipe through which @bytes_in_counter
 			# can tell us the number of bytes transferred.
 			counter_r, counter_w = \
-				multiprocessing.Pipe(duplex=False)
+				Pipeline.Subprocess.add_pipe(bytes_in_counter)
 
 			if "executable" not in bytes_in_counter:
 				bytes_in_counter["executable"] = cat
 
 			assert "args" not in bytes_in_counter
 			bytes_in_counter["args"] = { "counter": counter_w }
-
-			# Close the reader side of the pipe in the child.
-			assert "preexec_fn" not in bytes_in_counter
-			bytes_in_counter["preexec_fn"] = \
-				lambda: counter_r.close()
-
-			# Close the writer side in the parent after forking.
-			assert "postexec_fn" not in bytes_in_counter
-			bytes_in_counter["postexec_fn"] = \
-				lambda: counter_w.close()
 
 			# @bytes_in_counter is in the @pipeline already.
 			bytes_in_counter = counter_r
