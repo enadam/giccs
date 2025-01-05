@@ -7364,11 +7364,16 @@ class CmdFTPGet(CmdExec):
 	cmd = "get"
 	help = "TODO"
 
+	keep_mtime: bool = True
+
 	src: list[str]
 	dst: Optional[str]
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
+
+		section = self.sections["operation"]
+		section.add_disable_flag_no_dflt("--no-keep-mtime")
 
 		self.sections["positional"].add_argument("what", nargs='+')
 
@@ -7377,6 +7382,13 @@ class CmdFTPGet(CmdExec):
 
 		self.dst = args.what.pop() if len(args.what) > 1 else None
 		self.src = args.what
+
+	def post_validate(self, args: argparse.Namespace) -> None:
+		super().post_validate(args)
+
+		self.merge_options_from_ini(args, "keep_mtime", tpe=bool)
+		if args.keep_mtime is not None:
+			self.keep_mtime = args.keep_mtime
 
 	def execute(self) -> None:
 		cmd_ftp_get(self)
@@ -7450,6 +7462,11 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 				nfiles += 1
 			finally:
 				print()
+
+			if self.keep_mtime:
+				os.utime(out.fileno(), times=(
+					time.time(),
+					blob.gcs_blob.updated.timestamp()))
 
 	if nfiles > 1:
 		print()

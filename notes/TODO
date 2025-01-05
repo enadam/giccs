@@ -14,7 +14,6 @@ discover_local_snapshots(): from btrfs subvolume show -> Snapshot(s)
 	but it doesn't know about restored snapshots
 deprecate index list/delete (in favor of ftp commands)
 	we could also simplify delete remote
-CmdFTPGet: --no-keep-mtime
 
 caching:
 	single file in the root dir
