@@ -33,14 +33,14 @@ rm -r: delete empty folders
 mv [--dir/--fname] (rename/move blob, rename folder)
 tab-completion?
 
-overwrite:
-  * skip
-  * error
-  * ask (yes/no/abort)
-  * force
-overwrite-mode (download):
+--exists (get/put):
+  * fail (default)
+  * skip (-n)
+  * ask (yes/no/abort) (-i)
+  * overwrite (-f)
+--overwrite (get):
   * truncate
-  * atomic
+  * atomic (copy stat with cp --attributes-only --preserve all)
 
 document max blob size (5 TiB)
 document required permissions

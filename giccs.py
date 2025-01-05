@@ -7409,6 +7409,8 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 	elif local_isdir is None and len(remote) > 1:
 		raise FileNotFoundError(local)
 
+	nfiles = nbytes = 0
+	started = time.monotonic()
 	for src, src_top in remote:
 		src_tree = src_top.scan()
 		dst_top = local
@@ -7422,9 +7424,39 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 		for src in src_tree:
 			dst = dst_top / src.path(src_top)
 			if src.isdir():
-				print("MKDIR(%s)" % dst)
-			else:
-				print("DOWNLOAD(%s => %s)" % (src.path(), dst))
+				try:
+					os.mkdir(dst)
+				except FileExistsError:
+					pass
+				else:
+					print(f"Created {dst}.")
+				continue
+
+			out = open(dst, "wb")
+			try:
+				blob = src.obj
+				src = src.path()
+				msg = f"Downloading {src}"
+
+				# Similar logic as in upload_file().
+				if not dst.is_absolute():
+					src = src.relative_to(RootDir)
+				if dst != src:
+					msg += f" to {dst}"
+
+				print(f"{msg}...", end="", flush=True)
+				nbytes += download_blob(self,
+						blob, pipeline_stdout=out)
+				nfiles += 1
+			finally:
+				print()
+
+	if nfiles > 1:
+		print()
+		duration = time.monotonic() - started
+		print("Downloaded %d file(s) (%s) in %s."
+			% (nfiles, humanize_size(nbytes),
+				humanize_duration(duration)))
 
 class CmdFTPPut(CmdExec):
 	cmd = "put"
@@ -7469,7 +7501,8 @@ def upload_file(self: _CmdFTPPut,
 		src = str(src)
 		msg = f"Uploading {src}"
 
-		# @dst is absolute, @src can be either.
+		# @dst is absolute, @src can be either
+		# ("ftp put this" or "ftp put /that").
 		dst = str(dst)
 		if dst != src and dst != f"/{src}":
 			msg += f" as {dst}"
