@@ -7364,7 +7364,14 @@ class CmdFTPGet(CmdExec):
 	cmd = "get"
 	help = "TODO"
 
+	class IfExists(enum.Enum):
+		FAIL		= enum.auto()
+		SKIP		= enum.auto()
+		ASK		= enum.auto()
+		OVERWRITE	= enum.auto()
+
 	keep_mtime: bool = True
+	if_exists: IfExists = IfExists.FAIL
 
 	src: list[str]
 	dst: Optional[str]
@@ -7375,10 +7382,26 @@ class CmdFTPGet(CmdExec):
 		section = self.sections["operation"]
 		section.add_disable_flag_no_dflt("--no-keep-mtime")
 
+		mutex = section.add_mutually_exclusive_group()
+		mutex.add_enable_flag("--no-clobber", "-n")
+		mutex.add_enable_flag("--interactive", "-i")
+		mutex.add_enable_flag("--force", "-f")
+		mutex.add_argument("--exists",
+			choices=tuple(v.name.lower() for v in self.IfExists))
+
 		self.sections["positional"].add_argument("what", nargs='+')
 
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
+
+		if args.no_clobber:
+			self.if_exists = self.IfExists.SKIP
+		elif args.interactive:
+			self.if_exists = self.IfExists.ASK
+		elif args.force:
+			self.if_exists = self.IfExists.OVERWRITE
+		elif args.exists is not None:
+			self.if_exists = self.IfExists[args.exists.upper()]
 
 		self.dst = args.what.pop() if len(args.what) > 1 else None
 		self.src = args.what
@@ -7392,6 +7415,35 @@ class CmdFTPGet(CmdExec):
 
 	def execute(self) -> None:
 		cmd_ftp_get(self)
+
+	def confirm(self, prompt: str) -> Optional[bool]:
+		while True:
+			try:
+				ret = input("%s [y/n/q] " % prompt)
+			except EOFError:
+				print()
+				continue
+
+			if ret == 'y':
+				return True
+			elif ret == 'n':
+				return False
+			elif ret == 'q':
+				return None
+
+	def skip_file(self, path: pathlib.PurePath) -> Optional[bool]:
+		if self.if_exists == self.IfExists.FAIL:
+			raise
+		elif self.if_exists == self.IfExists.SKIP:
+			print("%r exists, skipping." % str(path))
+			return True
+		elif self.if_exists == self.IfExists.ASK:
+			overwrite = self.confirm("%r exists, overwrite?"
+							% str(path))
+			if overwrite is not None:
+				return not overwrite
+			else:
+				return None
 
 def cmd_ftp_get(self: _CmdFTPGet) -> None:
 	remote = [
@@ -7421,8 +7473,7 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 	elif local_isdir is None and len(remote) > 1:
 		raise FileNotFoundError(local)
 
-	nfiles = nbytes = 0
-	started = time.monotonic()
+	nfiles = nbytes = duration = 0
 	for src, src_top in remote:
 		src_tree = src_top.scan()
 		dst_top = local
@@ -7444,7 +7495,20 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 					print(f"Created {dst}.")
 				continue
 
-			out = open(dst, "wb")
+			if self.if_exists == self.IfExists.OVERWRITE:
+				out = open(dst, "wb")
+			else:
+				try:
+					out = open(dst, "xb")
+				except FileExistsError:
+					match self.skip_file(dst):
+						case False:
+							out = open(dst, "wb")
+						case True:
+							continue
+						case None:
+							break
+
 			try:
 				blob = src.obj
 				src = src.path()
@@ -7457,8 +7521,10 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 					msg += f" to {dst}"
 
 				print(f"{msg}...", end="", flush=True)
+				started = time.monotonic()
 				nbytes += download_blob(self,
 						blob, pipeline_stdout=out)
+				duration += time.monotonic() - started
 				nfiles += 1
 			finally:
 				print()
@@ -7467,10 +7533,16 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 				os.utime(out.fileno(), times=(
 					time.time(),
 					blob.gcs_blob.updated.timestamp()))
+		else:	# Loop finished without interruption,
+			# skip the "break" below.
+			continue
+
+		# skip_file() returned None in the inner loop to abort the
+		# operation.
+		break
 
 	if nfiles > 1:
 		print()
-		duration = time.monotonic() - started
 		print("Downloaded %d file(s) (%s) in %s."
 			% (nfiles, humanize_size(nbytes),
 				humanize_duration(duration)))
