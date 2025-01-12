@@ -38,8 +38,18 @@ tab-completion?
   * ask (yes/no/abort) (-i)
   * overwrite (-f)
 --overwrite (get):
-  * truncate
-  * atomic (copy stat with cp --attributes-only --preserve all)
+  * in-place:
+    * ftruncate(dst)
+    * write(dst)
+  * semi-atomic:
+    * write(tmp)
+    * ftruncate(dst) if dst.size > tmp.size
+    * ioctl(dst, FICLONE, tmp)
+    * unlink(tmp)
+  * atomic/fallback:
+    * write(tmp)
+    * cp --attributes-only --preserve=all [--no-preserve=timestamps] dst tmp
+    * rename(tmp, dst)
 
 document max blob size (5 TiB)
 document required permissions

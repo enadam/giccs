@@ -64,6 +64,8 @@ btrfs_ioctl_vol_args_v2_st: Final[struct.Struct] = struct.Struct(
 BTRFS_IOC_SNAP_DESTROY_V2 = btrfs.ioctl._IOW(
 				btrfs.ioctl.BTRFS_IOCTL_MAGIC, 63,
 				btrfs_ioctl_vol_args_v2_st)
+
+FICLONE = btrfs.ioctl._IOW(0x94, 9, struct.Struct("@i"))
 # }}}
 
 # Exceptions {{{
@@ -7383,8 +7385,14 @@ class CmdFTPGet(CmdExec):
 		ASK		= enum.auto()
 		OVERWRITE	= enum.auto()
 
+	class Overwrite(Choices, enum.Enum):
+		IN_PLACE	= enum.auto()
+		SEMI_ATOMIC	= enum.auto()
+		ATOMIC		= enum.auto()
+
 	keep_mtime: bool = True
 	if_exists: IfExists = IfExists.FAIL
+	overwrite: Overwrite = Overwrite.SEMI_ATOMIC
 
 	src: list[str]
 	dst: Optional[str]
@@ -7401,6 +7409,9 @@ class CmdFTPGet(CmdExec):
 		mutex.add_enable_flag("--force", "-f")
 		mutex.add_argument("--exists",
 			choices=self.IfExists.to_choices())
+
+		choices = self.Overwrite.to_choices()
+		section.add_argument("--overwrite", choices=choices)
 
 		self.sections["positional"].add_argument("what", nargs='+')
 
@@ -7426,6 +7437,12 @@ class CmdFTPGet(CmdExec):
 		if args.keep_mtime is not None:
 			self.keep_mtime = args.keep_mtime
 
+		choices = self.find_argument("--overwrite")[1]["choices"]
+		self.merge_options_from_ini(args, "overwrite", tpe=choices)
+		if args.overwrite is not None:
+			self.overwrite = self.Overwrite.from_choice(
+							args.overwrite)
+
 	def execute(self) -> None:
 		cmd_ftp_get(self)
 
@@ -7444,19 +7461,97 @@ class CmdFTPGet(CmdExec):
 			elif ret == 'q':
 				return None
 
-	def skip_file(self, path: pathlib.PurePath) -> Optional[bool]:
-		if self.if_exists == self.IfExists.FAIL:
-			raise
+	# Returns:
+	# * True:	skip the file
+	# * False:	overwrite the file
+	# * SystemExit:	abort the operation
+	# * Exception:	fail the operation
+	def skip_file(self, path: pathlib.PurePath) -> bool:
+		if self.if_exists == self.IfExists.OVERWRITE:
+			return False
 		elif self.if_exists == self.IfExists.SKIP:
 			print("%r exists, skipping." % str(path))
 			return True
+		elif self.if_exists == self.IfExists.FAIL:
+			raise
 		elif self.if_exists == self.IfExists.ASK:
 			overwrite = self.confirm("%r exists, overwrite?"
 							% str(path))
-			if overwrite is not None:
-				return not overwrite
-			else:
-				return None
+			if overwrite is None:
+				raise SystemExit
+			return not overwrite
+
+	# Returns:
+	# * file object
+	# * None:	skip the file
+	# * SystemExit:	abort the operation
+	# * Exception:	fail the operation
+	def open_dst(self, dst: pathlib.PurePath) -> Optional[BinaryIO]:
+		if self.if_exists != self.IfExists.OVERWRITE:
+			try:
+				return open(dst, "xb")
+			except FileExistsError:
+				if self.skip_file(dst):
+					return None
+
+		if self.overwrite == self.Overwrite.IN_PLACE:
+			return open(dst, "wb")
+
+		# We need to open it for reading as well otherwise FICLONE
+		# will fail with EBADF.
+		import tempfile
+		return tempfile.NamedTemporaryFile(
+			dir=dst.parent, prefix=dst.name + '.',
+			mode="x+b")
+
+	# Copy all attributes of @dst to @tmp except the timestamps,
+	# then replace @dst with @tmp.
+	def atomic_overwrite(self, dst: pathlib.PurePath, tmp: BinaryIO) \
+			-> None:
+		subprocess.check_call((
+			"cp", "--attributes-only",
+			"--preserve=all",
+			"--no-preserve=timestamps",
+			str(dst), tmp.name,
+		))
+		os.rename(tmp.name, dst)
+
+	# Clone the contents of @tmp into @dst, falling back to
+	# atomic_overwrite() if ioctl(FICLONE) is not supported.
+	def clone_file(self, dst: pathlib.PurePath, tmp: BinaryIO) -> BinaryIO:
+		try:	# Open @dst without truncating it to be as atomic
+			# as possible.
+			fd = os.open(dst, os.O_WRONLY)
+		except FileNotFoundError:
+			# We were to overwrite @dst, but it doesn't exist
+			# anymore.
+			os.rename(tmp.name, dst)
+			return tmp
+		except PermissionError:
+			self.atomic_overwrite(dst, tmp)
+			return tmp
+
+		# FICLONE fails if @fd is larger than @tmp.
+		if os.stat(fd).st_size > tmp.tell():
+			os.truncate(fd, tmp.tell())
+
+		# Clone @tmp from the beginning to the end.
+		tmp.seek(0)
+		try:
+			fcntl.ioctl(fd, FICLONE, tmp.fileno())
+		except OSError as ex:
+			import errno
+
+			os.close(fd)
+			if ex.errno not in (
+					errno.EOPNOTSUPP,
+					errno.EINVAL, errno.EPERM):
+				# An unexpected error.
+				raise
+			self.atomic_overwrite(dst, tmp)
+			return tmp
+		else:
+			return os.fdopen(fd, "wb")
 
 def cmd_ftp_get(self: _CmdFTPGet) -> None:
 	remote = [
@@ -7508,19 +7603,14 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 					print(f"Created {dst}.")
 				continue
 
-			if self.if_exists == self.IfExists.OVERWRITE:
-				out = open(dst, "wb")
-			else:
-				try:
-					out = open(dst, "xb")
-				except FileExistsError:
-					match self.skip_file(dst):
-						case False:
-							out = open(dst, "wb")
-						case True:
-							continue
-						case None:
-							break
+			try:
+				out = self.open_dst(dst)
+			except SystemExit:
+				# Abort the operation.
+				break
+			if out is None:
+				# Skip the file.
+				continue
 
 			try:
 				blob = src.obj
@@ -7542,15 +7632,34 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 			finally:
 				print()
 
+			out.flush()
+			if hasattr(out, "file"):
+				# @out was created with tempfile.
+				if self.overwrite == self.Overwrite.ATOMIC:
+					self.atomic_overwrite(dst, out)
+				else:	# self.Overwrite.SEMI_ATOMIC
+					out = self.clone_file(dst, out)
+
 			if self.keep_mtime:
+				# Set @out's mtime to the blob's last_updated
+				# timestamp.
 				os.utime(out.fileno(), times=(
 					time.time(),
 					blob.gcs_blob.updated.timestamp()))
+
+			# Handle write errors before beginning the next cycle.
+			try:
+				out.close()
+			except FileNotFoundError:
+				# Ignore the error if @out is a tempfile,
+				# because it could have been renamed to @dst.
+				if not hasattr(out, "file"):
+					raise
 		else:	# Loop finished without interruption,
 			# skip the "break" below.
 			continue
 
-		# skip_file() returned None in the inner loop to abort the
+		# open_dst() raised SystemExit in the inner loop to abort the
 		# operation.
 		break
 
