@@ -119,6 +119,18 @@ class ConsistencyError(FatalError): pass
 # }}}
 
 # Command line parsing {{{
+# A mixin making it easier to convert between choices made in the config file
+# and enum values.
+class Choices: # {{{
+	@classmethod
+	def to_choices(self):
+		return tuple(v.name.lower().replace('_', '-') for v in self)
+
+	@classmethod
+	def from_choice(self, choice: str):
+		return self.__getitem__(choice.replace('-', '_').upper())
+# }}}
+
 # A configparser.ConfigParser with extra functionality.
 class ConfigParser(configparser.ConfigParser): # {{{
 	# Type of option values in the default section.  Used by is_default().
@@ -1409,7 +1421,7 @@ class EncryptionOptions(CmdLineOptions): # {{{
 
 	padding: Optiona[Progressometer.Padding] = None
 
-	class Integrity(enum.IntEnum):
+	class Integrity(Choices, enum.IntEnum):
 		NONE		= enum.auto()
 		SIZE		= enum.auto()
 		HASH		= enum.auto()
@@ -1445,10 +1457,10 @@ class EncryptionOptions(CmdLineOptions): # {{{
 		section.add_disable_flag_no_dflt("--no-blob-header")
 
 		choices = [ "none" ]
-		choices += tuple(v.name.lower() for v in Progressometer.Padding)
+		choices += Progressometer.Padding.to_choices()
 		section.add_argument("--padding", choices=choices)
 
-		choices = tuple(v.name.lower() for v in self.Integrity)
+		choices = self.Integrity.to_choices()
 		section.add_argument("--integrity", choices=choices)
 
 	def resolve_internal_cipher(self, which: str, *names: str) \
@@ -1583,15 +1595,16 @@ class EncryptionOptions(CmdLineOptions): # {{{
 				# doesn't upload the same file multiple times.
 				self.padding = Progressometer.Padding.COVERT
 		elif args.padding != "none":
-			self.padding = \
-				Progressometer.Padding[args.padding.upper()]
+			self.padding = Progressometer.Padding.from_choice(
+								args.padding)
 
 		# Integrity-protection requires an extra permission because
 		# it needs to update the blob's metadata after its creation.
 		choices = self.find_argument("--integrity")[1]["choices"]
 		self.merge_options_from_ini(args, "integrity", tpe=choices)
 		if args.integrity is not None:
-			self.integrity = self.Integrity[args.integrity.upper()]
+			self.integrity = self.Integrity.from_choice(
+							args.integrity)
 		elif self.encrypt:
 			self.integrity = self.Integrity.HASH
 		if self.integrity != self.Integrity.NONE and not self.encrypt:
@@ -3548,7 +3561,7 @@ class Progressometer: # {{{
 	# of bytes, or the algorithm to calculate it from when the number of
 	# non-padding bytes becomes known (ie. when we've consumed the @wrapped
 	# file).
-	class Padding(enum.Enum):
+	class Padding(Choices, enum.Enum):
 		PADME		= enum.auto()
 		COVERT		= enum.auto()
 	padding: Optional[Union[Padding, int]] = None
@@ -7364,7 +7377,7 @@ class CmdFTPGet(CmdExec):
 	cmd = "get"
 	help = "TODO"
 
-	class IfExists(enum.Enum):
+	class IfExists(Choices, enum.Enum):
 		FAIL		= enum.auto()
 		SKIP		= enum.auto()
 		ASK		= enum.auto()
@@ -7387,7 +7400,7 @@ class CmdFTPGet(CmdExec):
 		mutex.add_enable_flag("--interactive", "-i")
 		mutex.add_enable_flag("--force", "-f")
 		mutex.add_argument("--exists",
-			choices=tuple(v.name.lower() for v in self.IfExists))
+			choices=self.IfExists.to_choices())
 
 		self.sections["positional"].add_argument("what", nargs='+')
 
@@ -7401,7 +7414,7 @@ class CmdFTPGet(CmdExec):
 		elif args.force:
 			self.if_exists = self.IfExists.OVERWRITE
 		elif args.exists is not None:
-			self.if_exists = self.IfExists[args.exists.upper()]
+			self.if_exists = self.IfExists.from_choice(args.exists)
 
 		self.dst = args.what.pop() if len(args.what) > 1 else None
 		self.src = args.what
