@@ -25,31 +25,11 @@ caching:
 			snapshot name and uuid
 			make BackupBlob:s dynamic
 
-get, put
 put: upload from stdin/command
 mkdir, rmdir
 rm -r: delete empty folders
 mv [--dir/--fname] (rename/move blob, rename folder)
 tab-completion?
-
---exists (get/put):
-  * fail (default)
-  * skip (-n)
-  * ask (yes/no/abort) (-i)
-  * overwrite (-f)
---overwrite (get):
-  * in-place:
-    * ftruncate(dst)
-    * write(dst)
-  * semi-atomic:
-    * write(tmp)
-    * ftruncate(dst) if dst.size > tmp.size
-    * ioctl(dst, FICLONE, tmp)
-    * unlink(tmp)
-  * atomic/fallback:
-    * write(tmp)
-    * cp --attributes-only --preserve=all [--no-preserve=timestamps] dst tmp
-    * rename(tmp, dst)
 
 document max blob size (5 TiB)
 document required permissions

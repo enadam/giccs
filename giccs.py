@@ -7375,45 +7375,25 @@ class CmdFTPPage(CmdFTPCat):
 			pager.stdin.close()
 			pager.wait()
 
-class CmdFTPGet(CmdExec):
-	cmd = "get"
-	help = "TODO"
-
+class FTPGetPutOptions(CmdLineOptions):
 	class IfExists(Choices, enum.Enum):
 		FAIL		= enum.auto()
 		SKIP		= enum.auto()
 		ASK		= enum.auto()
 		OVERWRITE	= enum.auto()
 
-	class Overwrite(Choices, enum.Enum):
-		IN_PLACE	= enum.auto()
-		SEMI_ATOMIC	= enum.auto()
-		ATOMIC		= enum.auto()
-
-	keep_mtime: bool = True
 	if_exists: IfExists = IfExists.FAIL
-	overwrite: Overwrite = Overwrite.SEMI_ATOMIC
-
-	src: list[str]
-	dst: Optional[str]
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
 		section = self.sections["operation"]
-		section.add_disable_flag_no_dflt("--no-keep-mtime")
-
 		mutex = section.add_mutually_exclusive_group()
 		mutex.add_enable_flag("--no-clobber", "-n")
 		mutex.add_enable_flag("--interactive", "-i")
 		mutex.add_enable_flag("--force", "-f")
 		mutex.add_argument("--exists",
 			choices=self.IfExists.to_choices())
-
-		choices = self.Overwrite.to_choices()
-		section.add_argument("--overwrite", choices=choices)
-
-		self.sections["positional"].add_argument("what", nargs='+')
 
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
@@ -7426,6 +7406,50 @@ class CmdFTPGet(CmdExec):
 			self.if_exists = self.IfExists.OVERWRITE
 		elif args.exists is not None:
 			self.if_exists = self.IfExists.from_choice(args.exists)
+
+	def confirm(self, prompt: str) -> bool:
+		while True:
+			try:
+				ret = input("%s [y/n/q] " % prompt)
+			except EOFError:
+				print()
+				continue
+
+			if ret == 'y':
+				return True
+			elif ret == 'n':
+				return False
+			elif ret == 'q':
+				raise SystemExit
+
+class CmdFTPGet(CmdExec, FTPGetPutOptions):
+	cmd = "get"
+	help = "TODO"
+
+	class Overwrite(Choices, enum.Enum):
+		IN_PLACE	= enum.auto()	# Needs write permission.
+		SEMI_ATOMIC	= enum.auto()	# Likewise.
+		ATOMIC		= enum.auto()	# Needs read permission.
+
+	keep_mtime: bool = True
+	overwrite: Overwrite = Overwrite.SEMI_ATOMIC
+
+	src: list[str]
+	dst: Optional[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["operation"]
+		section.add_disable_flag_no_dflt("--no-keep-mtime")
+
+		choices = self.Overwrite.to_choices()
+		section.add_argument("--overwrite", choices=choices)
+
+		self.sections["positional"].add_argument("what", nargs='+')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
 
 		self.dst = args.what.pop() if len(args.what) > 1 else None
 		self.src = args.what
@@ -7446,21 +7470,6 @@ class CmdFTPGet(CmdExec):
 	def execute(self) -> None:
 		cmd_ftp_get(self)
 
-	def confirm(self, prompt: str) -> Optional[bool]:
-		while True:
-			try:
-				ret = input("%s [y/n/q] " % prompt)
-			except EOFError:
-				print()
-				continue
-
-			if ret == 'y':
-				return True
-			elif ret == 'n':
-				return False
-			elif ret == 'q':
-				return None
-
 	# Returns:
 	# * True:	skip the file
 	# * False:	overwrite the file
@@ -7475,11 +7484,8 @@ class CmdFTPGet(CmdExec):
 		elif self.if_exists == self.IfExists.FAIL:
 			raise
 		elif self.if_exists == self.IfExists.ASK:
-			overwrite = self.confirm("%r exists, overwrite?"
-							% str(path))
-			if overwrite is None:
-				raise SystemExit
-			return not overwrite
+			return not self.confirm(
+				"%r exists, overwrite?" % str(path))
 
 	# Returns:
 	# * file object
@@ -7669,7 +7675,7 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 			% (nfiles, humanize_size(nbytes),
 				humanize_duration(duration)))
 
-class CmdFTPPut(CmdExec):
+class CmdFTPPut(CmdExec, FTPGetPutOptions):
 	cmd = "put"
 	help = "TODO"
 
@@ -7700,35 +7706,58 @@ class CmdFTPPut(CmdExec):
 
 def upload_file(self: _CmdFTPPut,
 		src: Union[str, pathlib.PurePath], dst: pathlib.PurePath) \
-		-> int:
+		-> tuple[Optional[int], Optional[float]]:
 	# Make @dst non-absolute, looks nicer in the GCS console.
 	full_dst = self.remote.root.path(full_path=True)
 	full_dst /= dst.relative_to(RootDir)
 	blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
 
-	try:
-		self.remote.lookup(dst)
-	except FileNotFoundError:
-		src = str(src)
-		msg = f"Uploading {src}"
+	src = str(src)
+	msg = f"Uploading {src}"
 
-		# @dst is absolute, @src can be either
-		# ("ftp put this" or "ftp put /that").
-		dst = str(dst)
-		if dst != src and dst != f"/{src}":
-			msg += f" as {dst}"
+	# @dst is absolute, @src can be either
+	# ("ftp put this" or "ftp put /that").
+	dst = str(dst)
+	if dst != src and dst != f"/{src}":
+		msg += f" as {dst}"
 
-		print(f"{msg}...", end="", flush=True)
+	if self.if_exists == self.IfExists.OVERWRITE:
+		overwrite = None
 	else:
-		raise FileExistsError(dst)
+		overwrite = False
 
-	try:
-		return upload_blob(self, blob,
-					pipeline_stdin=open(src, "rb"),
-					padding=self.padding)
-	finally:
-		print()
-		self.remote.lookup(dst, create=True).commit(blob)
+	while True:
+		print(f"{msg}...", end="", flush=True)
+		try:
+			started = time.monotonic()
+			nbytes = upload_blob(self, blob,
+						pipeline_stdin=open(src, "rb"),
+						overwrite=overwrite,
+						padding=self.padding)
+		except ConsistencyError as ex:
+			if not ex.args[0].endswith(
+					" already exists in bucket"):
+				print()
+				raise
+			elif self.if_exists == self.IfExists.FAIL:
+				print()
+				raise FileExistsError(dst)
+			elif self.if_exists == self.IfExists.SKIP:
+				print(" blob exists, skipping.")
+				return None, None
+
+			assert self.if_exists == self.IfExists.ASK
+			if self.confirm(" blob exists, overwrite?"):
+				overwrite = None
+			else:
+				return None, None
+		except:
+			print()
+			raise
+		else:
+			print()
+			self.remote.lookup(dst, create=True).commit(blob)
+			return nbytes, time.monotonic() - started
 
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# @local := list of source paths as strings
@@ -7776,15 +7805,21 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# symlink loops.
 	seen = set() if self.follow_symlinks else None
 
-	nfiles = nbytes = 0
-	started = time.monotonic()
+	aborted = False
+	nfiles = nbytes = duration = 0
 	for src, mode in local:
 		if stat.S_ISREG(mode):
 			dst = remote.path()
 			if remote.isdir():
 				dst /= os.path.basename(src)
-			nbytes += upload_file(self, src, dst)
-			nfiles += 1
+			try:
+				n, t = upload_file(self, src, dst)
+			except SystemExit:
+				break
+			if n is not None:
+				nbytes += n
+				nfiles += 1
+				duration += t
 			continue
 
 		# @src is a directory.
@@ -7822,12 +7857,22 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 					raise FatalError from ex
 
 				if stat.S_ISREG(mode):
-					nbytes += upload_file(self,
+					try:
+						n, t = upload_file(self,
 							src, dst_dir / fname)
-					nfiles += 1
+					except SystemExit:
+						aborted = True
+						break
+					if n is not None:
+						nbytes += n
+						nfiles += 1
+						duration += t
 				else:	# Skip pipes, devices etc.
 					print(f"{src}: not a regular file",
 						file=sys.stderr)
+
+			if aborted:
+				break
 
 			if seen is not None:
 				# Remove directories from @dirs we've @seen.
@@ -7849,9 +7894,11 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			# Traverse @dirs in a predictable order.
 			dirs.sort()
 
+		if aborted:
+			break
+
 	if nfiles > 1:
 		print()
-		duration = time.monotonic() - started
 		print("Uploaded %d file(s) (%s) in %s."
 			% (nfiles, humanize_size(nbytes),
 				humanize_duration(duration)))
