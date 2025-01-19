@@ -7733,7 +7733,8 @@ def upload_file(self: _CmdFTPPut,
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# @local := list of source paths as strings
 	if isinstance(self.parent, CmdFTPShell):
-		local = self.local.globs(map(os.path.expanduser, self.src))
+		local = list(self.local.globs(
+				map(os.path.expanduser, self.src)))
 	else:
 		local = self.src
 
