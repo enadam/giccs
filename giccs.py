@@ -857,7 +857,7 @@ class AccountOptions(ConfigFileOptions): # {{{
 			self.service_account_info = json.load(fin)
 		except json.decoder.JSONDecodeError as ex:
 			if cmd is not None:
-				cmd.kill()
+				cmd.terminate()
 			raise self.CmdLineError(f"{src}: {ex}") from ex
 		else:
 			if not isinstance(self.service_account_info, dict):
@@ -4080,8 +4080,8 @@ class Pipeline: # {{{
 		def returncode(self) -> Optional[int]:
 			return self.wrapped.exitcode
 
-		def kill(self) -> None:
-			self.wrapped.kill()
+		def terminate(self) -> None:
+			self.wrapped.terminate()
 
 		def wait(self) -> int:
 			self.wrapped.join()
@@ -4166,7 +4166,7 @@ class Pipeline: # {{{
 	def __del__(self):
 		for proc in self.processes:
 			try:
-				proc.kill()
+				proc.terminate()
 				proc.wait()
 			except:
 				pass
