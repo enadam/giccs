@@ -7387,7 +7387,7 @@ class FTPGetPutOptions(CmdLineOptions):
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 
-		section = self.sections["operation"]
+		section = self.sections["force"]
 		mutex = section.add_mutually_exclusive_group()
 		mutex.add_enable_flag("--no-clobber", "-n")
 		mutex.add_enable_flag("--interactive", "-i")
