@@ -7684,6 +7684,7 @@ class CmdFTPPut(CmdExec, FTPGetPutOptions):
 
 	follow_symlinks: bool
 
+	cmd: Optional[str]
 	src: list[str]
 	dst: Optional[str]
 
@@ -7691,8 +7692,11 @@ class CmdFTPPut(CmdExec, FTPGetPutOptions):
 		super().declare_arguments()
 
 		section = self.sections["operation"]
-		section.add_enable_flag("--follow-symlinks", "--dereference",
+		mutex = section.add_mutually_exclusive_group()
+		mutex.add_enable_flag("--follow-symlinks", "--dereference",
 					"-L")
+		mutex.add_enable_flag("--stdin", "-s")
+		mutex.add_argument("--cmd", "-c")
 
 		self.sections["positional"].add_argument("what", nargs='+')
 
@@ -7701,66 +7705,124 @@ class CmdFTPPut(CmdExec, FTPGetPutOptions):
 
 		self.follow_symlinks = args.follow_symlinks
 
-		self.dst = args.what.pop() if len(args.what) > 1 else None
-		self.src = args.what
+		if args.stdin or args.cmd is not None:
+			if len(args.what) > 1:
+				raise self.CmdLineError(
+					"a single destination "
+					"must be specified")
+			self.dst = args.what[0]
+			self.src = [ ]
+
+			if args.cmd is not None:
+				self.cmd = args.cmd
+			elif self.if_exists == self.IfExists.ASK:
+				# Once we've read stdin we can't read it again.
+				raise self.CmdLineError(
+					"can't use --stdin with --exists ask")
+			else:
+				self.cmd = None
+		else:
+			self.cmd = None
+			self.dst = args.what.pop() \
+					if len(args.what) > 1 \
+					else None
+			self.src = args.what
 
 	def execute(self) -> None:
 		cmd_ftp_put(self)
 
-def upload_file(self: _CmdFTPPut,
-		src: Union[str, pathlib.PurePath], dst: pathlib.PurePath) \
-		-> tuple[Optional[int], Optional[float]]:
-	# Make @dst non-absolute, looks nicer in the GCS console.
-	full_dst = self.remote.root.path(full_path=True)
-	full_dst /= dst.relative_to(RootDir)
-	blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
-
-	src = str(src)
-	msg = f"Uploading {src}"
-
-	# @dst is absolute, @src can be either
-	# ("ftp put this" or "ftp put /that").
-	dst = str(dst)
-	if dst != src and dst != f"/{src}":
-		msg += f" as {dst}"
-
+# Wrapper around @callback, which should upload_blob().
+def try_to_upload(self: _CmdFTPPut, blob: MetaBlob,
+		msg: Optional[str], callback: Callable[[Any], int],
+		to_commit: VirtualGlobber.DirEnt|pathlib.PurePath,
+		to_rollback: Optional[VirtualGlobber.DirEnt] = None):
 	if self.if_exists == self.IfExists.OVERWRITE:
 		overwrite = None
 	else:
 		overwrite = False
 
 	while True:
-		print(f"{msg}...", end="", flush=True)
+		if msg is not None:
+			print(f"{msg}...", end="", flush=True)
 		try:
-			started = time.monotonic()
-			nbytes = upload_blob(self, blob,
-						pipeline_stdin=open(src, "rb"),
+			try:
+				started = time.monotonic()
+				nbytes = callback(
+						blob=blob,
 						overwrite=overwrite,
 						padding=self.padding)
-		except ConsistencyError as ex:
-			if not ex.args[0].endswith(
-					" already exists in bucket"):
-				print()
-				raise
-			elif self.if_exists == self.IfExists.FAIL:
-				print()
-				raise FileExistsError(dst)
-			elif self.if_exists == self.IfExists.SKIP:
-				print(" blob exists, skipping.")
-				return None, None
+			except ConsistencyError as ex:
+				if not ex.args[0].endswith(
+						" already exists in bucket"):
+					raise
+				elif self.if_exists == self.IfExists.FAIL:
+					if isinstance(to_commit,
+							VirtualGlobber.DirEnt):
+						dst = to_commit.path()
+					else:
+						dst = to_commit
+					raise FileExistsError(str(dst))
+				elif self.if_exists == self.IfExists.SKIP:
+					# It's not necessary to roll back
+					# @to_rollback, since the blob's
+					# path exists.
+					print(" blob exists, skipping.")
+					return None, None
 
-			assert self.if_exists == self.IfExists.ASK
-			if self.confirm(" blob exists, overwrite?"):
+				assert self.if_exists == self.IfExists.ASK
+				if not self.confirm(" blob exists, "
+							"overwrite?"):
+					# Like above.
+					return None, None
+
+				# This is the only path where we re-run
+				# the loop.  Use "continue" to skip the
+				# "else" branch below.
 				overwrite = None
-			else:
-				return None, None
-		except:
-			print()
+				continue
+		except Exception as ex:
+			# Don't add another newline if we're coming from
+			# self.confirm().
+			if not isinstance(ex, SystemExit):
+				print()
+			if to_rollback is not None:
+				to_rollback.rollback()
 			raise
 		else:
+			duration = time.monotonic() - started
 			print()
-			self.remote.lookup(dst, create=True).commit(blob)
-			return nbytes, time.monotonic() - started
+
+			if isinstance(to_commit, pathlib.PurePath):
+				to_commit = self.remote.lookup(to_commit,
+								create=True)
+			to_commit.commit(blob)
+
+			return nbytes, duration
+
+def upload_file(self: _CmdFTPPut,
+		src: Union[str, pathlib.PurePath], dst_path: pathlib.PurePath,
+		to_rollback: VirtualGlobber.DirEnt) \
+		-> tuple[Optional[int], Optional[float]]:
+	# Make @dst non-absolute, looks nicer in the GCS console.
+	full_dst = self.remote.root.path(full_path=True)
+	full_dst /= dst_path.relative_to(RootDir)
+	blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
+
+	src = str(src)
+	msg = f"Uploading {src}"
+
+	# @dst_path is absolute, @src can be either
+	# ("ftp put this" or "ftp put /that").
+	dst = str(dst_path)
+	if dst != src and dst != f"/{src}":
+		msg += f" as {dst}"
+
+	# Reopen @src every time we try, in order to read from the beginning.
+	return try_to_upload(
+		self, blob, msg,
+		lambda **kw: upload_blob(self,
+				pipeline_stdin=open(src, "rb"), **kw),
+		dst_path, to_rollback)
 
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# @local := list of source paths as strings
@@ -7794,6 +7856,37 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	else:
 		remote = self.remote.cwd
 
+	# Handle --stdin and --cmd.
+	if not self.src:
+		if remote.isdir():
+			remote.rollback()
+			raise IsADirectoryError(remote.path())
+
+		blob = MetaBlob(self,
+			str(remote.path(full_path=True).relative_to(RootDir)))
+		if self.cmd is None:
+			msg = "Uploading from stdin"
+			def fun(**kw):
+				# Add a newline to @msg if stdin is a TTY.
+				if sys.stdin.isatty():
+					print(f"{msg} (^D to finish)...")
+				return upload_blob(self,
+						pipeline_stdin=os.fdopen(
+							sys.stdin.fileno(),
+							closefd=False),
+						**kw)
+
+			try_to_upload(self, blob,
+				None if sys.stdin.isatty() else msg, fun,
+				remote, remote)
+		else:
+			try_to_upload(self, blob,
+				"Uploading from %s" % shlex.quote(self.cmd),
+				lambda **kw: upload_blob(self,
+						command=self.cmd, **kw),
+				remote, remote)
+		return
+
 	# If @remote is not a directory, @local must be a single regular file.
 	if (len(local) > 1 or stat.S_ISDIR(local[0][1])) \
 			and not remote.isdir():
@@ -7816,7 +7909,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			if remote.isdir():
 				dst /= os.path.basename(src)
 			try:
-				n, t = upload_file(self, src, dst)
+				n, t = upload_file(self, src, dst, remote)
 			except SystemExit:
 				break
 			if n is not None:
@@ -7862,7 +7955,8 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 				if stat.S_ISREG(mode):
 					try:
 						n, t = upload_file(self,
-							src, dst_dir / fname)
+							src, dst_dir / fname,
+							remote)
 					except SystemExit:
 						aborted = True
 						break

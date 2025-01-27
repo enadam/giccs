@@ -25,7 +25,6 @@ caching:
 			snapshot name and uuid
 			make BackupBlob:s dynamic
 
-put: upload from stdin/command
 mkdir, rmdir
 rm -r: delete empty folders
 mv [--dir/--fname] (rename/move blob, rename folder)
