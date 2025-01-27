@@ -4096,7 +4096,7 @@ class Pipeline: # {{{
 	def __init__(self,
 			cmds: Sequence[Union[
 				Callable[..., None],
-				Sequence[str],
+				str, Sequence[str],
 				dict[str, Any],
 			]],
 			stdin: Optional[StdioType] = subprocess.DEVNULL,
@@ -4112,6 +4112,9 @@ class Pipeline: # {{{
 				cmd = { "executable": cmd }
 			elif not isinstance(cmd, dict):
 				cmd = { "args": cmd }
+
+			if isinstance(cmd.get("args"), str):
+				cmd.setdefault("shell", True)
 
 			if i > 0:
 				cmd["stdin"] = self.processes[-1].stdout
@@ -4881,7 +4884,7 @@ def write_external_encryption_header(blob: MetaBlob, then_cat: bool = False) \
 	return write_header
 
 def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
-		command: Optional[Sequence[str]] = None,
+		command: Optional[Sequence[str] | str] = None,
 		pipeline_stdin: Optional[Pipeline.StdioType] = None,
 		padding: Optional[Progressometer.Padding] = None,
 		count_bytes_in: bool = True, wet_run: bool = False,
