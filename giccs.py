@@ -25,6 +25,7 @@ import contextlib, functools
 import btrfs
 
 import google.cloud.storage
+import google.cloud.storage_control_v2
 import google.oauth2.service_account
 from google.api_core.exceptions import GoogleAPICallError
 # }}}
@@ -866,16 +867,24 @@ class AccountOptions(ConfigFileOptions): # {{{
 			if cmd is not None:
 				wait_proc(cmd)
 
-	# Make a google.cloud.storage.Client from @self.service_account_info.
+	@functools.cached_property
+	def creds(self) -> Optional[google.oauth2.service_account.Credentials]:
+		if self.service_account_info is None:
+			return None
+
+		return google.oauth2.service_account.Credentials. \
+				from_service_account_info(
+					self.service_account_info)
+
 	@functools.cached_property
 	def gcs_client(self) -> google.cloud.storage.Client:
-		if self.service_account_info is not None:
-			creds = google.oauth2.service_account.Credentials. \
-					from_service_account_info(
-						self.service_account_info)
-		else:
-			creds = None
-		return google.cloud.storage.Client(credentials=creds)
+		return google.cloud.storage.Client(credentials=self.creds)
+
+	@functools.cached_property
+	def gcs_ctrl(self) -> google.cloud.storage_control_v2. \
+				StorageControlClient:
+		return google.cloud.storage_control_v2.StorageControlClient(
+				credentials=self.creds)
 # }}}
 
 # Provide options to specify the GCS bucket to use.
@@ -986,12 +995,23 @@ class BucketOptions(AccountOptions): # {{{
 		else:
 			return found[0]
 
+	# Returns whether @self.bucket has hierarchical namespace enabled.
+	@functools.cached_property
+	def is_hfs(self) -> bool:
+		storage_layout_path = self.gcs_ctrl.storage_layout_path(
+					"_", self.bucket.name)
+		storage_layout = self.gcs_ctrl.get_storage_layout(
+					name=storage_layout_path)
+		return storage_layout.hierarchical_namespace.enabled
+
+	# Prepend @path with @self.prefix if there's one.
 	def with_prefix(self, path: str) -> str:
 		if self.prefix is not None:
 			return f"{self.prefix}/{path}"
 		else:
 			return path
 
+	# Strip @self.prefix from @path if it's defined.
 	def without_prefix(self, path: str) -> str:
 		if self.prefix is not None:
 			prefix = self.prefix + '/'
@@ -1001,6 +1021,17 @@ class BucketOptions(AccountOptions): # {{{
 			return path.removeprefix(prefix)
 		else:
 			return path
+
+	# Return a GCS prefix that matches all blobs under @path.
+	def gcs_prefix(self, path: pathlib.PurePath) -> Optional[str]:
+		if self.prefix is None and path == RootDir:
+			return None
+		return self.with_prefix(str(path.relative_to(RootDir))) + '/'
+
+	def bucket_path(self) -> str:
+		return "%s/buckets/%s" % (
+				self.gcs_ctrl.common_project_path('_'),
+				self.bucket.name)
 # }}}
 
 # Add --dry-run.
@@ -4541,7 +4572,8 @@ class VirtualGlobber(Globber): # {{{
 		for file in files:
 			self.add_file(pathlib.PurePath(str(file)), file)
 
-	def add_file(self, path: pathlib.PurePath, obj: Any = None) -> None:
+	def add_file(self, path: pathlib.PurePath, obj: Any = None,
+			is_dir: bool = False) -> DirEnt:
 		parent = self.root
 		start = 1 if path.is_absolute() else 0
 		for fname in path.parts[start:-1]:
@@ -4550,7 +4582,14 @@ class VirtualGlobber(Globber): # {{{
 				child = self.DirEnt.mkdir(self, fname, { })
 				parent.add(child)
 			parent = child
-		parent.add(self.DirEnt.mkfile(self, path.name, obj))
+
+		if is_dir:
+			dent = self.DirEnt.mkdir(self, path.name, { }, obj)
+		else:
+			dent = self.DirEnt.mkfile(self, path.name, obj)
+		parent.add(dent)
+
+		return dent
 
 	# Called by DirEnt.children().
 	def load_children(self, dent: DirEnt) -> None:
@@ -4653,14 +4692,7 @@ class GCSGlobber(VirtualGlobber):
 
 	# Return a prefix that matches all blobs under @dent.
 	def gcs_prefix(self, dent: VirtualGlobber.DirEnt) -> Optional[str]:
-		path = dent.path(full_path=True)
-		if self.args.prefix is not None or path != RootDir:
-			path = path.relative_to(RootDir)
-			if self.args.prefix is not None:
-				path = self.args.prefix / path
-			return f'{path}/'
-		else:	# path is RootDir and there's no args.prefix
-			return None
+		return self.args.gcs_prefix(dent.path(full_path=True))
 
 	def load_children(self, dent: VirtualGlobber.DirEnt) -> None:
 		if self.args.encrypt_metadata:
@@ -4696,8 +4728,8 @@ class GCSGlobber(VirtualGlobber):
 		# Trim @root_path from @blob.blob_path in case we've
 		# changed root directory.
 		root_path = self.root.path(full_path=True).relative_to(RootDir)
-		for blob in self.args.bucket.list_blobs(
-				prefix=self.gcs_prefix(dent)):
+		prefix = self.gcs_prefix(dent)
+		for blob in self.args.bucket.list_blobs(prefix=prefix):
 			blob = MetaBlob.create_best_from_gcs(self.args, blob)
 			if blob is None:
 				continue
@@ -4705,6 +4737,27 @@ class GCSGlobber(VirtualGlobber):
 			path = pathlib.PurePath(blob.blob_path) \
 					.relative_to(root_path)
 			self.add_file(path, blob)
+
+		if self.args.encrypt_metadata or not self.args.is_hfs:
+			return
+
+		# Add the empty folders in the bucket.
+		bucket_path = self.args.bucket_path()
+		folders_path = f"{bucket_path}/folders/"
+		req = google.cloud.storage_control_v2.ListFoldersRequest(
+			parent=bucket_path, prefix=prefix,
+		)
+		for folder in self.args.gcs_ctrl.list_folders(request=req):
+			path = folder.name.removeprefix(folders_path)
+			try:
+				self.add_file(
+					pathlib.PurePath(path) \
+						.relative_to(root_path),
+					is_dir=True)
+			except FileExistsError as ex:
+				# @path must have been added implicitly
+				# for a blob.
+				self.lookup(ex.args[0]).must_be_dir()
 # }}}
 
 # Utilities {{{
