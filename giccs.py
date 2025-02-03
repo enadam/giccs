@@ -5783,20 +5783,23 @@ def cmd_delete_remote(args: CmdDeleteRemote) -> None:
 
 			if args.dry_run:
 				print(f"Would delete {blob} ({details}).")
-				continue
+			else:
+				print(f"Deleting {blob} ({details})...")
+				blob.gcs_blob.delete()
 
-			print(f"Deleting {blob} ({details})...")
-			blob.gcs_blob.delete()
 			backup.clear_blob(blob)
 
 		# Delete @backup.index if we've deleted all backups.
-		if ndeleted > prev_ndeleted and backup.index is not None \
-				and backup.orphaned():
-			blob = backup.index
-			deleted_bytes += blob.gcs_blob.size
+		if ndeleted > prev_ndeleted and backup.orphaned():
+			if backup.index is not None:
+				blob = backup.index
+				deleted_bytes += blob.gcs_blob.size
 
-			print(f"Deleting {blob}...")
-			blob.gcs_blob.delete()
+				if args.dry_run:
+					print(f"Would delete {blob}.")
+				else:
+					print(f"Deleting {blob}...")
+					blob.gcs_blob.delete()
 
 	if ndeleted > 0:
 		print()
