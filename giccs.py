@@ -1037,6 +1037,10 @@ class BucketOptions(AccountOptions): # {{{
 				self.gcs_ctrl.common_project_path('_'),
 				self.bucket.name)
 
+	def folder_path(self, folder_id: str) -> str:
+		return self.gcs_ctrl.folder_path('_',
+				self.bucket.name, folder_id)
+
 	# @folder_id is "dir/subdir/" (it must end with a '/')
 	def create_folder(self, folder_id: str) -> None:
 		if not self.is_hfs:
@@ -1046,6 +1050,16 @@ class BucketOptions(AccountOptions): # {{{
 			self.gcs_ctrl.create_folder(
 				parent=self.bucket_path(),
 				folder_id=folder_id)
+		except GoogleAPICallError as ex:
+			raise FatalError from ex
+
+	def delete_folder(self, folder_id: str) -> None:
+		if not self.is_hfs:
+			return
+
+		try:
+			self.gcs_ctrl.delete_folder(
+				name=self.folder_path(folder_id))
 		except GoogleAPICallError as ex:
 			raise FatalError from ex
 # }}}
@@ -1677,6 +1691,10 @@ class EncryptedBucketOptions(EncryptionOptions, BucketOptions):
 	def create_folder(self, folder_id: str) -> None:
 		if not self.encrypt_metadata:
 			super().create_folder(folder_id)
+
+	def delete_folder(self, folder_id: str) -> None:
+		if not self.encrypt_metadata:
+			super().delete_folder(folder_id)
 # }}}
 
 # Add --upload-chunk-size, --progress and --timeout.
@@ -6860,7 +6878,7 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdFTPDir(self), CmdFTPDu(self),
-			CmdFTPMkDir(self),
+			CmdFTPMkDir(self), CmdFTPRmDir(self),
 			CmdFTPRm(self),
 			CmdFTPCat(self), CmdFTPPage(self),
 			CmdFTPGet(self), CmdFTPPut(self))
@@ -7002,7 +7020,7 @@ class CmdFTPShell(CmdTop):
 		 		CmdFTPChDir(self), CmdFTPPwd(self),
 		 		CmdFTPDir(self), CmdFTPPDir(self),
 		 		CmdFTPDu(self),
-				CmdFTPMkDir(self),
+				CmdFTPMkDir(self), CmdFTPRmDir(self),
 				CmdFTPRm(self),
 		 		CmdFTPCat(self), CmdFTPPage(self),
 		 		CmdFTPGet(self), CmdFTPPut(self))
@@ -7347,6 +7365,38 @@ class CmdFTPMkDir(CmdExec):
 				path += '/'
 
 			self.remote.lookup(path, create=create)
+
+class CmdFTPRmDir(CmdExec):
+	cmd = "rmdir"
+	help = "TODO"
+
+	what: list[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("what", nargs='+')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.what = args.what
+
+	def execute(self: _CmdFTPRmDir) -> None:
+		for match in self.remote.globs(self.what):
+			dent = self.remote.lookup(match)
+			if not dent.isdir():
+				raise NotADirectoryError(match)
+			elif dent.children:
+				raise UserError(
+					"%s: directory not empty"
+					% dent.path())
+			elif dent is self.remote.root:
+				raise UserError(
+					"Cannot delete the root directory")
+
+			self.delete_folder(self.remote.gcs_prefix(dent))
+			if dent is self.remote.cwd:
+				self.remote.cwd = dent.parent
+			dent.parent.remove(dent)
 
 class CmdFTPRm(CmdExec):
 	cmd = "rm"
@@ -8157,6 +8207,7 @@ class _CmdFTPDir(CmdFTP, CmdFTPDir): pass
 class _CmdFTPPDir(CmdFTP, CmdFTPPDir): pass
 class _CmdFTPDu(CmdFTP, CmdFTPDu): pass
 class _CmdFTPMkDir(CmdFTP, CmdFTPMkDir): pass
+class _CmdFTPRmDir(CmdFTP, CmdFTPRmDir): pass
 class _CmdFTPRm(CmdFTP, CmdFTPRm): pass
 class _CmdFTPGet(CmdFTP, CmdFTPGet): pass
 class _CmdFTPPut(CmdFTP, CmdFTPPut): pass
