@@ -77,7 +77,11 @@ class GiCCSError(Exception):
 		if ex.response is None:
 			return error[0]
 
+		import grpc
 		from requests.exceptions import JSONDecodeError
+
+		if isinstance(ex.response, grpc.Call):
+			return ex.response.details()
 
 		try:
 			js = ex.response.json()
@@ -1032,6 +1036,18 @@ class BucketOptions(AccountOptions): # {{{
 		return "%s/buckets/%s" % (
 				self.gcs_ctrl.common_project_path('_'),
 				self.bucket.name)
+
+	# @folder_id is "dir/subdir/" (it must end with a '/')
+	def create_folder(self, folder_id: str) -> None:
+		if not self.is_hfs:
+			return
+
+		try:
+			self.gcs_ctrl.create_folder(
+				parent=self.bucket_path(),
+				folder_id=folder_id)
+		except GoogleAPICallError as ex:
+			raise FatalError from ex
 # }}}
 
 # Add --dry-run.
@@ -1657,6 +1673,10 @@ class EncryptedBucketOptions(EncryptionOptions, BucketOptions):
 			self.volume = '/'.join(volume)
 
 		return bucket
+
+	def create_folder(self, folder_id: str) -> None:
+		if not self.encrypt_metadata:
+			super().create_folder(folder_id)
 # }}}
 
 # Add --upload-chunk-size, --progress and --timeout.
@@ -4600,7 +4620,8 @@ class VirtualGlobber(Globber): # {{{
 		self.load_children(dent)
 
 	def lookup(self, path: Union[str, pathlib.PurePath],
-			create: bool = False) -> DirEnt:
+			create: Union[bool, Callable[[DirEnt], None]] = False
+			) -> DirEnt:
 		if isinstance(path, str):
 			if not path:
 				raise FileNotFoundError(path)
@@ -4636,6 +4657,9 @@ class VirtualGlobber(Globber): # {{{
 								self, fname,
 								volatile=True)
 					parent.add(dent)
+
+					if callable(create):
+						create(dent)
 			elif not dent.is_tld():
 				# @fname == "..", go one level up if we can.
 				dent = dent.parent
@@ -6835,7 +6859,9 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
-		return (CmdFTPDir(self), CmdFTPDu(self), CmdFTPRm(self),
+		return (CmdFTPDir(self), CmdFTPDu(self),
+			CmdFTPMkDir(self),
+			CmdFTPRm(self),
 			CmdFTPCat(self), CmdFTPPage(self),
 			CmdFTPGet(self), CmdFTPPut(self))
 
@@ -6975,7 +7001,9 @@ class CmdFTPShell(CmdTop):
 		 		CmdFTPLChDir(self), CmdFTPLPwd(self),
 		 		CmdFTPChDir(self), CmdFTPPwd(self),
 		 		CmdFTPDir(self), CmdFTPPDir(self),
-		 		CmdFTPDu(self), CmdFTPRm(self),
+		 		CmdFTPDu(self),
+				CmdFTPMkDir(self),
+				CmdFTPRm(self),
 		 		CmdFTPCat(self), CmdFTPPage(self),
 		 		CmdFTPGet(self), CmdFTPPut(self))
 		return subcommands
@@ -7273,6 +7301,52 @@ class CmdFTPDu(CmdExec):
 		line.append(str(total_files))
 		line.append("file" if total_files == 1 else "files")
 		print(*line)
+
+class CmdFTPMkDir(CmdExec):
+	cmd = "mkdir"
+	help = "TODO"
+
+	what: list[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("what", nargs='+')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.what = args.what
+
+	def execute(self: _CmdFTPMkDir) -> None:
+		def create(dent: VirtualGlobber.DirEnt) -> None:
+			dent.must_be_dir()
+			print("Creating %s..." % dent.path())
+
+			# @folder_id can only be None if @dent is the @RootDir
+			# (and there's no @self.args.prefix), but it can't be
+			# because @dent shouldn't exist in GCS yet.
+			folder_id = self.remote.gcs_prefix(dent)
+			assert folder_id is not None
+
+			try:
+				self.create_folder(folder_id)
+			except:
+				dent.rollback()
+				raise
+			else:
+				dent.commit()
+
+		# It doesn't make a lot of sense to specify a pattern for this
+		# command, but let's accept them anyway, so we behave like a
+		# real shell (ie. "mkdir */xxx" won't do what the user might
+		# expect, but it will err out instead of creating a directory
+		# named "*/xxx").
+		for path in self.remote.globs(self.what, must_exist=False):
+			if path:
+				# Make sure that self.remote.lookup()
+				# creates a directory in the end.
+				path += '/'
+
+			self.remote.lookup(path, create=create)
 
 class CmdFTPRm(CmdExec):
 	cmd = "rm"
@@ -8082,6 +8156,7 @@ class _CmdFTPPwd(CmdFTP, CmdFTPPwd): pass
 class _CmdFTPDir(CmdFTP, CmdFTPDir): pass
 class _CmdFTPPDir(CmdFTP, CmdFTPPDir): pass
 class _CmdFTPDu(CmdFTP, CmdFTPDu): pass
+class _CmdFTPMkDir(CmdFTP, CmdFTPMkDir): pass
 class _CmdFTPRm(CmdFTP, CmdFTPRm): pass
 class _CmdFTPGet(CmdFTP, CmdFTPGet): pass
 class _CmdFTPPut(CmdFTP, CmdFTPPut): pass
