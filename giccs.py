@@ -5901,6 +5901,11 @@ def cmd_delete_remote(args: CmdDeleteRemote) -> None:
 					print(f"Deleting {blob}...")
 					blob.gcs_blob.delete()
 
+			if not args.dry_run:
+				args.delete_folder(
+					args.with_prefix(backup.snapshot_name)
+					+ '/')
+
 	if ndeleted > 0:
 		print()
 		print("%s %d backups(s) (%s)."
@@ -6124,6 +6129,11 @@ def cmd_delete_index(args: CmdDeleteIndex) -> None:
 		print(f"Deleting {blob} ({details})...")
 		blob.gcs_blob.delete()
 		backup.clear_blob(blob)
+
+		if backup.orphaned():
+			args.delete_folder(
+				args.with_prefix(backup.snapshot_name)
+				+ '/')
 
 	if ndeleted > 0:
 		print()
@@ -7430,7 +7440,7 @@ class CmdFTPRm(CmdExec):
 				raise IsADirectoryError(match)
 			to_delete.append(dent)
 
-		nfiles = size = 0
+		ndirs = nfiles = size = 0
 		for top in to_delete:
 			# Skip subtree if @top has been @deleted by an earlier
 			# @to_delete.
@@ -7442,12 +7452,20 @@ class CmdFTPRm(CmdExec):
 			# there's an error.
 			deleted = [ ]
 			for dent in top.scan(pre_order=False):
+				# Silently skip the root directory.
+				if dent is self.remote.root:
+					continue
 
 				if self.verbose:
 					print("Deleting %s..." % dent.path())
 
 				try:
-					if not dent.isdir():
+					if dent.isdir():
+						folder_id = self.remote \
+							.gcs_prefix(dent)
+						self.delete_folder(folder_id)
+						ndirs += 1
+					else:
 						assert dent.obj is not None
 						dent.obj.gcs_blob.delete()
 						size += dent.obj.gcs_blob.size
@@ -7480,10 +7498,10 @@ class CmdFTPRm(CmdExec):
 					self.remote.cwd = top.parent
 				top.parent.remove(top)
 
-		if self.verbose nfiles > 0:
+		if self.verbose and (ndirs > 0 or nfiles > 0):
 			print()
-			print("Deleted %d file(s) of %s."
-				% (nfiles, humanize_size(size)))
+			print("Deleted %d directories and %d file(s) of %s."
+				% (ndirs, nfiles, humanize_size(size)))
 
 class CmdFTPCat(CmdExec):
 	cmd = "cat"

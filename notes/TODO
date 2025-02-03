@@ -25,8 +25,6 @@ caching:
 			snapshot name and uuid
 			make BackupBlob:s dynamic
 
-mkdir, rmdir
-rm -r: delete empty folders
 mv [--dir/--fname] (rename/move blob, rename folder)
 tab-completion?
 
@@ -34,6 +32,7 @@ document max blob size (5 TiB)
 document required permissions
   * storage.objects.create
   * storage.objects.update (for patch(), to update metadata)
+  * storage.buckets.get (for --bucket)
   * storage.buckets.list (for list buckets)
   * storage.objects.list
   * storage.objects.get
