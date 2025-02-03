@@ -4495,14 +4495,19 @@ class VirtualGlobber(Globber): # {{{
 				if child.isdir():
 					child.load_subtree()
 
-		def scan(self, include_self: bool = True) -> Iterator[Self]:
-			if include_self:
+		def scan(self, pre_order: Optional[bool] = True) \
+				-> Iterator[Self]:
+			if pre_order is True:
 				yield self
 
 			if self.isdir():
 				self.load_subtree()
 				for child in self:
-					yield from child.scan()
+					it = child.scan(pre_order=pre_order)
+					yield from it
+
+			if pre_order is False:
+				yield self
 
 		# Make the entry and its ancestors non-volatile.
 		def commit(self, obj: Any = None) -> None:
@@ -7248,41 +7253,57 @@ class CmdFTPRm(CmdExec):
 				raise IsADirectoryError(match)
 			to_delete.append(dent)
 
-		deleted = set()
 		nfiles = size = 0
 		for top in to_delete:
-			for dent in top.scan():
-				# A file may be included by multiple
-				# @top directories.
-				if dent in deleted:
-					continue
-				deleted.add(dent)
+			# Skip subtree if @top has been @deleted by an earlier
+			# @to_delete.
+			if not top.has_parent(self.remote.root):
+				continue
 
-				if not dent.isdir():
-					assert dent.obj is not None
-					if self.verbose:
-						print("Deleting %s..."
-							% dent.path())
-					size += dent.obj.gcs_blob.size
-					nfiles += 1
+			# Deleted DirEnt:s will be removed from the tree
+			# after scan()ning it.  We also keep a list in case
+			# there's an error.
+			deleted = [ ]
+			for dent in top.scan(pre_order=False):
 
-					dent.obj.gcs_blob.delete()
+				if self.verbose:
+					print("Deleting %s..." % dent.path())
 
-			if top.isdir():
-				if top is self.remote.root:
-					# rm -rf /
-					self.remote.cwd = top
-				elif self.remote.cwd.has_parent(top):
-					# @cwd is or is under @top.
+				try:
+					if not dent.isdir():
+						assert dent.obj is not None
+						dent.obj.gcs_blob.delete()
+						size += dent.obj.gcs_blob.size
+						nfiles += 1
+				except:	# Remove the @deleted DirEnt:s
+					# from the tree.
+					for dent in deleted:
+						if self.remote.cwd is dent:
+							# If @dent.parent is
+							# also deleted, we'll
+							# move @cwd once again
+							# because @deleted is
+							# in deletion order.
+							self.remote.cwd = \
+								dent.parent
+						dent.parent.remove(dent)
+					raise
+				else:
+					deleted.append(dent)
+
+			if top is self.remote.root:
+				# rm -rf /
+				self.remote.cwd = top
+				self.remote.root.infanticide()
+			else:
+				if top.isdir() and self.remote.cwd \
+							.has_parent(top):
+					# @cwd is or is under @top,
+					# move it to @top's parent.
 					self.remote.cwd = top.parent
+				top.parent.remove(top)
 
-		if self.remote.root in deleted:
-			self.remote.root.infanticide()
-		else:
-			for dent in deleted:
-				dent.parent.remove(dent)
-
-		if self.verbose:
+		if self.verbose nfiles > 0:
 			print()
 			print("Deleted %d file(s) of %s."
 				% (nfiles, humanize_size(size)))
@@ -7600,7 +7621,7 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 
 		if local_isdir:
 			if self.re_baseless.search(src):
-				src_tree = src_top.scan(include_self=False)
+				src_tree = src_top.scan(pre_order=None)
 			else:
 				dst_top /= src_top.fname
 
