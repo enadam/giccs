@@ -319,9 +319,9 @@ class CmdLineOptions: # {{{
 	config_section: str = "default"
 
 	def __init__(self):
-		 # In order to make the most sense in --help, we will add the
-		 # argument groups in this order, relying on dict preserving
-		 # the insertion order.
+		# In order to make the most sense in --help, we will add the
+		# argument groups in this order, relying on dict preserving
+		# the insertion order.
 		self.sections = { }
 		for key, title in (
 			("common",	"Common options"		),
@@ -779,7 +779,7 @@ class CmdTop(CmdLineCommand): # {{{
 				traceback.print_exc()
 			else:
 				print("%s: %s" % (type(ex).__name__, ex),
-	  				file=sys.stderr)
+					file=sys.stderr)
 			return False
 		else:
 			return True
@@ -1934,7 +1934,7 @@ class Backup(Snapshot): # {{{
 	def all_blobs(self) -> Iterable[BackupBlob]:
 		return filter(None, (getattr(self, payload_type.field())
 					for payload_type
-		       			in BackupBlob.PayloadType))
+					in BackupBlob.PayloadType))
 
 	def orphaned(self) -> bool:
 		return not any(
@@ -1993,7 +1993,7 @@ class Snapshots(dict[uuid.UUID, Snapshot]): # {{{
 			snapshot_name = what
 
 		i = bisect.bisect_left(self, snapshot_name,
-			 key=lambda snapshot: snapshot.snapshot_name)
+			key=lambda snapshot: snapshot.snapshot_name)
 		if i < len(self) and self[i].snapshot_name == snapshot_name:
 			return i
 		raise UserError(f"{what} not found {self.where}")
@@ -2341,10 +2341,10 @@ class InternalCipher: # {{{
 			cls.CHUNKS_PER_STRIPE = chunks_per_stripe
 
 	def __init__(self,
-	      		meta_cipher: Primitive,
-	      		bulk_cipher_class: type[Primitive],
+			meta_cipher: Primitive,
+			bulk_cipher_class: type[Primitive],
 			blob_uuid: uuid.UUID, data_type_id: int,
-	      		wrapped: Optional[BinaryIO] = None):
+			wrapped: Optional[BinaryIO] = None):
 		from cryptography.hazmat.primitives.ciphers import aead
 		self.aead = aead
 
@@ -2361,8 +2361,8 @@ class InternalCipher: # {{{
 	# Makes the object ready to encrypt or decrypt another file.
 	# Also the @blob_uuid and/or the data_type_id can be updated.
 	def reset(self, blob_uuid: Optional[uuid.UUID] = None,
-	   		data_type_id: Optional[int] = None,
-	   		wrapped: Optional[BinaryIO] = None) -> None:
+			data_type_id: Optional[int] = None,
+			wrapped: Optional[BinaryIO] = None) -> None:
 		self.bulk_cipher = None
 
 		# Reset @self.auth_data if a new @blob_uuid or @data_type_id
@@ -2456,19 +2456,19 @@ class InternalEncrypt(InternalCipher):
 
 	# The @csrng can be overridden for testing.
 	def __init__(self,
-	      		meta_cipher: Primitive,
-	      		bulk_cipher_class: type[Primitive],
+			meta_cipher: Primitive,
+			bulk_cipher_class: type[Primitive],
 			blob_uuid: uuid.UUID, data_type_id: int,
 			csrng: Optional[random.Random] = None,
-	      		wrapped: Optional[BinaryIO] = None):
+			wrapped: Optional[BinaryIO] = None):
 		super().__init__(meta_cipher, bulk_cipher_class,
 					blob_uuid, data_type_id, wrapped)
 		self.csrng = csrng or self.CSRNG()
 
 	# Also called by super().__init__().
 	def reset(self, blob_uuid: Optional[uuid.UUID] = None,
-	   		data_type_id: Optional[int] = None,
-	   		wrapped: Optional[BinaryIO] = None) -> None:
+			data_type_id: Optional[int] = None,
+			wrapped: Optional[BinaryIO] = None) -> None:
 		super().reset(blob_uuid, data_type_id, wrapped)
 
 		self.ciphertext = bytearray()
@@ -2644,16 +2644,16 @@ class InternalDecrypt(InternalCipher):
 	ciphertext: bytearray
 
 	def __init__(self,
-	      		meta_cipher: Primitive,
-	      		bulk_cipher_class: type[Primitive],
+			meta_cipher: Primitive,
+			bulk_cipher_class: type[Primitive],
 			blob_uuid: uuid.UUID, data_type_id: int,
-	      		wrapped: Optional[BinaryIO] = None):
+			wrapped: Optional[BinaryIO] = None):
 		super().__init__(meta_cipher, bulk_cipher_class,
 					blob_uuid, data_type_id, wrapped)
 
 	def reset(self, blob_uuid: Optional[uuid.UUID] = None,
-	   		data_type_id: Optional[int] = None,
-	   		wrapped: Optional[BinaryIO] = None) -> None:
+			data_type_id: Optional[int] = None,
+			wrapped: Optional[BinaryIO] = None) -> None:
 		super().reset(blob_uuid, data_type_id, wrapped)
 		self.ciphertext = bytearray()
 
@@ -3319,14 +3319,14 @@ class MetaBlob(MetaCipher): # {{{
 
 		if self.has_signature():
 			self.save_metadatum(metadata,
-		       				"blob_uuid", self.blob_uuid)
+						"blob_uuid", self.blob_uuid)
 		if self.args.encrypt_metadata:
 			self.save_metadatum(metadata,
-		       				"blob_path", self.blob_path)
+						"blob_path", self.blob_path)
 
 		if self.args.encrypt:
 			self.save_metadatum(metadata,
-		       				"blob_size", self.blob_size)
+						"blob_size", self.blob_size)
 		self.save_metadatum(metadata, "blob_hash", self.blob_hash)
 		self.save_metadatum(metadata, "file_size", self.file_size)
 
@@ -3352,7 +3352,7 @@ class MetaBlob(MetaCipher): # {{{
 			import pickle
 			self.save_metadatum(
 				gcs_metadata, "metadata",
-		       		self.encrypt(
+				self.encrypt(
 					self.DataType.METADATA,
 					pickle.dumps(metadata)),
 				text=True)
@@ -3418,7 +3418,7 @@ class MetaBlob(MetaCipher): # {{{
 	# in @metadata.
 	def load_metadatum(self, metadata: Optional[dict[str, Any]],
 				key: str, tpe: type[MDT] = str,
-		    		expected: bool = True) -> Optional[MDT]:
+				expected: bool = True) -> Optional[MDT]:
 		if not self.has_metadatum(metadata, key, expected or None):
 			return None
 
@@ -3455,7 +3455,7 @@ class MetaBlob(MetaCipher): # {{{
 	# beforehand.
 	MDT = TypeVar("MetadataType", int, str, bytes, uuid.UUID)
 	def save_metadatum(self,
-		    	metadata: dict[str, Any],
+			metadata: dict[str, Any],
 			key: str, value: Optional[Union[MDT, ByteString]],
 			text: Optional[bool] = None) -> None:
 		if value is None:
@@ -3514,18 +3514,18 @@ class BackupBlob(MetaBlob): # {{{
 		return metadata and "snapshot_uuid" in metadata
 
 	def __init__(self, args: EncryptedBucketOptions,
-	      		payload_type: PayloadType,
+			payload_type: PayloadType,
 			snapshot: Snapshot, parent: Optional[Snapshot],
-	      		backups: Backups):
+			backups: Backups):
 		path = "%s/%s" % (snapshot.snapshot_name, payload_type.field())
 		super().__init__(args, path, backups,
 					payload_type=payload_type,
-		   			snapshot=snapshot, parent=parent)
+					snapshot=snapshot, parent=parent)
 
 	def init_metadata(self, path: str,
 				payload_type: PayloadType,
 				snapshot: Snapshot,
-		   		parent: Optional[Snapshot]) -> None:
+				parent: Optional[Snapshot]) -> None:
 		super().init_metadata(path)
 
 		self.snapshot_name = snapshot.snapshot_name
@@ -3651,7 +3651,7 @@ class Progressometer: # {{{
 			expected_gross: Optional[int] = None,
 			padding: Optional[Union[Padding, int]] = None,
 			padding_seed: Optional[bytes] = None,
-	      		hashing: Optional[Union[bool, bytes]] = None,
+			hashing: Optional[Union[bool, bytes]] = None,
 			final_cb: Optional[Callable[[], None]] = None,
 			autolag: bool = False):
 		self.wrapped = f
@@ -4304,7 +4304,7 @@ class Globber(glob2.Globber): # {{{
 	# If @at_least_one and @at_most_one, return a single string.
 	def glob(self, pattern: str,
 			at_least_one: bool = True,
-	  		must_exist: bool = True,
+			must_exist: bool = True,
 			at_most_one: bool = False) -> Union[Iterable[str], str]:
 		def subst(m: re.Match) -> str:
 			# This is how to escape metacharacters for glob2.glob().
@@ -4379,7 +4379,7 @@ class VirtualGlobber(Globber): # {{{
 		@classmethod
 		def mkdir(cls, globber: VirtualGlobber, fname: str,
 				children: Optional[dict[str, Self]] = None,
-	    			obj: Any = None, volatile: bool = False) \
+				obj: Any = None, volatile: bool = False) \
 				-> Self:
 			self = cls(globber, fname, obj=obj, volatile=volatile)
 			if children is not None:
@@ -4388,7 +4388,7 @@ class VirtualGlobber(Globber): # {{{
 
 		@classmethod
 		def mkfile(cls, globber: VirtualGlobber, fname: str,
-	     			obj: Any = None, volatile: bool = False) \
+				obj: Any = None, volatile: bool = False) \
 				-> Self:
 			self = cls(globber, fname, obj=obj, volatile=volatile)
 
@@ -4423,13 +4423,13 @@ class VirtualGlobber(Globber): # {{{
 
 			return "%s(fname=%r, children=%s, parent=%s)" \
 				% (self.__class__.__name__, self.fname,
-       					children, parent)
+					children, parent)
 
 		# Return the DirEnt's path relative to another path,
 		# or as an absolute path, either from the VirtualGlobber's
 		# current @root or the original root if @full_path is True.
 		def path(self, relative_to: Optional[Self] = None,
-	   			full_path: bool = False) -> pathlib.PurePath:
+				full_path: bool = False) -> pathlib.PurePath:
 			assert not full_path or relative_to is None
 
 			prefix = CurDir
@@ -6570,7 +6570,7 @@ class CmdDownload(CmdExec, DownloadBlobOptions, UploadDownloadOptions,
 		cmd_download(self)
 
 def download_backup(args: CmdDownload,
-		    	fname: str, blob: BackupBlob,
+			fname: str, blob: BackupBlob,
 			btrfs_recv: Sequence[str]) -> int:
 	if not args.ignore_local and os.path.exists(
 					os.path.join(args.dir, fname)):
@@ -6831,7 +6831,7 @@ class FTPClient:
 
 	# Right-justify the @col:th column in @rows, or delete it.
 	def rjust_column(self, rows: Sequence[list[Optional[str]]], col: int,
-		  		min_width: Optional[int] = None) -> None:
+				min_width: Optional[int] = None) -> None:
 		width = None
 		for row in rows:
 			if row[col] is not None:
@@ -6888,8 +6888,7 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdFTPDir(self), CmdFTPDu(self),
-			CmdFTPMkDir(self), CmdFTPRmDir(self),
-			CmdFTPRm(self),
+			CmdFTPMkDir(self), CmdFTPRmDir(self), CmdFTPRm(self),
 			CmdFTPCat(self), CmdFTPPage(self),
 			CmdFTPGet(self), CmdFTPPut(self))
 
@@ -7014,7 +7013,7 @@ class CmdFTPShell(CmdTop):
 			# subcommands).
 			parent = CmdFTPShell.ArgumentParserNoUsage
 			return super().add_subparsers(*args, **kw,
-				 			parser_class=parent)
+							parser_class=parent)
 
 	# Remove the flags we don't want the @subcommands to have.
 	# TODO: currently unused
@@ -7026,14 +7025,14 @@ class CmdFTPShell(CmdTop):
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
 		subcommands = (CmdFTPHelp(self), CmdFTPExit(self),
-		 		CmdFTPLChDir(self), CmdFTPLPwd(self),
-		 		CmdFTPChDir(self), CmdFTPPwd(self),
-		 		CmdFTPDir(self), CmdFTPPDir(self),
-		 		CmdFTPDu(self),
+				CmdFTPLChDir(self), CmdFTPLPwd(self),
+				CmdFTPChDir(self), CmdFTPPwd(self),
+				CmdFTPDir(self), CmdFTPPDir(self),
+				CmdFTPDu(self),
 				CmdFTPMkDir(self), CmdFTPRmDir(self),
 				CmdFTPRm(self),
-		 		CmdFTPCat(self), CmdFTPPage(self),
-		 		CmdFTPGet(self), CmdFTPPut(self))
+				CmdFTPCat(self), CmdFTPPage(self),
+				CmdFTPGet(self), CmdFTPPut(self))
 		return subcommands
 
 class CmdFTPHelp(CmdExec):
@@ -7066,7 +7065,7 @@ class CmdFTPHelp(CmdExec):
 		print("Available commands:")
 		for title, cmd in subcommands:
 			print(f"  * {title}: ", ' ' * (maxwidth - len(title)),
-	 			cmd.help, sep="")
+				cmd.help, sep="")
 
 class CmdFTPExit(CmdExec):
 	cmd = ("exit", "quit")
@@ -7257,7 +7256,7 @@ class CmdFTPPDir(CmdFTPDir):
 	def execute(self: _CmdFTPPDir) -> None:
 		pager = subprocess.Popen(("sensible-pager",),
 						stdin=subprocess.PIPE,
-			   			text=True)
+						text=True)
 		self.output = pager.stdin
 		super().execute()
 		pager.stdin.close()
@@ -8164,10 +8163,10 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 					# symlinks, and also files gone during
 					# the scan.
 					if ex.errno in (errno.ENOENT,
-		     					errno.ELOOP):
+							errno.ELOOP):
 						print(f"{ex.filename}: "
 							f"{ex.strerror}",
-	    						file=sys.stderr)
+							file=sys.stderr)
 						continue
 					raise FatalError from ex
 
@@ -8262,7 +8261,7 @@ class CmdMain(CmdTop):
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdList(), CmdDelete(), CmdIndex(),
-	  		CmdUpload(), CmdDownload(), CmdFTP())
+			CmdUpload(), CmdDownload(), CmdFTP())
 # }}}
 
 # Main starts here. {{{
