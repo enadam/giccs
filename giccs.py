@@ -7964,14 +7964,28 @@ def try_to_upload(self: _CmdFTPPut, blob: MetaBlob,
 			print(f"{msg}...", end="", flush=True)
 		try:
 			try:
+				# If we can overwrite blobs, it's okay
+				# if @to_commit exists.  If metadata
+				# is not encrypted this will be caught
+				# by upload_blob().
+				if self.encrypt_metadata \
+						and overwrite is False:
+					assert isinstance(
+						to_commit,
+						VirtualGlobber.DirEnt)
+					if not to_commit.volatile:
+						raise FileExistsError
+
 				started = time.monotonic()
 				nbytes = callback(
 						blob=blob,
 						overwrite=overwrite,
 						padding=self.padding)
-			except ConsistencyError as ex:
-				if not ex.args[0].endswith(
-						" already exists in bucket"):
+			except (FileExistsError, ConsistencyError)  as ex:
+				if not isinstance(ex, FileExistsError) \
+						and not ex.args[0].endswith(
+							" already exists "
+							"in bucket"):
 					raise
 				elif self.if_exists == self.IfExists.FAIL:
 					if isinstance(to_commit,
@@ -8021,11 +8035,6 @@ def upload_file(self: _CmdFTPPut,
 		src: Union[str, pathlib.PurePath], dst_path: pathlib.PurePath,
 		to_rollback: VirtualGlobber.DirEnt) \
 		-> tuple[Optional[int], Optional[float]]:
-	# Make @dst non-absolute, looks nicer in the GCS console.
-	full_dst = self.remote.root.path(full_path=True)
-	full_dst /= dst_path.relative_to(RootDir)
-	blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
-
 	src = str(src)
 	msg = f"Uploading {src}"
 
@@ -8035,12 +8044,27 @@ def upload_file(self: _CmdFTPPut,
 	if dst != src and dst != f"/{src}":
 		msg += f" as {dst}"
 
+	if self.encrypt_metadata:
+		dst = self.remote.lookup(dst_path, create=True)
+		assert not dst.isdir()
+		assert dst.volatile or dst.obj is not None
+		blob = dst.obj
+	else:
+		dst = dst_path
+		blob = None
+
+	if blob is None:
+		# Make @full_dst non-absolute, looks nicer in the GCS console.
+		full_dst = self.remote.root.path(full_path=True)
+		full_dst /= dst_path.relative_to(RootDir)
+		blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
+
 	# Reopen @src every time we try, in order to read from the beginning.
 	return try_to_upload(
 		self, blob, msg,
 		lambda **kw: upload_blob(self,
 				pipeline_stdin=open(src, "rb"), **kw),
-		dst_path, to_rollback)
+		dst, to_rollback)
 
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# @local := list of source paths as strings
@@ -8080,8 +8104,14 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			remote.rollback()
 			raise IsADirectoryError(remote.path())
 
-		blob = MetaBlob(self,
-			str(remote.path(full_path=True).relative_to(RootDir)))
+		if not remote.volatile:
+			# Replace the existing blob if we're overwriting.
+			assert remote.obj is not None
+			blob = remote.obj
+		else:
+			blob = MetaBlob(self,
+				str(remote.path(full_path=True).relative_to(RootDir)))
+
 		if self.cmd is None:
 			msg = "Uploading from stdin"
 			def fun(**kw):
