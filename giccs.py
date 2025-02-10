@@ -3433,6 +3433,9 @@ class MetaBlob(MetaCipher): # {{{
 				raise SecurityError(
 					"%s[%s]: invalid metadata"
 					% (self.name, key)) from ex
+		elif tpe is datetime.datetime \
+				and isinstance(value, (int, float)):
+			return datetime.datetime.fromtimestamp(value)
 
 		assert isinstance(value, str)
 		if tpe is bytes:
@@ -3442,9 +3445,13 @@ class MetaBlob(MetaCipher): # {{{
 				raise SecurityError(
 					"%s[%s]: couldn't decode metadata"
 					% (self.name, key)) from ex
-		else:	# @tpe is either int or uuid.UUID.
+		else:	# @tpe is either int, uuid.UUID or datetime.datetime.
 			try:
-				return tpe(value)
+				if tpe is datetime.datetime:
+					return datetime.datetime \
+							.fromisoformat(value)
+				else:
+					return tpe(value)
 			except ValueError as ex:
 				raise SecurityError(
 					"%s[%s]: invalid metadata"
@@ -3453,7 +3460,8 @@ class MetaBlob(MetaCipher): # {{{
 	# If @value is None, delete @key from @metadata, otherwise set
 	# @metadata[@key] to @value.  If @text, convert @value to string
 	# beforehand.
-	MDT = TypeVar("MetadataType", int, str, bytes, uuid.UUID)
+	MDT = TypeVar("MetadataType", int, str, bytes,
+					uuid.UUID, datetime.datetime)
 	def save_metadatum(self,
 			metadata: dict[str, Any],
 			key: str, value: Optional[Union[MDT, ByteString]],
@@ -3476,6 +3484,8 @@ class MetaBlob(MetaCipher): # {{{
 		else:	# Convert to a primitive type for pickling.
 			if isinstance(value, uuid.UUID):
 				metadata[key] = value.bytes
+			elif isinstance(value, datetime.datetime):
+				metadata[key] = value.timestamp()
 			elif isinstance(value, (int, str, bytes)):
 				metadata[key] = value
 			else:	# bytearray or memoryview
