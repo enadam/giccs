@@ -3025,6 +3025,9 @@ class MetaBlob(MetaCipher): # {{{
 	# without @args.prefix.
 	blob_path: str
 
+	# The time when the blob was last changed by us.
+	mtime: datetime.datetime
+
 	# The end-to-end hash computed by the Progressometer.  There are
 	# multiple reasons why calcualte this hash:
 	# * Provides an additional layer of defense against reordering
@@ -3271,6 +3274,11 @@ class MetaBlob(MetaCipher): # {{{
 	def init_metadata(self, path: str, **kw) -> None:
 		self.blob_path = path
 
+		# We need to make this timezone-aware, so str(self.mtime)
+		# will include the timezone, and datetime.fromisoformat()
+		# will restore it properly.
+		self.mtime = datetime.datetime.now(datetime.timezone.utc)
+
 	# Called by create_from_gcs_with_metadata() to restore metadata fields
 	# from @metadata.
 	def load_metadata(self, metadata: Optional[dict[str, Any]]) -> None:
@@ -3289,6 +3297,9 @@ class MetaBlob(MetaCipher): # {{{
 		else:
 			self.blob_path = self.args.without_prefix(self.name)
 
+		self.mtime = self.load_metadatum(metadata,
+						"mtime", datetime.datetime)
+
 		expected = self.args.integrity >= self.args.Integrity.SIZE
 		blob_size = self.load_metadatum(
 					metadata, "blob_size", int,
@@ -3298,13 +3309,13 @@ class MetaBlob(MetaCipher): # {{{
 				"%s has unexpected size (%d != %d)"
 				% (self.name, self.blob_size, blob_size))
 
+		self.file_size = self.load_metadatum(metadata, "file_size",
+							int, expected=False)
+
 		expected = self.args.integrity >= self.args.Integrity.HASH
 		self.blob_hash = self.load_metadatum(
 					metadata, "blob_hash", bytes,
 					expected=expected)
-
-		self.file_size = self.load_metadatum(metadata, "file_size",
-							int, expected=False)
 
 		self.padding = self.load_metadatum(
 					metadata, "padding",
@@ -3324,11 +3335,14 @@ class MetaBlob(MetaCipher): # {{{
 			self.save_metadatum(metadata,
 						"blob_path", self.blob_path)
 
+		self.save_metadatum(metadata, "mtime", self.mtime)
+
 		if self.args.encrypt:
 			self.save_metadatum(metadata,
 						"blob_size", self.blob_size)
-		self.save_metadatum(metadata, "blob_hash", self.blob_hash)
 		self.save_metadatum(metadata, "file_size", self.file_size)
+
+		self.save_metadatum(metadata, "blob_hash", self.blob_hash)
 
 		self.save_metadatum(metadata, "padding", self.padding or None)
 		self.save_metadatum(metadata, "padding_seed", self.padding_seed)
@@ -3360,6 +3374,7 @@ class MetaBlob(MetaCipher): # {{{
 
 	# Write new metadata to @self.gcs_blob.
 	def sync_metadata(self) -> None:
+		self.mtime = datetime.datetime.now(datetime.timezone.utc)
 		self.update_metadata()
 		self.gcs_blob.patch()
 
@@ -3385,6 +3400,9 @@ class MetaBlob(MetaCipher): # {{{
 				# Use an unlikely value.
 				size = (1 << 8*8) - 1
 			hasher.update(size.to_bytes(8, "big"))
+
+		# @self.mtime.timestamp() is a float.
+		hasher.update(struct.pack(">d", self.mtime.timestamp()))
 
 		hasher.update(self.padding.to_bytes(8, "big"))
 		hasher.update(self.padding_seed if self.padding_seed is not None
@@ -5597,11 +5615,11 @@ def cmd_list_remote(args: CmdListRemote) -> None:
 				nbytes.add(blob)
 
 			if args.verbose:
-				created = blob.gcs_blob \
-						.time_created.timestamp()
+				mtime = blob.mtime.timestamp()
 				print("", blob.payload_type.field(),
-					time.strftime("%Y-%m-%d %H:%M:%S",
-						time.localtime(created)),
+					time.strftime(
+						"%Y-%m-%d %H:%M:%S",
+						time.localtime(mtime)),
 					SizeAccumulator(blob).get(),
 					args.without_prefix(blob.name),
 					sep="\t")
@@ -5952,11 +5970,11 @@ def cmd_list_index(args: CmdListIndex) -> None:
 		nbytes += backup.index.gcs_blob.size
 
 		if args.verbose:
-			created = backup.index.gcs_blob \
-					.time_created.timestamp()
+			mtime = backup.index.mtime.timestamp()
 			print("",
-				time.strftime("%Y-%m-%d %H:%M:%S",
-					time.localtime(created)),
+				time.strftime(
+					"%Y-%m-%d %H:%M:%S",
+					time.localtime(mtime)),
 				humanize_size(backup.index.gcs_blob.size),
 				sep="\t")
 
@@ -7177,11 +7195,10 @@ class CmdFTPDir(CmdExec):
 			lines.append(line)
 
 			if dent.obj is not None:
-				created = dent.obj.gcs_blob.time_created \
-						.timestamp()
+				mtime = dent.obj.mtime.timestamp()
 				line.append(time.strftime(
 						"%Y-%m-%d %H:%M:%S",
-						time.localtime(created)))
+						time.localtime(mtime)))
 			else:
 				line.append(None)
 
@@ -7878,11 +7895,9 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 					out = self.clone_file(dst, out)
 
 			if self.keep_mtime:
-				# Set @out's mtime to the blob's last_updated
-				# timestamp.
+				# Set @out's mtime to the blob's.
 				os.utime(out.fileno(), times=(
-					time.time(),
-					blob.gcs_blob.updated.timestamp()))
+					time.time(), blob.mtime.timestamp()))
 
 			# Handle write errors before beginning the next cycle.
 			try:
