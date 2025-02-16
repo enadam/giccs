@@ -4974,10 +4974,22 @@ def cat(inp: Optional[int] = None, out: Optional[int] = None,
 		else:
 			n = maxbytes - total
 
-		if (n := os.splice(inp, out, n)) <= 0:
-			break
+		try:
+			n = os.splice(inp, out, n)
+		except OSError as ex:
+			# @inp might not support splice()ing.
+			import errno
+			if ex.errno != errno.EINVAL:
+				raise
 
+			buf = os.read(inp, n)
+			os.write(out, buf)
+			n = len(buf)
+
+		if n <= 0:
+			break
 		total += n
+
 		if maxbytes is not None:
 			assert total <= maxbytes
 
