@@ -7119,9 +7119,12 @@ class CmdFTPLChDir(CmdExec):
 		self.dst = args.directory
 
 	def execute(self):
-		os.chdir(self.local.glob(os.path.expanduser(self.dst),
-						at_least_one=True,
-						at_most_one=True))
+		try:
+			os.chdir(self.local.glob(os.path.expanduser(self.dst),
+							at_least_one=True,
+							at_most_one=True))
+		except OSError as ex:
+			raise FatalError from ex
 
 class CmdFTPLPwd(CmdExec):
 	cmd = "lpwd"
@@ -7834,6 +7837,8 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 		local_isdir = stat.S_ISDIR(os.stat(local).st_mode)
 	except FileNotFoundError:
 		local_isdir = None
+	except OSError as ex:
+		raise FatalError from ex
 
 	if local_isdir is False and (len(remote) > 1 or remote[0][1].isdir()):
 		raise NotADirectoryError(local)
@@ -7867,6 +7872,8 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 			except SystemExit:
 				# Abort the operation.
 				break
+			except OSError as ex:
+				raise FatalError from ex
 			if out is None:
 				# Skip the file.
 				continue
@@ -8090,17 +8097,26 @@ def upload_file(self: _CmdFTPPut,
 		blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
 
 	# Reopen @src every time we try, in order to read from the beginning.
-	return try_to_upload(
-		self, blob, msg,
-		lambda **kw: upload_blob(self,
-				pipeline_stdin=open(src, "rb"), **kw),
-		dst, to_rollback)
+	try:
+		return try_to_upload(
+			self, blob, msg,
+			lambda **kw: upload_blob(self,
+					pipeline_stdin=open(src, "rb"), **kw),
+			dst, to_rollback)
+	except:
+		if isinstance(dst, VirtualGlobber.DirEnt) \
+				and dst is not to_rollback:
+			dst.rollback()
+		raise
 
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# @local := list of source paths as strings
 	if isinstance(self.parent, CmdFTPShell):
-		local = list(self.local.globs(
-				map(os.path.expanduser, self.src)))
+		try:
+			local = list(self.local.globs(
+					map(os.path.expanduser, self.src)))
+		except OSError as ex:
+			raise FatalError from ex
 	else:
 		local = self.src
 
@@ -8179,6 +8195,9 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# symlink loops.
 	seen = set() if self.follow_symlinks else None
 
+	# os.walk(onerror)
+	def walk_error(ex): raise FatalError from ex
+
 	aborted = False
 	nfiles = nbytes = duration = 0
 	for src, mode in local:
@@ -8188,6 +8207,8 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 				dst /= os.path.basename(src)
 			try:
 				n, t = upload_file(self, src, dst, remote)
+			except OSError as ex:
+				raise FatalError from ex
 			except SystemExit:
 				break
 			if n is not None:
@@ -8206,7 +8227,8 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 
 		# Walk the tree of @src_top.
 		for dirpath, dirs, files in os.walk(
-				src_top, followlinks=self.follow_symlinks):
+				src_top, followlinks=self.follow_symlinks,
+				onerror=walk_error):
 			# Replace @src_top with @dst_top in @dirpath.
 			dirpath = pathlib.PurePath(dirpath)
 			dst_dir = dst_top / dirpath.relative_to(src_top)
@@ -8235,6 +8257,8 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 						n, t = upload_file(self,
 							src, dst_dir / fname,
 							remote)
+					except OSError as ex:
+						raise FatalError from ex
 					except SystemExit:
 						aborted = True
 						break
