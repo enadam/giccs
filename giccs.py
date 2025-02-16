@@ -7177,6 +7177,7 @@ class CmdFTPDir(CmdExec):
 	cmd = ("dir", "ls")
 	help = "TODO"
 
+	all:		bool
 	ctime:		bool
 	readdir:	bool
 	recursive:	bool
@@ -7189,6 +7190,7 @@ class CmdFTPDir(CmdExec):
 		super().declare_arguments()
 
 		section = self.sections["operation"]
+		section.add_enable_flag("--all", "-a")
 		section.add_enable_flag("--ctime", "-c")
 		section.add_enable_flag("--directory", "-d")
 		section.add_enable_flag("--recursive", "-R")
@@ -7198,6 +7200,7 @@ class CmdFTPDir(CmdExec):
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
 
+		self.all = args.all
 		self.ctime = args.ctime
 		self.readdir = not args.directory
 		self.recursive = args.recursive
@@ -7267,12 +7270,17 @@ class CmdFTPDir(CmdExec):
 		if header:
 			print(f"{path}:", file=self.output)
 
-		self.print_files((child.fname, child) for child in dent)
+		self.print_files(
+			(child.fname, child) for child in dent
+			if self.all or not child.fname.startswith('.'))
+
 		if not self.recursive:
 			return
 
 		for child in dent:
 			if not child.isdir():
+				continue
+			elif not self.all and child.fname.startswith('.'):
 				continue
 			self.print_dir(os.path.join(path, child.fname), child,
 					divisor=True, header=True)
