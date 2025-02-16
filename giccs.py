@@ -7161,9 +7161,10 @@ class CmdFTPDir(CmdExec):
 	cmd = ("dir", "ls")
 	help = "TODO"
 
-	readdir: bool
-	recursive: bool
-	what: list[str]
+	ctime:		bool
+	readdir:	bool
+	recursive:	bool
+	what:		list[str]
 
 	# Overridden by CmdFTPPDir.
 	output: TextIO = sys.stdout
@@ -7172,6 +7173,7 @@ class CmdFTPDir(CmdExec):
 		super().declare_arguments()
 
 		section = self.sections["operation"]
+		section.add_enable_flag("--ctime", "-c")
 		section.add_enable_flag("--directory", "-d")
 		section.add_enable_flag("--recursive", "-R")
 
@@ -7180,6 +7182,7 @@ class CmdFTPDir(CmdExec):
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
 
+		self.ctime = args.ctime
 		self.readdir = not args.directory
 		self.recursive = args.recursive
 		self.what = args.what
@@ -7195,10 +7198,12 @@ class CmdFTPDir(CmdExec):
 			lines.append(line)
 
 			if dent.obj is not None:
-				mtime = dent.obj.mtime.timestamp()
+				t = dent.obj.gcs_blob.time_created \
+					if self.ctime \
+					else dent.obj.mtime
 				line.append(time.strftime(
 						"%Y-%m-%d %H:%M:%S",
-						time.localtime(mtime)))
+						time.localtime(t.timestamp())))
 			else:
 				line.append(None)
 
