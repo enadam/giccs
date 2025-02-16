@@ -7010,6 +7010,9 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 				print(f"Invalid command.", file=sys.stderr)
 				error = True
 				continue
+			if cmdline == [ "$?" ]:
+				print(int(error))
+				continue
 
 			try:
 				error = not CmdFTPShell(self).run(cmdline)
