@@ -6930,7 +6930,7 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 		return (CmdFTPDir(self), CmdFTPDu(self),
 			CmdFTPMkDir(self), CmdFTPRmDir(self), CmdFTPRm(self),
 			CmdFTPCat(self), CmdFTPPage(self),
-			CmdFTPGet(self), CmdFTPPut(self))
+			CmdFTPGet(self), CmdFTPPut(self), CmdFTPTouch(self))
 
 	# Like shlex.split(), split a line of input into tokens,
 	# paying attention to quotation and escaping.
@@ -7072,7 +7072,8 @@ class CmdFTPShell(CmdTop):
 				CmdFTPMkDir(self), CmdFTPRmDir(self),
 				CmdFTPRm(self),
 				CmdFTPCat(self), CmdFTPPage(self),
-				CmdFTPGet(self), CmdFTPPut(self))
+				CmdFTPGet(self), CmdFTPPut(self),
+				CmdFTPTouch(self))
 		return subcommands
 
 class CmdFTPHelp(CmdExec):
@@ -7999,10 +8000,12 @@ class CmdFTPPut(CmdExec, FTPGetPutOptions):
 		cmd_ftp_put(self)
 
 # Wrapper around @callback, which should upload_blob().
-def try_to_upload(self: _CmdFTPPut, blob: MetaBlob,
+# Returns the number of bytes uploaded and the time it took.
+def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch, blob: MetaBlob,
 		msg: Optional[str], callback: Callable[[Any], int],
 		to_commit: VirtualGlobber.DirEnt|pathlib.PurePath,
-		to_rollback: Optional[VirtualGlobber.DirEnt] = None):
+		to_rollback: Optional[VirtualGlobber.DirEnt] = None) \
+		-> tuple[Optional[int], Optional[float]]:
 	if self.if_exists == self.IfExists.OVERWRITE:
 		overwrite = None
 	else:
@@ -8080,18 +8083,19 @@ def try_to_upload(self: _CmdFTPPut, blob: MetaBlob,
 
 			return nbytes, duration
 
-def upload_file(self: _CmdFTPPut,
+def upload_file(self: _CmdFTPPut|_CmdFTPTouch, msg: Optional[str],
 		src: Union[str, pathlib.PurePath], dst_path: pathlib.PurePath,
-		to_rollback: VirtualGlobber.DirEnt) \
+		to_rollback: Optional[VirtualGlobber.DirEnt] = None) \
 		-> tuple[Optional[int], Optional[float]]:
-	src = str(src)
-	msg = f"Uploading {src}"
+	if msg is None:
+		src = str(src)
+		msg = f"Uploading {src}"
 
-	# @dst_path is absolute, @src can be either
-	# ("ftp put this" or "ftp put /that").
-	dst = str(dst_path)
-	if dst != src and dst != f"/{src}":
-		msg += f" as {dst}"
+		# @dst_path is absolute, @src can be either
+		# ("ftp put this" or "ftp put /that").
+		dst = str(dst_path)
+		if dst != src and dst != f"/{src}":
+			msg += f" as {dst}"
 
 	if self.encrypt_metadata:
 		dst = self.remote.lookup(dst_path, create=True)
@@ -8218,7 +8222,8 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			if remote.isdir():
 				dst /= os.path.basename(src)
 			try:
-				n, t = upload_file(self, src, dst, remote)
+				n, t = upload_file(self, None,
+							src, dst, remote)
 			except OSError as ex:
 				raise FatalError from ex
 			except SystemExit:
@@ -8266,7 +8271,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 
 				if stat.S_ISREG(mode):
 					try:
-						n, t = upload_file(self,
+						n, t = upload_file(self, None,
 							src, dst_dir / fname,
 							remote)
 					except OSError as ex:
@@ -8314,6 +8319,41 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			% (nfiles, humanize_size(nbytes),
 				humanize_duration(duration)))
 
+class CmdFTPTouch(CmdExec):
+	cmd = "touch"
+	help = "TODO"
+
+	what: list[str]
+
+	# Required by try_to_upload().
+	IfExists = FTPGetPutOptions.IfExists
+	if_exists: Final[IfExists] = IfExists.FAIL
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("what", nargs='+')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.what = args.what
+
+	def execute(self: _CmdFTPTouch) -> None:
+		for path in self.remote.globs(self.what, must_exist=False):
+			dent = self.remote.lookup(path, create=True)
+			path = dent.path()
+
+			if dent.isdir():
+				if dent.volatile:
+					# User should use mkdir instead.
+					dent.rollback()
+					raise IsADirectoryError(path)
+			elif dent.volatile:
+				upload_file(self, f"Creating {path}...",
+						"/dev/null", path, dent)
+			else:	# This will update the mtime.
+				print(f"Touching {path}...")
+				dent.obj.sync_metadata()
+
 class _CmdFTPChDir(CmdFTP, CmdFTPChDir): pass
 class _CmdFTPPwd(CmdFTP, CmdFTPPwd): pass
 class _CmdFTPDir(CmdFTP, CmdFTPDir): pass
@@ -8324,6 +8364,7 @@ class _CmdFTPRmDir(CmdFTP, CmdFTPRmDir): pass
 class _CmdFTPRm(CmdFTP, CmdFTPRm): pass
 class _CmdFTPGet(CmdFTP, CmdFTPGet): pass
 class _CmdFTPPut(CmdFTP, CmdFTPPut): pass
+class _CmdFTPTouch(CmdFTP, CmdFTPTouch): pass
 
 # Non-executable subcommands {{{
 class CmdList(CmdLineCommand):
