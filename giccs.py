@@ -4600,7 +4600,9 @@ class VirtualGlobber(Globber): # {{{
 			if self.isdir():
 				self.load_subtree()
 				for child in self:
-					it = child.scan(pre_order=pre_order)
+					# It doesn't make sense to propagate
+					# @pre_order if it's None.
+					it = child.scan(pre_order is not False)
 					yield from it
 
 			if pre_order is False:
@@ -7876,6 +7878,7 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 
 		if local_isdir:
 			if self.re_baseless.search(src):
+				# Omit @src_top itself from the scan().
 				src_tree = src_top.scan(pre_order=None)
 			else:
 				dst_top /= src_top.fname
