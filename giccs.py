@@ -7563,9 +7563,7 @@ class CmdFTPRm(CmdExec):
 				if dent is self.remote.root:
 					continue
 
-				if self.verbose:
-					print("Deleting %s..." % dent.path())
-
+				print("Deleting %s..." % dent.path())
 				try:
 					if dent.isdir():
 						folder_id = self.remote \
