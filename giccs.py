@@ -7081,6 +7081,53 @@ class CmdFTPShell(CmdTop):
 				CmdFTPTouch(self))
 		return subcommands
 
+class FTPOverwriteOptions(CmdLineOptions):
+	class IfExists(Choices, enum.Enum):
+		FAIL		= enum.auto()
+		SKIP		= enum.auto()
+		ASK		= enum.auto()
+		OVERWRITE	= enum.auto()
+
+	if_exists: IfExists = IfExists.FAIL
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["force"]
+		mutex = section.add_mutually_exclusive_group()
+		mutex.add_enable_flag("--no-clobber", "-n")
+		mutex.add_enable_flag("--interactive", "-i")
+		mutex.add_enable_flag("--force", "-f")
+		mutex.add_argument("--exists",
+			choices=self.IfExists.to_choices())
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+
+		if args.no_clobber:
+			self.if_exists = self.IfExists.SKIP
+		elif args.interactive:
+			self.if_exists = self.IfExists.ASK
+		elif args.force:
+			self.if_exists = self.IfExists.OVERWRITE
+		elif args.exists is not None:
+			self.if_exists = self.IfExists.from_choice(args.exists)
+
+	def confirm(self, prompt: str) -> bool:
+		while True:
+			try:
+				ret = input("%s [y/n/q] " % prompt)
+			except EOFError:
+				print()
+				continue
+
+			if ret == 'y':
+				return True
+			elif ret == 'n':
+				return False
+			elif ret == 'q':
+				raise SystemExit
+
 class CmdFTPHelp(CmdExec):
 	cmd = "help"
 	help = "TODO"
@@ -7657,54 +7704,7 @@ class CmdFTPPage(CmdFTPCat):
 			pager.stdin.close()
 			pager.wait()
 
-class FTPGetPutOptions(CmdLineOptions):
-	class IfExists(Choices, enum.Enum):
-		FAIL		= enum.auto()
-		SKIP		= enum.auto()
-		ASK		= enum.auto()
-		OVERWRITE	= enum.auto()
-
-	if_exists: IfExists = IfExists.FAIL
-
-	def declare_arguments(self) -> None:
-		super().declare_arguments()
-
-		section = self.sections["force"]
-		mutex = section.add_mutually_exclusive_group()
-		mutex.add_enable_flag("--no-clobber", "-n")
-		mutex.add_enable_flag("--interactive", "-i")
-		mutex.add_enable_flag("--force", "-f")
-		mutex.add_argument("--exists",
-			choices=self.IfExists.to_choices())
-
-	def pre_validate(self, args: argparse.Namespace) -> None:
-		super().pre_validate(args)
-
-		if args.no_clobber:
-			self.if_exists = self.IfExists.SKIP
-		elif args.interactive:
-			self.if_exists = self.IfExists.ASK
-		elif args.force:
-			self.if_exists = self.IfExists.OVERWRITE
-		elif args.exists is not None:
-			self.if_exists = self.IfExists.from_choice(args.exists)
-
-	def confirm(self, prompt: str) -> bool:
-		while True:
-			try:
-				ret = input("%s [y/n/q] " % prompt)
-			except EOFError:
-				print()
-				continue
-
-			if ret == 'y':
-				return True
-			elif ret == 'n':
-				return False
-			elif ret == 'q':
-				raise SystemExit
-
-class CmdFTPGet(CmdExec, FTPGetPutOptions):
+class CmdFTPGet(CmdExec, FTPOverwriteOptions):
 	cmd = "get"
 	help = "TODO"
 
@@ -7962,7 +7962,7 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 			% (nfiles, humanize_size(nbytes),
 				humanize_duration(duration)))
 
-class CmdFTPPut(CmdExec, FTPGetPutOptions):
+class CmdFTPPut(CmdExec, FTPOverwriteOptions):
 	cmd = "put"
 	help = "TODO"
 
@@ -8342,22 +8342,21 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			% (nfiles, humanize_size(nbytes),
 				humanize_duration(duration)))
 
-class CmdFTPTouch(CmdExec):
+class CmdFTPTouch(FTPOverwriteOptions, CmdExec):
 	cmd = "touch"
 	help = "TODO"
 
 	what: list[str]
 
-	# Required by try_to_upload().
-	IfExists = FTPGetPutOptions.IfExists
-	if_exists: Final[IfExists] = IfExists.FAIL
-
 	def declare_arguments(self) -> None:
-		super().declare_arguments()
+		# We need FTPOverwriteOptions for try_to_upload(),
+		# but we don't want to declare any flags.
+		super(FTPOverwriteOptions, self).declare_arguments()
 		self.sections["positional"].add_argument("what", nargs='+')
 
 	def pre_validate(self, args: argparse.Namespace) -> None:
-		super().pre_validate(args)
+		# Like above.
+		super(FTPOverwriteOptions, self).pre_validate(args)
 		self.what = args.what
 
 	def execute(self: _CmdFTPTouch) -> None:
