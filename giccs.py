@@ -7872,79 +7872,81 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 		raise FileNotFoundError(local)
 
 	nfiles = nbytes = duration = 0
-	for src, src_top in remote:
+	for src_path, src_top in remote:
 		src_tree = src_top.scan()
 		dst_top = local
 
 		if local_isdir:
-			if self.re_baseless.search(src):
+			if self.re_baseless.search(src_path):
 				# Omit @src_top itself from the scan().
 				src_tree = src_top.scan(pre_order=None)
 			else:
 				dst_top /= src_top.fname
 
-		for src in src_tree:
-			dst = dst_top / src.path(src_top)
-			if src.isdir():
+		for src_dent in src_tree:
+			dst_path = dst_top / src_dent.path(src_top)
+			if src_dent.isdir():
 				try:
-					os.mkdir(dst)
+					os.mkdir(dst_path)
 				except FileExistsError:
 					pass
 				else:
-					print(f"Created {dst}.")
+					print(f"Created {dst_path}.")
 				continue
 
 			try:
-				out = self.open_dst(dst)
+				dst = self.open_dst(dst_path)
 			except SystemExit:
 				# Abort the operation.
 				break
 			except OSError as ex:
 				raise FatalError from ex
-			if out is None:
+			if dst is None:
 				# Skip the file.
 				continue
 
 			try:
-				blob = src.obj
-				src = src.path()
-				msg = f"Downloading {src}"
+				src_path = src_dent.path()
+				msg = f"Downloading {src_path}"
 
 				# Similar logic as in upload_file().
-				if not dst.is_absolute():
-					src = src.relative_to(RootDir)
-				if dst != src:
-					msg += f" to {dst}"
+				if not dst_path.is_absolute():
+					src_path = src_path.relative_to(
+								RootDir)
+				if dst_path != src_path:
+					msg += f" to {dst_path}"
 
 				print(f"{msg}...", end="", flush=True)
 				started = time.monotonic()
 				nbytes += download_blob(self,
-						blob, pipeline_stdout=out)
+						src_dent.obj,
+						pipeline_stdout=dst)
 				duration += time.monotonic() - started
 				nfiles += 1
 			finally:
 				print()
 
-			out.flush()
-			if hasattr(out, "file"):
-				# @out was created with tempfile.
+			dst.flush()
+			if hasattr(dst, "file"):
+				# @dst was created with tempfile.
 				if self.overwrite == self.Overwrite.ATOMIC:
-					self.atomic_overwrite(dst, out)
+					self.atomic_overwrite(dst_path, dst)
 				else:	# self.Overwrite.SEMI_ATOMIC
-					out = self.clone_file(dst, out)
+					dst = self.clone_file(dst_path, dst)
 
 			if self.keep_mtime:
-				# Set @out's mtime to the blob's.
-				os.utime(out.fileno(), times=(
-					time.time(), blob.mtime.timestamp()))
+				# Set @dst's mtime to the blob's.
+				os.utime(dst.fileno(), times=(
+					time.time(),
+					src_dent.obj.mtime.timestamp()))
 
 			# Handle write errors before beginning the next cycle.
 			try:
-				out.close()
+				dst.close()
 			except FileNotFoundError:
-				# Ignore the error if @out is a tempfile,
-				# because it could have been renamed to @dst.
-				if not hasattr(out, "file"):
+				# Ignore the error if @dst is a tempfile,
+				# it could have been renamed to @dst_path.
+				if not hasattr(dst, "file"):
 					raise
 		else:	# Loop finished without interruption,
 			# skip the "break" below.
@@ -8225,19 +8227,21 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# symlink loops.
 	seen = set() if self.follow_symlinks else None
 
-	# os.walk(onerror)
-	def walk_error(ex): raise FatalError from ex
+	# The os.walk(onerror) handler.
+	def walk_error(ex: Exception) -> None:
+		raise FatalError from ex
 
 	aborted = False
 	nfiles = nbytes = duration = 0
-	for src, mode in local:
-		if stat.S_ISREG(mode):
-			dst = remote.path()
+	for src_path, src_mode in local:
+		if stat.S_ISREG(src_mode):
+			dst_path = remote.path()
 			if remote.isdir():
-				dst /= os.path.basename(src)
+				dst_path /= os.path.basename(src_path)
 			try:
 				n, t = upload_file(self, None,
-							src, dst, remote)
+							src_path, dst_path,
+							remote)
 			except OSError as ex:
 				raise FatalError from ex
 			except SystemExit:
@@ -8248,27 +8252,30 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 				duration += t
 			continue
 
-		# @src is a directory.
-		src_top = pathlib.PurePath(src)
+		# @src_path is a directory.
+		src_top = pathlib.PurePath(src_path)
 		dst_top = remote.path()
-		if not remote.volatile and not self.re_baseless.search(src):
+		if not remote.volatile \
+				and not self.re_baseless.search(src_path):
 			# put foo bar -> upload foo/* under bar/foo/*
 			# Otherwise upload foo/* under bar/*.
 			dst_top /= src_top.name
 
 		# Walk the tree of @src_top.
-		for dirpath, dirs, files in os.walk(
+		for src_dir, dirs, files in os.walk(
 				src_top, followlinks=self.follow_symlinks,
 				onerror=walk_error):
-			# Replace @src_top with @dst_top in @dirpath.
-			dirpath = pathlib.PurePath(dirpath)
-			dst_dir = dst_top / dirpath.relative_to(src_top)
+			# @dst_dir := @src_dir [@src_top -> @dst_top]
+			src_dir = pathlib.PurePath(src_dir)
+			dst_dir = dst_top / src_dir.relative_to(src_top)
 
 			# Upload the @files in a predictable order.
 			for fname in sorted(files):
-				src = dirpath / fname
+				src_path = src_dir / fname
+				dst_path = dst_dir / fname
+
 				try:
-					mode = os.stat(src).st_mode
+					src_mode = os.stat(src_path).st_mode
 				except OSError as ex:
 					import errno
 
@@ -8283,36 +8290,38 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 						continue
 					raise FatalError from ex
 
-				if stat.S_ISREG(mode):
-					try:
-						n, t = upload_file(self, None,
-							src, dst_dir / fname,
-							remote)
-					except OSError as ex:
-						raise FatalError from ex
-					except SystemExit:
-						aborted = True
-						break
-					if n is not None:
-						nbytes += n
-						nfiles += 1
-						duration += t
-				else:	# Skip pipes, devices etc.
-					print(f"{src}: not a regular file",
+				if not stat.S_ISREG(src_mode):
+					# Skip pipes, devices etc.
+					print("%s: not a regular file"
+							% src_path,
 						file=sys.stderr)
+					continue
+
+				try:
+					n, t = upload_file(self, None,
+						src_path, dst_path, remote)
+				except OSError as ex:
+					raise FatalError from ex
+				except SystemExit:
+					aborted = True
+					break
+				if n is not None:
+					nbytes += n
+					nfiles += 1
+					duration += t
 
 			if aborted:
 				break
 
 			if seen is not None:
 				# Remove directories from @dirs we've @seen.
-				sbuf = os.stat(dirpath)
+				sbuf = os.stat(src_dir)
 				seen.add((sbuf.st_dev, sbuf.st_ino))
 
 				i = 0
 				remove = [ ]
 				for dname in dirs:
-					sbuf = os.stat(dirpath / dname)
+					sbuf = os.stat(src_dir / dname)
 					if (sbuf.st_dev, sbuf.st_ino) in seen:
 						remove.append(i)
 					else:
