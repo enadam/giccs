@@ -4625,17 +4625,25 @@ class VirtualGlobber(Globber): # {{{
 			if not self.volatile:
 				return
 			assert not self.is_tld()
+			self.volatile = False
 
 			child, parent = self, self.parent
 			while parent.volatile:
+				# Make sure we don't roll back @parent again
+				# through a different path.  If we didn't,
+				# the second time we'd find a volatile TLD,
+				# failing the assertion below.
+				parent.volatile = False
 				assert not parent.is_tld()
 				child, parent = parent, parent.parent
 			parent.remove(child)
 
-	root:	DirEnt
-	cwd:	DirEnt
+	root:		DirEnt
+	cwd:		DirEnt
+	volatiles:	list[DirEnt]
 
 	def __init__(self, files: Iterable[Any] = ()):
+		self.volatiles = [ ]
 		self.cwd = self.root = self.DirEnt.mkroot(self)
 		for file in files:
 			self.add_file(pathlib.PurePath(str(file)), file)
@@ -4685,6 +4693,7 @@ class VirtualGlobber(Globber): # {{{
 			parts = path.parts
 			dent = self.cwd
 
+		created = False
 		for i, fname in enumerate(parts):
 			dent.must_be_dir()
 			if fname != "..":
@@ -4706,8 +4715,28 @@ class VirtualGlobber(Globber): # {{{
 								volatile=True)
 					parent.add(dent)
 
+					if not created:
+						created = True
+						self.volatiles.append(dent)
+					else:	# Make DirEnt.rollback()
+						# more efficient by having
+						# the bottommost child in
+						# @self.volatiles.
+						assert(self.volatiles[-1]
+							is dent.parent)
+						self.volatiles[-1] = dent
+
 					if callable(create):
 						create(dent)
+			elif created:
+				# Refuse to create multiple directories by
+				# looking up enoent-1/../enoent-2/../enoent-3,
+				# because it's surprising and we're adding
+				# only one DirEnt to @self.volatiles.
+				raise UserError(
+					"%s: cannot reference the parent "
+					"of a newly created directory"
+					% path)
 			elif not dent.is_tld():
 				# @fname == "..", go one level up if we can.
 				dent = dent.parent
@@ -4715,6 +4744,11 @@ class VirtualGlobber(Globber): # {{{
 			dent.must_be_dir()
 
 		return dent
+
+	def rollback(self) -> None:
+		for dent in self.volatiles:
+			dent.rollback()
+		self.volatiles.clear()
 
 	def chdir(self, path: Union[str, pathlib.PurePath],
 			create: bool = False) -> None:
@@ -7025,6 +7059,8 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 				error = True
 			except CmdFTPExit.ExitFTP:
 				break
+			finally:
+				self.remote.rollback()
 
 		if error:
 			sys.exit(1)
@@ -7462,13 +7498,8 @@ class CmdFTPMkDir(CmdExec):
 			folder_id = self.remote.gcs_prefix(dent)
 			assert folder_id is not None
 
-			try:
-				self.create_folder(folder_id)
-			except:
-				dent.rollback()
-				raise
-			else:
-				dent.commit()
+			self.create_folder(folder_id)
+			dent.commit()
 
 		# It doesn't make a lot of sense to specify a pattern for this
 		# command, but let's accept them anyway, so we behave like a
@@ -8017,8 +8048,7 @@ class CmdFTPPut(CmdExec, FTPOverwriteOptions):
 # Returns the number of bytes uploaded and the time it took.
 def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch, blob: MetaBlob,
 		msg: Optional[str], callback: Callable[[Any], int],
-		to_commit: VirtualGlobber.DirEnt|pathlib.PurePath,
-		to_rollback: Optional[VirtualGlobber.DirEnt] = None) \
+		to_commit: VirtualGlobber.DirEnt|pathlib.PurePath) \
 		-> tuple[Optional[int], Optional[float]]:
 	if self.if_exists == self.IfExists.OVERWRITE:
 		overwrite = None
@@ -8061,16 +8091,12 @@ def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch, blob: MetaBlob,
 						dst = to_commit
 					raise FileExistsError(str(dst))
 				elif self.if_exists == self.IfExists.SKIP:
-					# It's not necessary to roll back
-					# @to_rollback, since the blob's
-					# path exists.
 					print(" blob exists, skipping.")
 					return None, None
 
 				assert self.if_exists == self.IfExists.ASK
 				if not self.confirm(" blob exists, "
 							"overwrite?"):
-					# Like above.
 					return None, None
 
 				# This is the only path where we re-run
@@ -8083,8 +8109,6 @@ def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch, blob: MetaBlob,
 			# self.confirm().
 			if not isinstance(ex, SystemExit):
 				print()
-			if to_rollback is not None:
-				to_rollback.rollback()
 			raise
 		else:
 			duration = time.monotonic() - started
@@ -8099,8 +8123,7 @@ def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch, blob: MetaBlob,
 
 def upload_file(self: _CmdFTPPut|_CmdFTPTouch, msg: Optional[str],
 		src: Union[str, pathlib.PurePath], dst_path: pathlib.PurePath,
-		to_rollback: Optional[VirtualGlobber.DirEnt] = None) \
-		-> tuple[Optional[int], Optional[float]]:
+		) -> tuple[Optional[int], Optional[float]]:
 	if msg is None:
 		src = str(src)
 		msg = f"Uploading {src}"
@@ -8127,17 +8150,11 @@ def upload_file(self: _CmdFTPPut|_CmdFTPTouch, msg: Optional[str],
 		blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
 
 	# Reopen @src every time we try, in order to read from the beginning.
-	try:
-		return try_to_upload(
-			self, blob, msg,
-			lambda **kw: upload_blob(self,
-					pipeline_stdin=open(src, "rb"), **kw),
-			dst, to_rollback)
-	except:
-		if isinstance(dst, VirtualGlobber.DirEnt) \
-				and dst is not to_rollback:
-			dst.rollback()
-		raise
+	return try_to_upload(
+		self, blob, msg,
+		lambda **kw: upload_blob(self,
+				pipeline_stdin=open(src, "rb"), **kw),
+		dst)
 
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# @local := list of source paths as strings
@@ -8177,7 +8194,6 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# Handle --stdin and --cmd.
 	if not self.src:
 		if remote.isdir():
-			remote.rollback()
 			raise IsADirectoryError(remote.path())
 
 		if not remote.volatile:
@@ -8202,21 +8218,19 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 
 			try_to_upload(self, blob,
 				None if sys.stdin.isatty() else msg, fun,
-				remote, remote)
+				remote)
 		else:
 			try_to_upload(self, blob,
 				"Uploading from %s" % shlex.quote(self.cmd),
 				lambda **kw: upload_blob(self,
 						command=self.cmd, **kw),
-				remote, remote)
+				remote)
 		return
 
 	# If @remote is not a directory, @local must be a single regular file.
 	if (len(local) > 1 or stat.S_ISDIR(local[0][1])) \
 			and not remote.isdir():
 		if remote.volatile:
-			# @remote was provisionally created.
-			remote.rollback()
 			raise FileNotFoundError(remote.path())
 		else:
 			raise NotADirectoryError(remote.path())
@@ -8237,9 +8251,9 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			if remote.isdir():
 				dst_path /= os.path.basename(src_path)
 			try:
-				n, t = upload_file(self, None,
-							src_path, dst_path,
-							remote)
+				n, t = upload_file(
+						self, None,
+						src_path, dst_path)
 			except OSError as ex:
 				raise FatalError from ex
 			except SystemExit:
@@ -8296,8 +8310,9 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 					continue
 
 				try:
-					n, t = upload_file(self, None,
-						src_path, dst_path, remote)
+					n, t = upload_file(
+							self, None,
+							src_path, dst_path)
 				except OSError as ex:
 					raise FatalError from ex
 				except SystemExit:
@@ -8365,11 +8380,10 @@ class CmdFTPTouch(FTPOverwriteOptions, CmdExec):
 			if dent.isdir():
 				if dent.volatile:
 					# User should use mkdir instead.
-					dent.rollback()
 					raise IsADirectoryError(path)
 			elif dent.volatile:
 				upload_file(self, f"Creating {path}...",
-						"/dev/null", path, dent)
+						"/dev/null", path)
 			else:	# This will update the mtime.
 				print(f"Touching {path}...")
 				dent.obj.sync_metadata()
