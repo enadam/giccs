@@ -8046,50 +8046,40 @@ class CmdFTPPut(CmdExec, FTPOverwriteOptions):
 
 # Wrapper around @callback, which should upload_blob().
 # Returns the number of bytes uploaded and the time it took.
-def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch, blob: MetaBlob,
-		msg: Optional[str], callback: Callable[[Any], int],
-		to_commit: VirtualGlobber.DirEnt|pathlib.PurePath) \
-		-> tuple[Optional[int], Optional[float]]:
+def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch,
+			blob: MetaBlob, dst: VirtualGlobber.DirEnt,
+			callback: Callable[[Any], int],
+			msg: Optional[str] = None) \
+			-> tuple[Optional[int], Optional[float]]:
 	if self.if_exists == self.IfExists.OVERWRITE:
+		# Overwrite the file if it exists.
 		overwrite = None
-	else:
+	else:	# Do not overwrite an existing file on the first try.
 		overwrite = False
 
 	while True:
 		if msg is not None:
 			print(f"{msg}...", end="", flush=True)
+
 		try:
 			try:
-				# If we can overwrite blobs, it's okay
-				# if @to_commit exists.  If metadata
-				# is not encrypted this will be caught
-				# by upload_blob().
-				if self.encrypt_metadata \
-						and overwrite is False:
-					assert isinstance(
-						to_commit,
-						VirtualGlobber.DirEnt)
-					if not to_commit.volatile:
-						raise FileExistsError
+				if overwrite is False and not dst.volatile:
+					# Will be handled below.
+					raise FileExistsError
 
 				started = time.monotonic()
 				nbytes = callback(
 						blob=blob,
 						overwrite=overwrite,
 						padding=self.padding)
-			except (FileExistsError, ConsistencyError)  as ex:
+			except (FileExistsError, ConsistencyError) as ex:
 				if not isinstance(ex, FileExistsError) \
 						and not ex.args[0].endswith(
 							" already exists "
 							"in bucket"):
 					raise
 				elif self.if_exists == self.IfExists.FAIL:
-					if isinstance(to_commit,
-							VirtualGlobber.DirEnt):
-						dst = to_commit.path()
-					else:
-						dst = to_commit
-					raise FileExistsError(str(dst))
+					raise FileExistsError(str(dst.path()))
 				elif self.if_exists == self.IfExists.SKIP:
 					print(" blob exists, skipping.")
 					return None, None
@@ -8099,9 +8089,10 @@ def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch, blob: MetaBlob,
 							"overwrite?"):
 					return None, None
 
-				# This is the only path where we re-run
-				# the loop.  Use "continue" to skip the
-				# "else" branch below.
+				# The only time we re-run the loop is when
+				# the user was asked whether to overwrite
+				# the file and said yes.  Use "continue"
+				# to skip the "else" branch below.
 				overwrite = None
 				continue
 		except Exception as ex:
@@ -8114,47 +8105,47 @@ def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch, blob: MetaBlob,
 			duration = time.monotonic() - started
 			print()
 
-			if isinstance(to_commit, pathlib.PurePath):
-				to_commit = self.remote.lookup(to_commit,
-								create=True)
-			to_commit.commit(blob)
-
+			dst.commit(blob)
 			return nbytes, duration
 
-def upload_file(self: _CmdFTPPut|_CmdFTPTouch, msg: Optional[str],
-		src: Union[str, pathlib.PurePath], dst_path: pathlib.PurePath,
-		) -> tuple[Optional[int], Optional[float]]:
+def upload_file(self: _CmdFTPPut|_CmdFTPTouch,
+		src_path: Union[str, pathlib.PurePath],
+		dst_path: pathlib.PurePath,
+		dst_dent: Optional[VirtualGlobber.DirEnt] = None,
+		msg: Optional[str] = None) \
+		-> tuple[Optional[int], Optional[float]]:
 	if msg is None:
-		src = str(src)
-		msg = f"Uploading {src}"
+		msg = f"Uploading {src_path}"
+		if not isinstance(src_path, pathlib.PurePath):
+			src_path = pathlib.PurePath(src_path)
 
-		# @dst_path is absolute, @src can be either
+		# @dst_path is absolute, @src_path can be either
 		# ("ftp put this" or "ftp put /that").
-		dst = str(dst_path)
-		if dst != src and dst != f"/{src}":
-			msg += f" as {dst}"
+		if src_path.is_absolute():
+			same = (dst_path == src_path)
+		else:
+			same = (dst_path.relative_to(RootDir) == src_path)
+		if not same:
+			msg += f" as {dst_path}"
 
-	if self.encrypt_metadata:
-		dst = self.remote.lookup(dst_path, create=True)
-		assert not dst.isdir()
-		assert dst.volatile or dst.obj is not None
-		blob = dst.obj
-	else:
-		dst = dst_path
-		blob = None
+	if dst_dent is None:
+		dst_dent = self.remote.lookup(dst_path, create=True)
+	assert not dst_dent.isdir()
 
-	if blob is None:
+	if dst_dent.volatile:
 		# Make @full_dst non-absolute, looks nicer in the GCS console.
 		full_dst = self.remote.root.path(full_path=True)
 		full_dst /= dst_path.relative_to(RootDir)
 		blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
+	else:
+		blob = dst_dent.obj
+		assert blob is not None
 
-	# Reopen @src every time we try, in order to read from the beginning.
-	return try_to_upload(
-		self, blob, msg,
-		lambda **kw: upload_blob(self,
-				pipeline_stdin=open(src, "rb"), **kw),
-		dst)
+	# Reopen @src_path every time we try, in order to read from the
+	# beginning (it might not be seekable).
+	fun = lambda **kw: \
+		upload_blob(self, pipeline_stdin=open(src_path, "rb"), **kw)
+	return try_to_upload(self, blob, dst_dent, fun, msg)
 
 def cmd_ftp_put(self: _CmdFTPPut) -> None:
 	# @local := list of source paths as strings
@@ -8216,15 +8207,13 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 							closefd=False),
 						**kw)
 
-			try_to_upload(self, blob,
-				None if sys.stdin.isatty() else msg, fun,
-				remote)
+			try_to_upload(self, blob, remote, fun,
+				None if sys.stdin.isatty() else msg)
 		else:
-			try_to_upload(self, blob,
-				"Uploading from %s" % shlex.quote(self.cmd),
-				lambda **kw: upload_blob(self,
-						command=self.cmd, **kw),
-				remote)
+			fun = lambda **kw: \
+				upload_blob(self, command=self.cmd, **kw)
+			try_to_upload(self, blob, remote, fun,
+				"Uploading from %s" % shlex.quote(self.cmd))
 		return
 
 	# If @remote is not a directory, @local must be a single regular file.
@@ -8251,9 +8240,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			if remote.isdir():
 				dst_path /= os.path.basename(src_path)
 			try:
-				n, t = upload_file(
-						self, None,
-						src_path, dst_path)
+				n, t = upload_file(self, src_path, dst_path)
 			except OSError as ex:
 				raise FatalError from ex
 			except SystemExit:
@@ -8310,8 +8297,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 					continue
 
 				try:
-					n, t = upload_file(
-							self, None,
+					n, t = upload_file(self,
 							src_path, dst_path)
 				except OSError as ex:
 					raise FatalError from ex
@@ -8382,8 +8368,8 @@ class CmdFTPTouch(FTPOverwriteOptions, CmdExec):
 					# User should use mkdir instead.
 					raise IsADirectoryError(path)
 			elif dent.volatile:
-				upload_file(self, f"Creating {path}...",
-						"/dev/null", path)
+				upload_file(self, "/dev/null", path, dent,
+						f"Creating {path}...")
 			else:	# This will update the mtime.
 				print(f"Touching {path}...")
 				dent.obj.sync_metadata()
