@@ -9,7 +9,7 @@ from typing import	TypeVar, ParamSpec, Protocol, Self, \
 			Container, Collection, Sequence, \
 			TextIO, BinaryIO, ByteString
 
-import sys, os
+import sys, os, errno
 import io, fcntl, stat
 import subprocess, multiprocessing
 import pathlib, glob2
@@ -110,7 +110,25 @@ class GiCCSError(Exception):
 			else:
 				parts.append(str(arg))
 
-		return ' '.join(parts)
+		args = ' '.join(parts)
+		if isinstance(self.__cause__, OSError) \
+				and self.__cause__.errno is None:
+			if isinstance(self.__cause__, FileExistsError):
+				self.__cause__.errno = errno.EEXIST
+			elif isinstance(self.__cause__, FileNotFoundError):
+				self.__cause__.errno = errno.ENOENT
+			elif isinstance(self.__cause__, IsADirectoryError):
+				self.__cause__.errno = errno.EISDIR
+			elif isinstance(self.__cause__, NotADirectoryError):
+				self.__cause__.errno = errno.ENOTDIR
+
+			if self.__cause__.errno is not None:
+				return "[Errno %d] %s: %s" % (
+					self.__cause__.errno,
+					os.strerror(self.__cause__.errno),
+					args)
+
+		return args
 
 # Bad user input.
 class UserError(GiCCSError): pass
@@ -5014,7 +5032,6 @@ def cat(inp: Optional[int] = None, out: Optional[int] = None,
 			n = os.splice(inp, out, n)
 		except OSError as ex:
 			# @inp might not support splice()ing.
-			import errno
 			if ex.errno != errno.EINVAL:
 				raise
 
@@ -7857,8 +7874,6 @@ class CmdFTPGet(CmdExec, FTPOverwriteOptions):
 		try:
 			fcntl.ioctl(fd, FICLONE, tmp.fileno())
 		except OSError as ex:
-			import errno
-
 			os.close(fd)
 			if ex.errno not in (
 					errno.EOPNOTSUPP,
@@ -8259,8 +8274,6 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 				try:
 					src_mode = os.stat(src_path).st_mode
 				except OSError as ex:
-					import errno
-
 					# Skip dangling and self-referencing
 					# symlinks, and also files gone during
 					# the scan.
