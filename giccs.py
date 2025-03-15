@@ -8051,62 +8051,45 @@ def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch,
 			callback: Callable[[Any], int],
 			msg: Optional[str] = None) \
 			-> tuple[Optional[int], Optional[float]]:
-	if self.if_exists == self.IfExists.OVERWRITE:
-		# Overwrite the file if it exists.
-		overwrite = None
-	else:	# Do not overwrite an existing file on the first try.
-		overwrite = False
+	if msg is not None:
+		print(f"{msg}...", end="", flush=True)
+		sep = ' '
+	else:
+		sep = ""
 
-	while True:
+	overwrite = (self.if_exists == self.IfExists.OVERWRITE)
+	if not dst.volatile and not overwrite:
+		# @dst exists, should we overwrite it?
+		if self.if_exists == self.IfExists.FAIL:
+			if msg is not None:
+				print()
+			raise FileExistsError(str(dst.path()))
+		elif self.if_exists == self.IfExists.SKIP:
+			print(f"{sep}blob exists, skipping.")
+			return None, None
+
+		assert self.if_exists == self.IfExists.ASK
+		if not self.confirm(f"{sep}blob exists, overwrite?"):
+			return None, None
+
+		overwrite = True
 		if msg is not None:
 			print(f"{msg}...", end="", flush=True)
 
-		try:
-			try:
-				if overwrite is False and not dst.volatile:
-					# Will be handled below.
-					raise FileExistsError
+	try:
+		started = time.monotonic()
+		nbytes = callback(
+				blob=blob, padding=self.padding,
+				overwrite=None if overwrite else False)
+	except Exception:
+		print()
+		raise
 
-				started = time.monotonic()
-				nbytes = callback(
-						blob=blob,
-						overwrite=overwrite,
-						padding=self.padding)
-			except (FileExistsError, ConsistencyError) as ex:
-				if not isinstance(ex, FileExistsError) \
-						and not ex.args[0].endswith(
-							" already exists "
-							"in bucket"):
-					raise
-				elif self.if_exists == self.IfExists.FAIL:
-					raise FileExistsError(str(dst.path()))
-				elif self.if_exists == self.IfExists.SKIP:
-					print(" blob exists, skipping.")
-					return None, None
+	duration = time.monotonic() - started
+	print()
 
-				assert self.if_exists == self.IfExists.ASK
-				if not self.confirm(" blob exists, "
-							"overwrite?"):
-					return None, None
-
-				# The only time we re-run the loop is when
-				# the user was asked whether to overwrite
-				# the file and said yes.  Use "continue"
-				# to skip the "else" branch below.
-				overwrite = None
-				continue
-		except Exception as ex:
-			# Don't add another newline if we're coming from
-			# self.confirm().
-			if not isinstance(ex, SystemExit):
-				print()
-			raise
-		else:
-			duration = time.monotonic() - started
-			print()
-
-			dst.commit(blob)
-			return nbytes, duration
+	dst.commit(blob)
+	return nbytes, duration
 
 def upload_file(self: _CmdFTPPut|_CmdFTPTouch,
 		src_path: Union[str, pathlib.PurePath],
