@@ -1046,8 +1046,8 @@ class BucketOptions(AccountOptions): # {{{
 
 	# Return a GCS prefix that matches all blobs under @path.
 	def gcs_prefix(self, path: pathlib.PurePath) -> Optional[str]:
-		if self.prefix is None and path == RootDir:
-			return None
+		if path == RootDir:
+			return self.with_prefix("") or None
 		return self.with_prefix(str(path.relative_to(RootDir))) + '/'
 
 	def bucket_path(self) -> str:
@@ -3221,8 +3221,11 @@ class MetaBlob(MetaCipher): # {{{
 		try:
 			self.blob_uuid = uuid.UUID(blob_uuid)
 		except ValueError as ex:
+			# If a volume has a prefix, all volumes
+			# in the bucket must have a prefix too.
 			raise ConsistencyError(
-				"%s has invalid UUID (%s)"
+				"%s has invalid UUID (%s), "
+				"maybe you need to specify a --prefix"
 				% (self.name, blob_uuid)) from ex
 
 	# Decrypt and decode @self.gcs_blob.metadata["metadata"].
