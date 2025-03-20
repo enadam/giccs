@@ -3044,7 +3044,7 @@ class MetaBlob(MetaCipher): # {{{
 	user_path: str
 
 	# The time when the blob was last changed by us.
-	mtime: datetime.datetime
+	user_mtime: datetime.datetime
 
 	# The end-to-end hash computed by the Progressometer.  There are
 	# multiple reasons why calcualte this hash:
@@ -3296,10 +3296,10 @@ class MetaBlob(MetaCipher): # {{{
 	def init_metadata(self, path: str, **kw) -> None:
 		self.user_path = path
 
-		# We need to make this timezone-aware, so str(self.mtime)
+		# We need to make this timezone-aware, so str(self.user_mtime)
 		# will include the timezone, and datetime.fromisoformat()
 		# will restore it properly.
-		self.mtime = datetime.datetime.now(datetime.timezone.utc)
+		self.user_mtime = datetime.datetime.now(datetime.timezone.utc)
 
 	# Called by create_from_gcs_with_metadata() to restore metadata fields
 	# from @metadata.
@@ -3320,7 +3320,7 @@ class MetaBlob(MetaCipher): # {{{
 			self.user_path = self.args.without_prefix(
 								self.blob_name)
 
-		self.mtime = self.load_metadatum(metadata,
+		self.user_mtime = self.load_metadatum(metadata,
 						"mtime", datetime.datetime)
 
 		expected = self.args.integrity >= self.args.Integrity.SIZE
@@ -3358,7 +3358,7 @@ class MetaBlob(MetaCipher): # {{{
 			self.save_metadatum(metadata,
 						"user_path", self.user_path)
 
-		self.save_metadatum(metadata, "mtime", self.mtime)
+		self.save_metadatum(metadata, "mtime", self.user_mtime)
 
 		if self.args.encrypt:
 			self.save_metadatum(metadata,
@@ -3397,7 +3397,7 @@ class MetaBlob(MetaCipher): # {{{
 
 	# Write new metadata to @self.gcs_blob.
 	def sync_metadata(self) -> None:
-		self.mtime = datetime.datetime.now(datetime.timezone.utc)
+		self.user_mtime = datetime.datetime.now(datetime.timezone.utc)
 		self.update_metadata()
 		self.gcs_blob.patch()
 
@@ -3424,8 +3424,8 @@ class MetaBlob(MetaCipher): # {{{
 				size = (1 << 8*8) - 1
 			hasher.update(size.to_bytes(8, "big"))
 
-		# @self.mtime.timestamp() is a float.
-		hasher.update(struct.pack(">d", self.mtime.timestamp()))
+		# @self.user_mtime.timestamp() is a float.
+		hasher.update(struct.pack(">d", self.user_mtime.timestamp()))
 
 		hasher.update(self.padding.to_bytes(8, "big"))
 		hasher.update(self.padding_seed if self.padding_seed is not None
@@ -5684,7 +5684,7 @@ def cmd_list_remote(args: CmdListRemote) -> None:
 				nbytes.add(blob)
 
 			if args.verbose:
-				mtime = blob.mtime.timestamp()
+				mtime = blob.user_mtime.timestamp()
 				print("", blob.payload_type.field(),
 					time.strftime(
 						"%Y-%m-%d %H:%M:%S",
@@ -6039,7 +6039,7 @@ def cmd_list_index(args: CmdListIndex) -> None:
 		nbytes += backup.index.gcs_blob.size
 
 		if args.verbose:
-			mtime = backup.index.mtime.timestamp()
+			mtime = backup.index.user_mtime.timestamp()
 			print("",
 				time.strftime(
 					"%Y-%m-%d %H:%M:%S",
@@ -7328,7 +7328,7 @@ class CmdFTPDir(CmdExec):
 			if dent.obj is not None:
 				t = dent.obj.gcs_blob.time_created \
 					if self.ctime \
-					else dent.obj.mtime
+					else dent.obj.user_mtime
 				line.append(time.strftime(
 						"%Y-%m-%d %H:%M:%S",
 						time.localtime(t.timestamp())))
@@ -7986,7 +7986,7 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 				# Set @dst's mtime to the blob's.
 				os.utime(dst.fileno(), times=(
 					time.time(),
-					src_dent.obj.mtime.timestamp()))
+					src_dent.obj.user_mtime.timestamp()))
 
 			# Handle write errors before beginning the next cycle.
 			try:
