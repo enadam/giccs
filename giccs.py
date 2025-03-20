@@ -3046,6 +3046,9 @@ class MetaBlob(MetaCipher): # {{{
 	# The time when the blob was last changed by us.
 	user_mtime: datetime.datetime
 
+	# The size of the payload before compression and encryption.
+	user_size: Optional[int] = None
+
 	# The end-to-end hash computed by the Progressometer.  There are
 	# multiple reasons why calcualte this hash:
 	# * Provides an additional layer of defense against reordering
@@ -3053,9 +3056,6 @@ class MetaBlob(MetaCipher): # {{{
 	# * Gives integrity protection in case external encryption doesn't
 	#   provide it.
 	blob_hash: Optional[bytes] = None
-
-	# The size of the payload before compression and encryption.
-	file_size: Optional[int] = None
 
 	# Padding added to the payload after compression and encryption,
 	# generated from @padding_seed.
@@ -3332,7 +3332,7 @@ class MetaBlob(MetaCipher): # {{{
 				"%s has unexpected size (%d != %d)"
 				% (self.blob_name, self.blob_size, blob_size))
 
-		self.file_size = self.load_metadatum(metadata, "file_size",
+		self.user_size = self.load_metadatum(metadata, "user_size",
 							int, expected=False)
 
 		expected = self.args.integrity >= self.args.Integrity.HASH
@@ -3363,7 +3363,7 @@ class MetaBlob(MetaCipher): # {{{
 		if self.args.encrypt:
 			self.save_metadatum(metadata,
 						"blob_size", self.blob_size)
-		self.save_metadatum(metadata, "file_size", self.file_size)
+		self.save_metadatum(metadata, "user_size", self.user_size)
 
 		self.save_metadatum(metadata, "blob_hash", self.blob_hash)
 
@@ -3418,7 +3418,7 @@ class MetaBlob(MetaCipher): # {{{
 		hasher.update(self.args.with_prefix(self.user_path).encode())
 		hasher.update(b'\0')
 
-		for size in (self.blob_size, self.file_size):
+		for size in (self.blob_size, self.user_size):
 			if size is None:
 				# Use an unlikely value.
 				size = (1 << 8*8) - 1
@@ -3973,8 +3973,8 @@ class SizeAccumulator: # {{{
 	_blob_size: Optional[int] = None
 	_blob_size_incomplete: bool = False
 
-	_file_size: Optional[int] = None
-	_file_size_incomplete: bool = False
+	_user_size: Optional[int] = None
+	_user_size_incomplete: bool = False
 
 	def __init__(self, init: Optional[Union[int, MetaBlob]] = None):
 		if isinstance(init, int):
@@ -3995,12 +3995,12 @@ class SizeAccumulator: # {{{
 			self._add("_blob_size", what._blob_size)
 			self._blob_size_incomplete |= \
 					what._blob_size_incomplete
-			self._add("_file_size", what._file_size)
-			self._file_size_incomplete |= \
-					what._file_size_incomplete
+			self._add("_user_size", what._user_size)
+			self._user_size_incomplete |= \
+					what._user_size_incomplete
 		else:
 			self._add("_blob_size", what.blob_size)
-			self._add("_file_size", what.file_size)
+			self._add("_user_size", what.user_size)
 
 	def _get(self, attr: str, none: bool = False, **kw) -> Optional[str]:
 		value = getattr(self, attr)
@@ -4019,15 +4019,15 @@ class SizeAccumulator: # {{{
 	def blob_size(self, none: bool = False, **kw) -> Optional[str]:
 		return self._get("_blob_size", none=none, **kw)
 
-	def file_size(self, none: bool = False, **kw) -> Optional[str]:
-		return self._get("_file_size", none=none, **kw)
+	def user_size(self, none: bool = False, **kw) -> Optional[str]:
+		return self._get("_user_size", none=none, **kw)
 
 	def get(self, **kw) -> str:
 		sizes = [ self.blob_size(**kw) ]
 
-		file_size = self.file_size(none=True, **kw)
-		if file_size is not None:
-			sizes.append(file_size)
+		user_size = self.user_size(none=True, **kw)
+		if user_size is not None:
+			sizes.append(user_size)
 
 		return '/'.join(sizes)
 # }}}
@@ -5263,7 +5263,7 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 						blob.DataType.PAYLOAD)
 				assert bytes_in >= len(header)
 				bytes_in -= len(header)
-		blob.file_size = bytes_in
+		blob.user_size = bytes_in
 
 	if padding is not None:
 		assert isinstance(src.padding, int)
@@ -7345,7 +7345,7 @@ class CmdFTPDir(CmdExec):
 				total_size.add(size)
 
 				line.append(size.blob_size(with_exact=True))
-				line.append(size.file_size(with_exact=True))
+				line.append(size.user_size(with_exact=True))
 
 			line.append(path)
 
@@ -7472,7 +7472,7 @@ class CmdFTPDu(CmdExec):
 
 				lines.append([
 					size.blob_size(with_exact=True),
-					size.file_size(with_exact=True),
+					size.user_size(with_exact=True),
 					match,
 				])
 
