@@ -1924,13 +1924,13 @@ class Backup(Snapshot): # {{{
 		if blob.snapshot_name != self.snapshot_name:
 			raise ConsistencyError(
 				"%s has unexpected snapshot name (%s != %s)"
-				% (blob.name, blob.snapshot_name,
+				% (blob.blob_name, blob.snapshot_name,
 					self.snapshot_name))
 		elif blob.snapshot_uuid != self.snapshot_uuid:
 			raise ConsistencyError(
 				"%s has unexpected snapshot UUID "
 				"(%s != %s)"
-				% (blob.name, blob.snapshot_uuid,
+				% (blob.blob_name, blob.snapshot_uuid,
 					self.snapshot_uuid))
 
 		existing = getattr(self, blob.payload_type.field())
@@ -1938,7 +1938,7 @@ class Backup(Snapshot): # {{{
 			raise ConsistencyError(
 				"%s has duplicate %s blobs (%s and %s)"
 				% (self, blob.payload_type.field(),
-					existing.name, blob.name))
+					existing.blob_name, blob.blob_name))
 
 		setattr(self, blob.payload_type.field(), blob)
 
@@ -3067,8 +3067,9 @@ class MetaBlob(MetaCipher): # {{{
 		cls.subclasses.append(subclass)
 		return subclass
 
+	# The GCS-visible name of the blob.
 	@property
-	def name(self) -> str:
+	def blob_name(self) -> str:
 		return self.gcs_blob.name
 
 	@property
@@ -3160,8 +3161,8 @@ class MetaBlob(MetaCipher): # {{{
 							bytes)
 			if not self.calc_signature().verify(signature):
 				raise SecurityError(
-					f"{self.name}: metadata/signature "
-					"mismatch")
+					"%s: metadata/signature mismatch"
+					% self.blob_name)
 		else:	# Assert that there's no signature in @metadata,
 			# otherwise there's a possible misconfiguration.
 			self.has_metadatum(metadata, "signature", False)
@@ -3208,7 +3209,7 @@ class MetaBlob(MetaCipher): # {{{
 
 		return self, self.blob_uuid, metadata
 
-	# Initialize @self.blob_uuid either from @blob_uuid or @self.name.
+	# Initialize @self.blob_uuid either from @blob_uuid or @self.blob_name.
 	def init_blob_uuid(self, blob_uuid: Optional[uuid.UUID] = None) \
 				-> None:
 		assert self.args.encrypt_metadata
@@ -3217,7 +3218,7 @@ class MetaBlob(MetaCipher): # {{{
 			self.blob_uuid = blob_uuid
 			return
 
-		blob_uuid = self.args.without_prefix(self.name)
+		blob_uuid = self.args.without_prefix(self.blob_name)
 		try:
 			self.blob_uuid = uuid.UUID(blob_uuid)
 		except ValueError as ex:
@@ -3226,7 +3227,7 @@ class MetaBlob(MetaCipher): # {{{
 			raise ConsistencyError(
 				"%s has invalid UUID (%s), "
 				"maybe you need to specify a --prefix"
-				% (self.name, blob_uuid)) from ex
+				% (self.blob_name, blob_uuid)) from ex
 
 	# Decrypt and decode @self.gcs_blob.metadata["metadata"].
 	def init_encrypted_metadata(self) -> dict[str, Any]:
@@ -3244,12 +3245,12 @@ class MetaBlob(MetaCipher): # {{{
 		except pickle.PickleError as ex:
 			raise SecurityError(
 				"%s[%s]: couldn't decode metadata"
-				% (self.name, "metadata")) from ex
+				% (self.blob_name, "metadata")) from ex
 
 		if not isinstance(metadata, dict):
 			raise SecurityError(
 				"%s[%s]: invalid metadata"
-				% (self.name, "metadata"))
+				% (self.blob_name, "metadata"))
 
 		return metadata
 
@@ -3316,7 +3317,8 @@ class MetaBlob(MetaCipher): # {{{
 			self.blob_path = self.load_metadatum(metadata,
 								"blob_path")
 		else:
-			self.blob_path = self.args.without_prefix(self.name)
+			self.blob_path = self.args.without_prefix(
+								self.blob_name)
 
 		self.mtime = self.load_metadatum(metadata,
 						"mtime", datetime.datetime)
@@ -3328,7 +3330,7 @@ class MetaBlob(MetaCipher): # {{{
 		if blob_size is not None and self.blob_size != blob_size:
 			raise SecurityError(
 				"%s has unexpected size (%d != %d)"
-				% (self.name, self.blob_size, blob_size))
+				% (self.blob_name, self.blob_size, blob_size))
 
 		self.file_size = self.load_metadatum(metadata, "file_size",
 							int, expected=False)
@@ -3443,13 +3445,13 @@ class MetaBlob(MetaCipher): # {{{
 			if expected is False:
 				raise ConsistencyError(
 						"%s[%s]: unexpected metadata"
-						% (self.name, key))
+						% (self.blob_name, key))
 			return True
 		else:
 			if expected is True:
 				raise SecurityError(
 						"%s[%s]: missing metadata"
-						% (self.name, key))
+						% (self.blob_name, key))
 			return False
 
 
@@ -3471,7 +3473,7 @@ class MetaBlob(MetaCipher): # {{{
 			except ValueError as ex:
 				raise SecurityError(
 					"%s[%s]: invalid metadata"
-					% (self.name, key)) from ex
+					% (self.blob_name, key)) from ex
 		elif tpe is datetime.datetime \
 				and isinstance(value, (int, float)):
 			return datetime.datetime.fromtimestamp(value)
@@ -3483,7 +3485,7 @@ class MetaBlob(MetaCipher): # {{{
 			except binascii.Error as ex:
 				raise SecurityError(
 					"%s[%s]: couldn't decode metadata"
-					% (self.name, key)) from ex
+					% (self.blob_name, key)) from ex
 		else:	# @tpe is either int, uuid.UUID or datetime.datetime.
 			try:
 				if tpe is datetime.datetime:
@@ -3494,7 +3496,7 @@ class MetaBlob(MetaCipher): # {{{
 			except ValueError as ex:
 				raise SecurityError(
 					"%s[%s]: invalid metadata"
-					% (self.name, key)) from ex
+					% (self.blob_name, key)) from ex
 
 	# If @value is None, delete @key from @metadata, otherwise set
 	# @metadata[@key] to @value.  If @text, convert @value to string
@@ -3536,9 +3538,8 @@ class MetaBlob(MetaCipher): # {{{
 		try:
 			return super().decrypt(data_type, ciphertext)
 		except FatalError as ex:
-			raise ex.__class__(
-				"%s[%s]:" % (self.name, data_type.field()),
-				ex) from ex
+			pfx = "%s[%s]:" % (self.blob_name, data_type.field())
+			raise ex.__class__(pfx, ex) from ex
 # }}}
 
 # A MetaBlob of a Backup.
@@ -3601,19 +3602,19 @@ class BackupBlob(MetaBlob): # {{{
 				self.blob_path.rpartition('/')
 		if not per:
 			raise ConsistencyError(
-				f"{self.name}'s path is missing "
+				f"{self.blob_name}'s path is missing "
 				"payload type")
 
 		if not payload_type.islower():
 			raise ConsistencyError(
-				f"{self.name}'s path has invalid "
+				f"{self.blob_name}'s path has invalid "
 				f"payload type ({payload_type})")
 		payload_type = payload_type.upper()
 		try:
 			self.payload_type = self.PayloadType[payload_type]
 		except KeyError:
 			raise ConsistencyError(
-				f"{self.name} has unknown "
+				f"{self.blob_name} has unknown "
 				f"payload type ({payload_type})")
 
 		self.snapshot_uuid = self.load_metadatum(
@@ -5205,27 +5206,27 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 			if overwrite is True:
 				raise ConsistencyError(
 					"%s does not exist in bucket"
-					% blob.name) from ex
+					% blob.blob_name) from ex
 			elif overwrite is False:
 				raise ConsistencyError(
 					"%s already exists in bucket"
-					% blob.name) from ex
+					% blob.blob_name) from ex
 			else:
 				raise
 		except GoogleAPICallError as ex:
 			raise FatalError from ex
 	else:	# In case of --wet-run just read @src until we hit EOF.
 		if overwrite is not None:
-			exists = blob.gcs_blob.bucket.get_blob(blob.name) \
-					is not None
+			exists = blob.gcs_blob.bucket \
+					.get_blob(blob.blob_name) is not None
 			if exists and not overwrite:
 				raise ConsistencyError(
 					"%s already exists in bucket"
-					% blob.name)
+					% blob.blob_name)
 			elif overwrite and not exists:
 				raise ConsistencyError(
 					"%s does not exist in bucket"
-					% blob.name)
+					% blob.blob_name)
 		while src.read(1024*1024):
 			pass
 
@@ -5236,7 +5237,7 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 		try:
 			blob.gcs_blob.delete()
 		except:	# We may not have permission to do so.
-			print(f"WARNING: {blob.name} could be corrupted, "
+			print(f"WARNING: {blob.blob_name} could be corrupted, "
 				"but unable to delete it!", file=sys.stderr)
 		raise ConsistencyError(
 				"Blob size mismatch (%d != %d)"
@@ -5469,7 +5470,7 @@ def discover_remote_backups(args: EncryptedBucketOptions,
 				raise ConsistencyError(
 					"%s and %s have different UUIDs, "
 					"but conflicting snapshot names"
-					% (blob.name, existing))
+					% (blob.blob_name, existing))
 			by_uuid[backup.snapshot_uuid] = backup
 			by_name[backup.snapshot_name] = backup
 		else:
@@ -5689,7 +5690,7 @@ def cmd_list_remote(args: CmdListRemote) -> None:
 						"%Y-%m-%d %H:%M:%S",
 						time.localtime(mtime)),
 					SizeAccumulator(blob).get(),
-					args.without_prefix(blob.name),
+					args.without_prefix(blob.blob_name),
 					sep="\t")
 
 	if args.verbose and nbackups > 1:
