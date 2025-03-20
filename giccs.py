@@ -916,7 +916,7 @@ class BucketOptions(AccountOptions): # {{{
 
 	bucket_name:	Optional[str] = None
 	bucket_labels:	Optional[dict[str, Optional[str]]] = None
-	prefix:		Optional[str] = None
+	prefix:		pathlib.PurePath = CurDir
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
@@ -963,15 +963,13 @@ class BucketOptions(AccountOptions): # {{{
 
 		self.merge_options_from_ini(args, "prefix")
 		if args.prefix is not None:
-			prefix = pathlib.PurePath(args.prefix)
-			if prefix not in (CurDir, RootDir):
-				if ".." in prefix.parts:
-					raise self.CmdLineError(
-							"--prefix must not "
-							"contain \"..\"")
-				if prefix.is_absolute():
-					prefix = prefix.relative_to(RootDir)
-				self.prefix = str(prefix)
+			self.prefix = pathlib.PurePath(args.prefix)
+			if ".." in self.prefix.parts:
+				raise self.CmdLineError(
+						"--prefix must not "
+						"contain \"..\"")
+			if self.prefix.is_absolute():
+				self.prefix = prefix.relative_to(RootDir)
 
 	# Does @bucket match @self.bucket_name and/or @self.bucket_labels?
 	def bucket_matches(self, bucket: google.cloud.storage.Bucket) -> bool:
@@ -1026,29 +1024,23 @@ class BucketOptions(AccountOptions): # {{{
 					name=storage_layout_path)
 		return storage_layout.hierarchical_namespace.enabled
 
-	# Prepend @path with @self.prefix if there's one.
-	def with_prefix(self, path: str) -> str:
-		if self.prefix is not None:
-			return f"{self.prefix}/{path}"
-		else:
-			return path
+	# Return a GCS prefix that matches all blobs under @path.
+	def with_prefix(self, path: pathlib.PurePath | str) -> Optional[str]:
+		if isinstance(path, pathlib.PurePath) and path.is_absolute():
+			path = path.relative_to(RootDir)
+		path = self.prefix / path
+		return f"{path}/" if path.parts else None
 
 	# Strip @self.prefix from @path if it's defined.
 	def without_prefix(self, path: str) -> str:
-		if self.prefix is not None:
-			prefix = self.prefix + '/'
+		if self.prefix.parts:
+			prefix = f"{self.prefix}/"
 			if not path.startswith(prefix):
 				raise ConsistencyError(
 					f"{path} doesn't start with {prefix}")
 			return path.removeprefix(prefix)
 		else:
 			return path
-
-	# Return a GCS prefix that matches all blobs under @path.
-	def gcs_prefix(self, path: pathlib.PurePath) -> Optional[str]:
-		if path == RootDir:
-			return self.with_prefix("") or None
-		return self.with_prefix(str(path.relative_to(RootDir))) + '/'
 
 	def bucket_path(self) -> str:
 		return "%s/buckets/%s" % (
@@ -1699,10 +1691,8 @@ class EncryptedBucketOptions(EncryptionOptions, BucketOptions):
 		bucket = super().bucket
 
 		if self.volume is None:
-			volume = [ bucket.name ]
-			if self.prefix is not None:
-				volume.append(self.prefix)
-			self.volume = '/'.join(volume)
+			self.volume = str(pathlib.PurePath(bucket.name)
+						/ self.prefix)
 
 		return bucket
 
@@ -3041,7 +3031,7 @@ class MetaBlob(MetaCipher): # {{{
 	# The user-visible path of the blob without a leading /.
 	# If metadata is not encrypted, it's the same as the @blob_name
 	# without @args.prefix.
-	user_path: str
+	user_path: pathlib.PurePath
 
 	# The time when the blob was last changed by us.
 	user_mtime: datetime.datetime
@@ -3087,9 +3077,10 @@ class MetaBlob(MetaCipher): # {{{
 		return True
 
 	def __str__(self):
-		return self.user_path
+		return str(self.user_path)
 
-	def __init__(self, args: EncryptedBucketOptions, path: str,
+	def __init__(self, args: EncryptedBucketOptions,
+			user_path: pathlib.PurePath,
 			backups: Optional[Backups] = None, **kw):
 		super().__init__(args)
 
@@ -3112,13 +3103,13 @@ class MetaBlob(MetaCipher): # {{{
 					len(UUID0.bytes) - len(uuid_bytes))
 				self.blob_uuid = uuid.UUID(bytes=uuid_bytes)
 
-			blob_name = args.with_prefix(
-						str(self.blob_uuid) \
-						if args.encrypt_metadata \
-						else path)
-			assert not blob_name.startswith('/')
+			blob_name = args.prefix
+			blob_name /= str(self.blob_uuid) \
+					if args.encrypt_metadata \
+					else user_path
+			assert not blob_name.is_absolute()
 
-			self.gcs_blob = args.bucket.blob(blob_name)
+			self.gcs_blob = args.bucket.blob(str(blob_name))
 			if not args.encrypt:
 				assert self.blob_uuid is None
 				break
@@ -3133,7 +3124,7 @@ class MetaBlob(MetaCipher): # {{{
 			else:
 				break
 
-		self.init_metadata(path, **kw)
+		self.init_metadata(user_path, **kw)
 		self.update_metadata()
 
 	# Try to create a MetaBlob or a subclass thereof and set it up
@@ -3293,8 +3284,8 @@ class MetaBlob(MetaCipher): # {{{
 		return cls.create_from_gcs_with_metadata(args, gcs_blob)[0]
 
 	# Called by __init__() to initialize metadata fields.
-	def init_metadata(self, path: str, **kw) -> None:
-		self.user_path = path
+	def init_metadata(self, user_path: pathlib.PurePath, **kw) -> None:
+		self.user_path = user_path
 
 		# We need to make this timezone-aware, so str(self.user_mtime)
 		# will include the timezone, and datetime.fromisoformat()
@@ -3315,10 +3306,12 @@ class MetaBlob(MetaCipher): # {{{
 
 		if self.args.encrypt_metadata:
 			self.user_path = self.load_metadatum(metadata,
-								"user_path")
+						"user_path", pathlib.PurePath)
 		else:
-			self.user_path = self.args.without_prefix(
-								self.blob_name)
+			self.user_path = \
+				pathlib.PurePath(
+					self.args.without_prefix(
+							self.blob_name))
 
 		self.user_mtime = self.load_metadatum(metadata,
 						"mtime", datetime.datetime)
@@ -3415,7 +3408,7 @@ class MetaBlob(MetaCipher): # {{{
 		hasher.update(b'\0')
 
 		# @self.blob_uuid is included by the @hasher automatically.
-		hasher.update(self.args.with_prefix(self.user_path).encode())
+		hasher.update(bytes(self.args.prefix / self.user_path))
 		hasher.update(b'\0')
 
 		for size in (self.blob_size, self.user_size):
@@ -3486,7 +3479,8 @@ class MetaBlob(MetaCipher): # {{{
 				raise SecurityError(
 					"%s[%s]: couldn't decode metadata"
 					% (self.blob_name, key)) from ex
-		else:	# @tpe is either int, uuid.UUID or datetime.datetime.
+		else:	# @tpe is either int, pathlib.PurePath, uuid.UUID
+			# or datetime.datetime.
 			try:
 				if tpe is datetime.datetime:
 					return datetime.datetime \
@@ -3502,7 +3496,8 @@ class MetaBlob(MetaCipher): # {{{
 	# @metadata[@key] to @value.  If @text, convert @value to string
 	# beforehand.
 	MDT = TypeVar("MetadataType", int, str, bytes,
-					uuid.UUID, datetime.datetime)
+					pathlib.PurePath, uuid.UUID,
+					datetime.datetime)
 	def save_metadatum(self,
 			metadata: dict[str, Any],
 			key: str, value: Optional[Union[MDT, ByteString]],
@@ -3523,7 +3518,9 @@ class MetaBlob(MetaCipher): # {{{
 			else:
 				metadata[key] = str(value)
 		else:	# Convert to a primitive type for pickling.
-			if isinstance(value, uuid.UUID):
+			if isinstance(value, pathlib.PurePath):
+				metadata[key] = str(value)
+			elif isinstance(value, uuid.UUID):
 				metadata[key] = value.bytes
 			elif isinstance(value, datetime.datetime):
 				metadata[key] = value.timestamp()
@@ -3567,16 +3564,16 @@ class BackupBlob(MetaBlob): # {{{
 			payload_type: PayloadType,
 			snapshot: Snapshot, parent: Optional[Snapshot],
 			backups: Backups):
-		path = "%s/%s" % (snapshot.snapshot_name, payload_type.field())
-		super().__init__(args, path, backups,
-					payload_type=payload_type,
+		super().__init__(args, pathlib.PurePath(snapshot.snapshot_name,
+							payload_type.field()),
+					backups, payload_type=payload_type,
 					snapshot=snapshot, parent=parent)
 
-	def init_metadata(self, path: str,
+	def init_metadata(self, user_path: pathlib.PurePath,
 				payload_type: PayloadType,
 				snapshot: Snapshot,
 				parent: Optional[Snapshot]) -> None:
-		super().init_metadata(path)
+		super().init_metadata(user_path)
 
 		self.snapshot_name = snapshot.snapshot_name
 		self.snapshot_uuid = snapshot.snapshot_uuid
@@ -3598,12 +3595,11 @@ class BackupBlob(MetaBlob): # {{{
 	def load_metadata(self, metadata: Optional[dict[str, Any]]) -> None:
 		super().load_metadata(metadata)
 
-		self.snapshot_name, per, payload_type = \
-				self.user_path.rpartition('/')
-		if not per:
+		if len(self.user_path.parts) < 2:
 			raise ConsistencyError(
 				f"{self.blob_name}'s path is missing "
 				"payload type")
+		self.snapshot_name, payload_type = self.user_path.parts[-2:]
 
 		if not payload_type.islower():
 			raise ConsistencyError(
@@ -4820,7 +4816,7 @@ class GCSGlobber(VirtualGlobber):
 
 	# Return a prefix that matches all blobs under @dent.
 	def gcs_prefix(self, dent: VirtualGlobber.DirEnt) -> Optional[str]:
-		return self.args.gcs_prefix(dent.path(full_path=True))
+		return self.args.with_prefix(dent.path(full_path=True))
 
 	def load_children(self, dent: VirtualGlobber.DirEnt) -> None:
 		if self.args.encrypt_metadata:
@@ -4838,8 +4834,8 @@ class GCSGlobber(VirtualGlobber):
 			if blob is None:
 				continue
 
-			fname = pathlib.PurePath(blob.user_path).name
-			dent.add(self.DirEnt.mkfile(self, fname, blob))
+			dent.add(self.DirEnt.mkfile(
+				self, blob.user_path.name, blob))
 
 		for prefix in lst.prefixes:
 			fname = pathlib.PurePath(prefix).name
@@ -4862,9 +4858,8 @@ class GCSGlobber(VirtualGlobber):
 			if blob is None:
 				continue
 
-			path = pathlib.PurePath(blob.user_path) \
-					.relative_to(root_path)
-			self.add_file(path, blob)
+			self.add_file(blob.user_path.relative_to(root_path),
+					blob)
 
 		if self.args.encrypt_metadata or not self.args.is_hfs:
 			return
@@ -5450,13 +5445,9 @@ def discover_local_snapshots(path: str) -> Snapshots:
 # Go through the blobs of a GCS bucket and create Backup:s from them.
 def discover_remote_backups(args: EncryptedBucketOptions,
 				keep_index_only: bool = False) -> Backups:
-	prefix = args.prefix
-	if prefix is not None:
-		prefix += '/'
-
 	by_name = { }
 	by_uuid = Backups()
-	for blob in args.bucket.list_blobs(prefix=prefix):
+	for blob in args.bucket.list_blobs(prefix=args.with_prefix(RootDir)):
 		blob = BackupBlob.create_from_gcs(args, blob)
 		if blob is None:
 			continue
@@ -5999,9 +5990,8 @@ def cmd_delete_remote(args: CmdDeleteRemote) -> None:
 					blob.gcs_blob.delete()
 
 			if not args.dry_run:
-				args.delete_folder(
-					args.with_prefix(backup.snapshot_name)
-					+ '/')
+				args.delete_folder(args.with_prefix(
+							backup.snapshot_name))
 
 	if ndeleted > 0:
 		print()
@@ -6228,9 +6218,8 @@ def cmd_delete_index(args: CmdDeleteIndex) -> None:
 		backup.clear_blob(blob)
 
 		if backup.orphaned():
-			args.delete_folder(
-				args.with_prefix(backup.snapshot_name)
-				+ '/')
+			args.delete_folder(args.with_prefix(
+						backup.snapshot_name))
 
 	if ndeleted > 0:
 		print()
@@ -8138,7 +8127,7 @@ def upload_file(self: _CmdFTPPut|_CmdFTPTouch,
 		# Make @full_dst non-absolute, looks nicer in the GCS console.
 		full_dst = self.remote.root.path(full_path=True)
 		full_dst /= dst_path.relative_to(RootDir)
-		blob = MetaBlob(self, str(full_dst.relative_to(RootDir)))
+		blob = MetaBlob(self, full_dst.relative_to(RootDir))
 	else:
 		blob = dst_dent.obj
 		assert blob is not None
@@ -8195,7 +8184,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			blob = remote.obj
 		else:
 			blob = MetaBlob(self,
-				str(remote.path(full_path=True).relative_to(RootDir)))
+				remote.path(full_path=True).relative_to(RootDir))
 
 		if self.cmd is None:
 			msg = "Uploading from stdin"
