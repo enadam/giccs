@@ -3038,10 +3038,10 @@ class MetaBlob(MetaCipher): # {{{
 
 	gcs_blob: google.cloud.storage.Blob
 
-	# The @path with which the object was created the first time.
-	# If metadata is not encrypted, it's the same as the @gcs_blob.name
+	# The user-visible path of the blob without a leading /.
+	# If metadata is not encrypted, it's the same as the @blob_name
 	# without @args.prefix.
-	blob_path: str
+	user_path: str
 
 	# The time when the blob was last changed by us.
 	mtime: datetime.datetime
@@ -3087,7 +3087,7 @@ class MetaBlob(MetaCipher): # {{{
 		return True
 
 	def __str__(self):
-		return self.blob_path
+		return self.user_path
 
 	def __init__(self, args: EncryptedBucketOptions, path: str,
 			backups: Optional[Backups] = None, **kw):
@@ -3294,7 +3294,7 @@ class MetaBlob(MetaCipher): # {{{
 
 	# Called by __init__() to initialize metadata fields.
 	def init_metadata(self, path: str, **kw) -> None:
-		self.blob_path = path
+		self.user_path = path
 
 		# We need to make this timezone-aware, so str(self.mtime)
 		# will include the timezone, and datetime.fromisoformat()
@@ -3314,10 +3314,10 @@ class MetaBlob(MetaCipher): # {{{
 								uuid.UUID)
 
 		if self.args.encrypt_metadata:
-			self.blob_path = self.load_metadatum(metadata,
-								"blob_path")
+			self.user_path = self.load_metadatum(metadata,
+								"user_path")
 		else:
-			self.blob_path = self.args.without_prefix(
+			self.user_path = self.args.without_prefix(
 								self.blob_name)
 
 		self.mtime = self.load_metadatum(metadata,
@@ -3356,7 +3356,7 @@ class MetaBlob(MetaCipher): # {{{
 						"blob_uuid", self.blob_uuid)
 		if self.args.encrypt_metadata:
 			self.save_metadatum(metadata,
-						"blob_path", self.blob_path)
+						"user_path", self.user_path)
 
 		self.save_metadatum(metadata, "mtime", self.mtime)
 
@@ -3415,7 +3415,7 @@ class MetaBlob(MetaCipher): # {{{
 		hasher.update(b'\0')
 
 		# @self.blob_uuid is included by the @hasher automatically.
-		hasher.update(self.args.with_prefix(self.blob_path).encode())
+		hasher.update(self.args.with_prefix(self.user_path).encode())
 		hasher.update(b'\0')
 
 		for size in (self.blob_size, self.file_size):
@@ -3599,7 +3599,7 @@ class BackupBlob(MetaBlob): # {{{
 		super().load_metadata(metadata)
 
 		self.snapshot_name, per, payload_type = \
-				self.blob_path.rpartition('/')
+				self.user_path.rpartition('/')
 		if not per:
 			raise ConsistencyError(
 				f"{self.blob_name}'s path is missing "
@@ -4838,7 +4838,7 @@ class GCSGlobber(VirtualGlobber):
 			if blob is None:
 				continue
 
-			fname = pathlib.PurePath(blob.blob_path).name
+			fname = pathlib.PurePath(blob.user_path).name
 			dent.add(self.DirEnt.mkfile(self, fname, blob))
 
 		for prefix in lst.prefixes:
@@ -4853,7 +4853,7 @@ class GCSGlobber(VirtualGlobber):
 			assert dent == self.root
 			assert dent.fname == '/'
 
-		# Trim @root_path from @blob.blob_path in case we've
+		# Trim @root_path from @blob.user_path in case we've
 		# changed root directory.
 		root_path = self.root.path(full_path=True).relative_to(RootDir)
 		prefix = self.gcs_prefix(dent)
@@ -4862,7 +4862,7 @@ class GCSGlobber(VirtualGlobber):
 			if blob is None:
 				continue
 
-			path = pathlib.PurePath(blob.blob_path) \
+			path = pathlib.PurePath(blob.user_path) \
 					.relative_to(root_path)
 			self.add_file(path, blob)
 
