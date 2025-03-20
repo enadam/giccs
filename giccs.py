@@ -4446,7 +4446,12 @@ class VirtualGlobber(Globber): # {{{
 		def children(self) -> dict[str, Self]:
 			# Set the property to avoid infinite recursion.
 			self.children = { }
-			self.globber.load_children(self)
+			try:
+				self.globber.load_children(self)
+			except:	# Retry when the property is read
+				# the next time.
+				delattr(self, "children")
+				raise
 			return self.children
 
 		# For sorted() in __iter__().
