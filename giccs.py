@@ -7163,12 +7163,20 @@ class FTPOverwriteOptions(CmdLineOptions):
 			self.if_exists = self.IfExists.from_choice(args.exists)
 
 	def confirm(self, prompt: str) -> bool:
+		import readline
+
+		n = readline.get_current_history_length()
 		while True:
 			try:
 				ret = input("%s [y/n/q] " % prompt)
 			except EOFError:
 				print()
-				continue
+				ret = None
+			else:	# Remove this interaction from the history.
+				# (If the user recalled an earlier input,
+				#  no new entry was added to the history.)
+				if readline.get_current_history_length() > n:
+					readline.remove_history_item(n)
 
 			if ret == 'y':
 				return True
@@ -7176,6 +7184,8 @@ class FTPOverwriteOptions(CmdLineOptions):
 				return False
 			elif ret == 'q':
 				raise SystemExit
+			else:
+				prompt = prompt.lstrip()
 
 class CmdFTPHelp(CmdExec):
 	cmd = "help"
