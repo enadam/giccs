@@ -3039,12 +3039,9 @@ class MetaBlob(MetaCipher): # {{{
 	# The size of the payload before compression and encryption.
 	user_size: Optional[int] = None
 
-	# The end-to-end hash computed by the Progressometer.  There are
-	# multiple reasons why calcualte this hash:
-	# * Provides an additional layer of defense against reordering
-	#   stripes within blobs or replacing them across blobs.
-	# * Gives integrity protection in case external encryption doesn't
-	#   provide it.
+	# The end-to-end hash computed by the Progressometer.  This provides
+	# an additional layer of defense against reordering stripes within
+	# blobs or replacing them across blobs.
 	blob_hash: Optional[bytes] = None
 
 	# Padding added to the payload after compression and encryption,
@@ -3052,6 +3049,7 @@ class MetaBlob(MetaCipher): # {{{
 	padding: int = 0
 	padding_seed: Optional[bytes] = None
 
+	# Class decorator to register a subclass for create_best_from_gcs().
 	@classmethod
 	def register_subclass(cls, subclass: T):
 		cls.subclasses.append(subclass)
@@ -6900,12 +6898,12 @@ class FTPClient:
 	re_baseless = re.compile(r"(^(/|\.|\.\.)|/(\.|\.\.))/*$")
 
 	@functools.cached_property
-	def local(self):
+	def local(self) -> Globber:
 		assert isinstance(self, CmdFTP)
 		return Globber()
 
 	@functools.cached_property
-	def remote(self):
+	def remote(self) -> GCSGlobber:
 		assert isinstance(self, CmdFTP)
 
 		remote = GCSGlobber(self)
