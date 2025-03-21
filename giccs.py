@@ -4459,6 +4459,12 @@ class VirtualGlobber(Globber): # {{{
 
 			return self
 
+		def __post_init__(self):
+			if self.fname in ("", ".", ".."):
+				raise ConsistencyError(
+					"%s: invalid directory entry"
+					% self.path())
+
 		@functools.cached_property
 		def children(self) -> dict[str, Self]:
 			# Set the property to avoid infinite recursion.
@@ -4858,6 +4864,13 @@ class GCSGlobber(VirtualGlobber):
 				self, blob.user_path.name, blob))
 
 		for prefix in lst.prefixes:
+			# If we allowed these, we could create
+			# a non-existent subdirectory.
+			if prefix.endswith(("//", "/./")):
+				raise ConsistencyError(
+					"weird entry in %s (%s)"
+					% (dent.path(), prefix))
+
 			fname = pathlib.PurePath(prefix).name
 			dent.add(self.DirEnt.mkdir(self, fname))
 
