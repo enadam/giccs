@@ -3218,6 +3218,17 @@ class MetaBlob(MetaCipher): # {{{
 				"maybe you need to specify a --prefix"
 				% (self.blob_name, blob_uuid)) from ex
 
+		# A UUID can be represented textually in many ways,
+		# for example with curly braces.  Verify that @blob_uuid
+		# is in the default representation.  It wouldn't do harm
+		# if we accepted any representation, but a difference
+		# could indicate tampering.
+		expected = str(self.args.prefix / str(self.blob_uuid))
+		if self.blob_name != expected:
+			raise SecurityError(
+				f"{self.blob_name} is denormalized, "
+				f"should be {expected}")
+
 	# Decrypt and decode @self.gcs_blob.metadata["metadata"].
 	def init_encrypted_metadata(self) -> dict[str, Any]:
 		import pickle
@@ -3310,6 +3321,12 @@ class MetaBlob(MetaCipher): # {{{
 				pathlib.PurePath(
 					self.args.without_prefix(
 							self.blob_name))
+
+			# Do the same cross-check as in init_blob_uuid().
+			expected = str(self.args.prefix / self.user_path)
+			if self.blob_name != expected:
+				raise SecurityError(
+					f"{self.blob_name} is denormalized")
 
 		self.user_mtime = self.load_metadatum(metadata,
 						"mtime", datetime.datetime)
