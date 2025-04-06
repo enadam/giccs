@@ -1024,6 +1024,10 @@ class BucketOptions(AccountOptions): # {{{
 					name=storage_layout_path)
 		return storage_layout.hierarchical_namespace.enabled
 
+	# Return the bucket name or "<bucket-name>/<prefix>".
+	def bucket_with_prefix(self) -> str:
+		return str(self.bucket.name / self.prefix)
+
 	# Return a GCS prefix that matches all blobs under @path.
 	def with_prefix(self, path: pathlib.PurePath | str) -> Optional[str]:
 		if isinstance(path, pathlib.PurePath) and path.is_absolute():
@@ -7059,6 +7063,8 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 	def execute(self) -> None:
 		import readline
 
+		print("Operating on", self.bucket_with_prefix())
+
 		error = False
 		re_shell = re.compile(r"^\s*!(.*)")
 		while True:
@@ -7311,8 +7317,21 @@ class CmdFTPPwd(CmdExec):
 	cmd = "pwd"
 	help = "TODO"
 
+	print_bucket: bool
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["operation"].add_enable_flag("--bucket", "-b")
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.print_bucket = args.bucket
+
 	def execute(self: _CmdFTPPwd):
-		print(self.remote.cwd.path())
+		if self.print_bucket:
+			print(self.bucket_with_prefix())
+		else:
+			print(self.remote.cwd.path())
 
 class CmdFTPDir(CmdExec):
 	cmd = ("dir", "ls")
