@@ -7157,6 +7157,8 @@ class CmdFTPShell(CmdTop):
 		subcommands = (CmdFTPHelp(self), CmdFTPExit(self),
 				CmdFTPLChDir(self), CmdFTPLPwd(self),
 				CmdFTPChDir(self), CmdFTPPwd(self),
+				CmdFTPPushD(self), CmdFTPPopD(self),
+				CmdFTPDirStack(self),
 				CmdFTPDir(self), CmdFTPPDir(self),
 				CmdFTPDu(self),
 				CmdFTPMkDir(self), CmdFTPRmDir(self),
@@ -7299,6 +7301,9 @@ class CmdFTPChDir(CmdExec):
 
 	dst: str
 
+	# Class variable to keep state.
+	prev: Optional[str] = None
+
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
 		self.sections["positional"].add_argument("directory")
@@ -7307,11 +7312,25 @@ class CmdFTPChDir(CmdExec):
 		super().pre_validate(args)
 		self.dst = args.directory
 
+	def chdir_path(self, path: str) -> str:
+		cwd = self.remote.cwd.path()
+		self.remote.chdir(path)
+		self.__class__.prev = cwd
+		return cwd
+
+	def chdir_dst(self, dst: str) -> str:
+		if dst != '-':
+			return self.chdir_path(self.remote.glob(
+						dst,
+						at_least_one=True,
+						at_most_one=True))
+		elif self.prev is not None:
+			return self.chdir_path(self.prev)
+		else:
+			raise UserError("No previous directory")
+
 	def execute(self: _CmdFTPChDir):
-		self.remote.chdir(self.remote.glob(
-					self.dst,
-					at_least_one=True,
-					at_most_one=True))
+		self.chdir_dst(self.dst)
 
 class CmdFTPPwd(CmdExec):
 	cmd = "pwd"
@@ -7332,6 +7351,66 @@ class CmdFTPPwd(CmdExec):
 			print(self.bucket_with_prefix())
 		else:
 			print(self.remote.cwd.path())
+
+class CmdFTPDirStack(CmdExec):
+	cmd = "dirs"
+	help = "TODO"
+
+	clear: bool
+
+	# Class variable to keep state.
+	stack: list[str] = [ ]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["operation"].add_enable_flag("--clear", "-c")
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.clear = args.clear
+
+	def pushd(self, dst: str) -> None:
+		chdir = self.parent.find_subcommand("cd")
+		self.stack.append(chdir.chdir_dst(dst))
+
+	def popd(self) -> None:
+		if not self.stack:
+			raise UserError("Directory stack empty")
+
+		chdir = self.parent.find_subcommand("cd")
+		chdir.chdir_path(self.stack[-1])
+		del self.stack[-1]
+
+	def execute(self: _CmdFTPDirStack):
+		if self.clear:
+			self.stack.clear()
+			return
+		if self.stack:
+			print(*self.stack, sep="\n")
+
+class CmdFTPPushD(CmdExec):
+	cmd = "pushd"
+	help = "TODO"
+
+	dst: str
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("directory")
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.dst = args.directory
+
+	def execute(self: _CmdFTPPushD):
+		self.parent.find_subcommand("dirs").pushd(self.dst)
+
+class CmdFTPPopD(CmdExec):
+	cmd = "popd"
+	help = "TODO"
+
+	def execute(self: _CmdFTPPopD):
+		self.parent.find_subcommand("dirs").popd()
 
 class CmdFTPDir(CmdExec):
 	cmd = ("dir", "ls")
@@ -8427,6 +8506,9 @@ class CmdFTPTouch(FTPOverwriteOptions, CmdExec):
 
 class _CmdFTPChDir(CmdFTP, CmdFTPChDir): pass
 class _CmdFTPPwd(CmdFTP, CmdFTPPwd): pass
+class _CmdFTPPushD(CmdFTP, CmdFTPPushD): pass
+class _CmdFTPPopD(CmdFTP, CmdFTPPopD): pass
+class _CmdFTPDirStack(CmdFTP, CmdFTPDirStack): pass
 class _CmdFTPDir(CmdFTP, CmdFTPDir): pass
 class _CmdFTPPDir(CmdFTP, CmdFTPPDir): pass
 class _CmdFTPDu(CmdFTP, CmdFTPDu): pass
