@@ -7010,7 +7010,7 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
-		return (CmdFTPDir(self), CmdFTPDu(self),
+		return (CmdFTPTree(self), CmdFTPDir(self), CmdFTPDu(self),
 			CmdFTPMkDir(self), CmdFTPRmDir(self), CmdFTPRm(self),
 			CmdFTPCat(self), CmdFTPPage(self),
 			CmdFTPGet(self), CmdFTPPut(self), CmdFTPTouch(self))
@@ -7158,7 +7158,7 @@ class CmdFTPShell(CmdTop):
 				CmdFTPLChDir(self), CmdFTPLPwd(self),
 				CmdFTPChDir(self), CmdFTPPwd(self),
 				CmdFTPPushD(self), CmdFTPPopD(self),
-				CmdFTPDirStack(self),
+				CmdFTPDirStack(self), CmdFTPTree(self),
 				CmdFTPDir(self), CmdFTPPDir(self),
 				CmdFTPDu(self),
 				CmdFTPMkDir(self), CmdFTPRmDir(self),
@@ -7411,6 +7411,74 @@ class CmdFTPPopD(CmdExec):
 
 	def execute(self: _CmdFTPPopD):
 		self.parent.find_subcommand("dirs").popd()
+
+class CmdFTPTree(CmdExec):
+	cmd = "tree"
+	help = "TODO"
+
+	with_files:	bool
+	with_hidden:	bool
+	root:		Optional[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["operation"].add_enable_flag("--files", "-f")
+		self.sections["operation"].add_enable_flag("--hidden", "-a")
+		self.sections["positional"].add_argument("root", nargs='?')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+
+		self.with_files = args.files
+		self.with_hidden = args.hidden
+		self.root = args.root
+
+	def print_subtree(self, dent: VirtualGlobber.DirEnt, \
+				*parents: tuple[bool]):
+		line = [ ]
+		if parents:
+			for has_next in parents[:-1]:
+				line.append('│' if has_next else ' ')
+			line.append('├' if parents[-1] else '└')
+		if dent.is_tld():
+			line.append('/')
+		elif dent.isdir():
+			line.append(dent.fname + '/')
+		else:
+			line.append(dent.fname)
+		print(*line, sep=' ')
+
+		if not dent.isdir():
+			return
+
+		if not (self.with_files and self.with_hidden):
+			# Collect the list of @children to show in advance
+			# because we'll need to know which is the last one.
+			children = [ ]
+			for child in dent:
+				if not self.with_files and not child.isdir():
+					continue
+				if not self.with_hidden:
+					if child.fname.startswith('.'):
+						continue
+				children.append(child)
+			nchildren = len(children)
+		else:	# We're showing all children.
+			children, nchildren = dent, len(dent.children)
+
+		for i, child in enumerate(children):
+			self.print_subtree(child, *parents, i < nchildren - 1)
+
+	def execute(self: _CmdFTPTree):
+		if self.root is not None:
+			dent = self.remote.lookup(
+					self.remote.glob(
+						self.root,
+						at_least_one=True,
+						at_most_one=True))
+		else:
+			dent = self.remote.cwd
+		self.print_subtree(dent)
 
 class CmdFTPDir(CmdExec):
 	cmd = ("dir", "ls")
@@ -8509,6 +8577,7 @@ class _CmdFTPPwd(CmdFTP, CmdFTPPwd): pass
 class _CmdFTPPushD(CmdFTP, CmdFTPPushD): pass
 class _CmdFTPPopD(CmdFTP, CmdFTPPopD): pass
 class _CmdFTPDirStack(CmdFTP, CmdFTPDirStack): pass
+class _CmdFTPTree(CmdFTP, CmdFTPTree): pass
 class _CmdFTPDir(CmdFTP, CmdFTPDir): pass
 class _CmdFTPPDir(CmdFTP, CmdFTPPDir): pass
 class _CmdFTPDu(CmdFTP, CmdFTPDu): pass
