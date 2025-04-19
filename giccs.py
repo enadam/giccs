@@ -7021,7 +7021,42 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 		token = None
 		quoted = None
 		escaped = False
+		environ = environ_delimited = None
 		for c in s:
+			if environ is not None:
+				assert not escaped
+
+				isalnum = re.match(r'\w', c)
+				if isalnum:
+					environ += c
+				elif not environ and c == '{':
+					assert not environ_delimited
+					environ_delimited = True
+				elif environ_delimited and c != '}':
+					raise ValueError(
+						"%s: illegal character in "
+						"environment variable name"
+						% repr(c))
+				elif not environ:
+					raise ValueError(
+						"Empty environment variable "
+						"name")
+				else:
+					val = os.environ.get(environ)
+					if val is None:
+						raise ValueError(
+							f"{environ}: no such "
+							"environment variable")
+
+					if token is None:
+						token = val
+					else:
+						token += val
+					environ = None
+
+				if isalnum or environ_delimited:
+					continue
+
 			if escaped:
 				assert token is not None
 				if c == '\\' or c in Globber.GLOBBING:
@@ -7029,6 +7064,9 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 				else:
 					token += c
 				escaped = False
+			elif c == '$' and quoted != "'":
+				environ = ""
+				environ_delimited = False
 			elif quoted is not None:
 				assert token is not None
 				if c == quoted:
@@ -7057,7 +7095,28 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 			raise ValueError("Dangling escape character")
 		elif quoted is not None:
 			raise ValueError("Unclosed quotation")
-		elif token is not None:
+
+		if environ is not None:
+			if environ_delimited:
+				raise ValueError(
+					f"{environ}: unfinished environment "
+					"variable name")
+			elif not environ:
+				raise ValueError(
+					"Empty environment variable name")
+
+			val = os.environ.get(environ)
+			if val is None:
+				raise ValueError(
+					f"{environ}: no such environment "
+					"variable")
+
+			if token is None:
+				token = val
+			else:
+				token += val
+
+		if token is not None:
 			yield token
 
 	def execute(self) -> None:
