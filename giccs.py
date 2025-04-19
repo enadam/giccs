@@ -7214,6 +7214,7 @@ class CmdFTPShell(CmdTop):
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
 		subcommands = (CmdFTPHelp(self), CmdFTPExit(self),
+				CmdFTPSetEnv(self),
 				CmdFTPLChDir(self), CmdFTPLPwd(self),
 				CmdFTPChDir(self), CmdFTPPwd(self),
 				CmdFTPPushD(self), CmdFTPPopD(self),
@@ -7324,6 +7325,26 @@ class CmdFTPExit(CmdExec):
 
 	def execute(self):
 		raise self.ExitFTP
+
+class CmdFTPSetEnv(CmdExec):
+	cmd = "setenv"
+	help = "TODO"
+
+	name:  str
+	value: str
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("environment")
+		self.sections["positional"].add_argument("value")
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.name = args.environment
+		self.value = args.value
+
+	def execute(self):
+		os.environ[self.name] = self.value
 
 class CmdFTPLChDir(CmdExec):
 	cmd = "lcd"
