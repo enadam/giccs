@@ -7369,9 +7369,12 @@ class CmdFTPDirStack(CmdExec):
 		super().pre_validate(args)
 		self.clear = args.clear
 
-	def pushd(self, dst: str) -> None:
-		chdir = self.parent.find_subcommand("cd")
-		self.stack.append(chdir.chdir_dst(dst))
+	def pushd(self, dst: Optional[str]) -> None:
+		if dst is not None:
+			chdir = self.parent.find_subcommand("cd")
+			self.stack.append(chdir.chdir_dst(dst))
+		else:
+			self.stack.append(self.remote.cwd.path())
 
 	def popd(self) -> None:
 		if not self.stack:
@@ -7392,11 +7395,11 @@ class CmdFTPPushD(CmdExec):
 	cmd = "pushd"
 	help = "TODO"
 
-	dst: str
+	dst: Optional[str]
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
-		self.sections["positional"].add_argument("directory")
+		self.sections["positional"].add_argument("directory", nargs='?')
 
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
