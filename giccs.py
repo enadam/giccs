@@ -7263,6 +7263,7 @@ class FTPOverwriteOptions(CmdLineOptions):
 		elif args.exists is not None:
 			self.if_exists = self.IfExists.from_choice(args.exists)
 
+	# Return True, False or saise SystemExit.
 	def confirm(self, prompt: str) -> bool:
 		import readline
 
@@ -7284,7 +7285,7 @@ class FTPOverwriteOptions(CmdLineOptions):
 			elif ret == 'n':
 				return False
 			elif ret == 'q':
-				raise SystemExit
+				raise SystemExit(0)
 			else:
 				prompt = prompt.lstrip()
 
