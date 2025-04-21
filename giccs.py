@@ -7127,6 +7127,12 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 		error = False
 		re_shell = re.compile(r"^\s*!(.*)")
 		while True:
+			# Setting the environment variable may leak memory,
+			# so only do that if @error has changed.
+			error_str = str(int(error))
+			if os.environ.get("STATUS") != error_str:
+				os.environ["STATUS"] = error_str
+
 			try:
 				line = input("%s> " % self.remote.cwd.path())
 			except KeyboardInterrupt:
@@ -7153,9 +7159,6 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 			if cmdline[0].startswith('-'):
 				print(f"Invalid command.", file=sys.stderr)
 				error = True
-				continue
-			if cmdline == [ "$?" ]:
-				print(int(error))
 				continue
 
 			try:
