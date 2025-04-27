@@ -7077,6 +7077,8 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 					token += rf'\{c}'
 				else:
 					token += c
+			elif c == '#':
+				break
 			elif c.isspace():
 				if token is not None:
 					yield token
@@ -7154,7 +7156,7 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 				error = True
 				continue
 
-			if not cmdline or cmdline[0].startswith('#'):
+			if not cmdline:
 				continue
 			if cmdline[0].startswith('-'):
 				print(f"Invalid command.", file=sys.stderr)
