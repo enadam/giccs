@@ -581,6 +581,11 @@ class CmdLineOptions: # {{{
 			raise self.CmdLineError(f"{what}: missing value")
 		return lst
 
+	# Is stdin a terminal?
+	@functools.cached_property
+	def interactive(self) -> bool:
+		return os.isatty(sys.stdin.fileno())
+
 	# Public methods.
 	# Find the declaration of an argument.
 	def find_argument(self, flag: str) -> Optional[Section.Option]:
@@ -7122,9 +7127,9 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 			yield token
 
 	def execute(self) -> None:
-		import readline
-
-		print("Operating on", self.bucket_with_prefix())
+		if self.interactive:
+			import readline
+			print("Operating on", self.bucket_with_prefix())
 
 		error = False
 		re_shell = re.compile(r"^\s*!(.*)")
@@ -7136,12 +7141,18 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 				os.environ["STATUS"] = error_str
 
 			try:
-				line = input("%s> " % self.remote.cwd.path())
+				if self.interactive:
+					line = input(
+						"%s> "
+						% self.remote.cwd.path())
+				else:
+					line = input()
 			except KeyboardInterrupt:
 				print()
 				continue
 			except EOFError:
-				print()
+				if self.interactive:
+					print()
 				break
 
 			if (m := re_shell.match(line)) is not None:
@@ -7265,10 +7276,16 @@ class FTPOverwriteOptions(CmdLineOptions):
 		elif args.exists is not None:
 			self.if_exists = self.IfExists.from_choice(args.exists)
 
+		# Make sure confirm() is not called when we're not interactive.
+		if self.if_exists == self.IfExists.ASK \
+				and not self.interactive:
+			self.if_exists = self.IfExists.FAIL
+
 	# Return True, False or saise SystemExit.
 	def confirm(self, prompt: str) -> bool:
 		import readline
 
+		assert self.interactive
 		n = readline.get_current_history_length()
 		while True:
 			try:
@@ -8505,7 +8522,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 			msg = "Uploading from stdin"
 			def fun(**kw):
 				# Add a newline to @msg if stdin is a TTY.
-				if sys.stdin.isatty():
+				if self.interactive:
 					print(f"{msg} (^D to finish)...")
 				return upload_blob(self,
 						pipeline_stdin=os.fdopen(
@@ -8514,7 +8531,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 						**kw)
 
 			try_to_upload(self, blob, remote, fun,
-				None if sys.stdin.isatty() else msg)
+				None if self.interactive else msg)
 		else:
 			fun = lambda **kw: \
 				upload_blob(self, command=self.cmd, **kw)
