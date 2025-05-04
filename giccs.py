@@ -4910,10 +4910,13 @@ class GCSGlobber(VirtualGlobber):
 		bucket_path = self.args.bucket_path()
 		folders_path = f"{bucket_path}/folders/"
 		req = google.cloud.storage_control_v2.ListFoldersRequest(
-			parent=bucket_path, prefix=prefix,
-		)
+			parent=bucket_path, prefix=prefix)
 		for folder in self.args.gcs_ctrl.list_folders(request=req):
 			path = folder.name.removeprefix(folders_path)
+			if path == prefix:
+				continue
+			path = self.args.without_prefix(path)
+
 			try:
 				self.add_file(
 					pathlib.PurePath(path) \
