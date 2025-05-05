@@ -4456,7 +4456,9 @@ class VirtualGlobber(Globber): # {{{
 		# a root with make_root(), or the parent of a non-TLD.
 		parent: Optional[Self | pathlib.PurePath] = None
 
-		# Whether this entry was created on-demand by lookup().
+		# Whether this entry has been committed to the globber.
+		# If not, and the command that created it fails, it will be
+		# removed from the tree.
 		volatile: bool = False
 
 		# Any associated object, eg. a MetaBlob.
@@ -4494,6 +4496,8 @@ class VirtualGlobber(Globber): # {{{
 				raise ConsistencyError(
 					"%s: invalid directory entry"
 					% self.path())
+			if self.volatile:
+				self.globber.volatiles.add(self)
 
 		@functools.cached_property
 		def children(self) -> dict[str, Self]:
@@ -4714,10 +4718,12 @@ class VirtualGlobber(Globber): # {{{
 
 	root:		DirEnt
 	cwd:		DirEnt
-	volatiles:	list[DirEnt]
+
+	# Uncommitted entries created by the currently executing command.
+	volatiles:	set[DirEnt]
 
 	def __init__(self, files: Iterable[Any] = ()):
-		self.volatiles = [ ]
+		self.volatiles = set()
 		self.cwd = self.root = self.DirEnt.mkroot(self)
 		for file in files:
 			self.add_file(pathlib.PurePath(str(file)), file)
@@ -4789,24 +4795,18 @@ class VirtualGlobber(Globber): # {{{
 								volatile=True)
 					parent.add(dent)
 
-					if not created:
-						created = True
-						self.volatiles.append(dent)
-					else:	# Make DirEnt.rollback()
-						# more efficient by having
-						# the bottommost child in
-						# @self.volatiles.
-						assert(self.volatiles[-1]
-							is dent.parent)
-						self.volatiles[-1] = dent
+					# Make rollback() more efficient
+					# by having only the bottommost child
+					# in @self.volatiles.
+					self.volatiles.discard(dent.parent)
+					self.volatiles.add(dent)
 
 					if callable(create):
 						create(dent)
+					created = True
 			elif created:
 				# Refuse to create multiple directories by
-				# looking up enoent-1/../enoent-2/../enoent-3,
-				# because it's surprising and we're adding
-				# only one DirEnt to @self.volatiles.
+				# looking up enoent-1/../enoent-2/../enoent-3.
 				raise UserError(
 					"%s: cannot reference the parent "
 					"of a newly created directory"
