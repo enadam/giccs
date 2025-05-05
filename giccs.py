@@ -4652,6 +4652,28 @@ class VirtualGlobber(Globber): # {{{
 				child.parent = None
 			self.children = { }
 
+		# children=False: add a file
+		# children=True:  add a directory, children = { }
+		# children=None:  add a directory, children are not loaded
+		# children=dict:  add a directory, children = dict
+		def add_child(self, fname: str,
+				children: Union[bool, None, dict[str, Self]]
+						= False,
+				obj: Any = None, volatile: bool = False) \
+				-> Self:
+			if children is False:
+				child = self.mkfile(
+						self.globber, fname,
+						obj=obj, volatile=volatile)
+			else:
+				if children is True:
+					children = { }
+				child = self.mkdir(
+						self.globber, fname,
+						children=children,
+						obj=obj, volatile=volatile)
+			return self.add(child)
+
 		def ls(self) -> Iterable[str]:
 			self.must_be_dir()
 			return sorted(self.children.keys())
@@ -4735,17 +4757,10 @@ class VirtualGlobber(Globber): # {{{
 		for fname in path.parts[start:-1]:
 			child = parent.get(fname)
 			if child is None:
-				child = self.DirEnt.mkdir(self, fname, { })
-				parent.add(child)
+				child = parent.add_child(fname, children=True)
 			parent = child
 
-		if is_dir:
-			dent = self.DirEnt.mkdir(self, path.name, { }, obj)
-		else:
-			dent = self.DirEnt.mkfile(self, path.name, obj)
-		parent.add(dent)
-
-		return dent
+		return parent.add_child(path.name, children=is_dir, obj=obj)
 
 	# Called by DirEnt.children().
 	def load_children(self, dent: DirEnt) -> None:
@@ -4784,16 +4799,11 @@ class VirtualGlobber(Globber): # {{{
 						raise
 
 					parent = dent
-					if i < len(parts) - 1 or must_be_dir:
-						dent = self.DirEnt.mkdir(
-								self, fname,
-								children={ },
-								volatile=True)
-					else:
-						dent = self.DirEnt.mkfile(
-								self, fname,
-								volatile=True)
-					parent.add(dent)
+					add_dir = i < len(parts) - 1 \
+							or must_be_dir
+					dent = parent.add_child(fname,
+							children=add_dir,
+							volatile=True)
 
 					# Make rollback() more efficient
 					# by having only the bottommost child
@@ -4887,11 +4897,8 @@ class GCSGlobber(VirtualGlobber):
 				include_folders_as_prefixes=True)
 		for blob in lst:
 			blob = MetaBlob.create_best_from_gcs(self.args, blob)
-			if blob is None:
-				continue
-
-			dent.add(self.DirEnt.mkfile(
-				self, blob.user_path.name, blob))
+			if blob is not None:
+				dent.add_child(blob.user_path.name, obj=blob)
 
 		for prefix in lst.prefixes:
 			# If we allowed these, we could create
@@ -4901,8 +4908,8 @@ class GCSGlobber(VirtualGlobber):
 					"weird entry in %s (%s)"
 					% (dent.path(), prefix))
 
-			fname = pathlib.PurePath(prefix).name
-			dent.add(self.DirEnt.mkdir(self, fname))
+			dent.add_child(pathlib.PurePath(prefix).name,
+					children=None)
 
 	def load_subtree(self, dent: VirtualGlobber.DirEnt) -> None:
 		if self.args.encrypt_metadata:
