@@ -7608,6 +7608,8 @@ class CmdFTPTree(CmdExec):
 						at_most_one=True))
 		else:
 			dent = self.remote.cwd
+		if dent.isdir():
+			dent.load_subtree()
 		self.print_subtree(dent)
 
 class CmdFTPDir(CmdExec):
