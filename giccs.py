@@ -7365,9 +7365,13 @@ class FTPOverwriteOptions(CmdLineOptions):
 	# Return OVERWRITE, SKIP or FAIL, or raise SystemExit.
 	def file_exists(self,
 			dst: pathlib.PurePath,
-			src: Optional[pathlib.PurePath] = None) -> IfExists:
+			src: Optional[pathlib.PurePath] = None,
+			prompt: Optional[str] = None) -> IfExists:
+		if prompt is None:
+			prompt = "%r exists" % str(dst)
+
 		if self.if_exists == self.IfExists.ASK:
-			prompt = "%r exists, overwrite" % str(dst)
+			prompt += ", overwrite"
 			if src is not None:
 				prompt += " with %r" % str(src)
 			prompt += '?'
@@ -7378,7 +7382,7 @@ class FTPOverwriteOptions(CmdLineOptions):
 				return self.IfExists.SKIP
 
 		if self.if_exists == self.IfExists.SKIP:
-			print("%r exists, skipping." % str(dst))
+			print(f"{prompt}, skipping.")
 		return self.if_exists
 
 class CmdFTPHelp(CmdExec):
@@ -8727,26 +8731,19 @@ def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch,
 	else:
 		sep = ""
 
-	# We can't use FTPOverwriteOptions.file_exists() because
-	# of the custom prompt.
 	overwrite = (self.if_exists == self.IfExists.OVERWRITE)
 	if not dst.volatile and not overwrite:
-		# @dst exists, should we overwrite it?
-		if self.if_exists == self.IfExists.FAIL:
-			if msg is not None:
-				print()
-			raise FileExistsError(str(dst.path()))
-		elif self.if_exists == self.IfExists.SKIP:
-			print(f"{sep}blob exists, skipping.")
-			return None, None
-
-		assert self.if_exists == self.IfExists.ASK
-		if not self.confirm(f"{sep}blob exists, overwrite?"):
-			return None, None
-
-		overwrite = True
-		if msg is not None:
-			print(f"{msg}...", end="", flush=True)
+		match self.file_exists(dst.path(), prompt=f"{sep}blob exists"):
+			case self.IfExists.FAIL:
+				if msg is not None:
+					print()
+				raise FileExistsError(dst.path())
+			case self.IfExists.SKIP:
+				return None, None
+			case self.IfExists.OVERWRITE:
+				overwrite = True
+				if msg is not None:
+					print(f"{msg}...", end="", flush=True)
 
 	try:
 		started = time.monotonic()
