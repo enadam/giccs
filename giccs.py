@@ -7335,15 +7335,17 @@ class FTPOverwriteOptions(CmdLineOptions):
 				and not self.interactive:
 			self.if_exists = self.IfExists.FAIL
 
-	# Return True, False or saise SystemExit.
-	def confirm(self, prompt: str) -> bool:
+	# Return whether the answer is affirmative and whether to apply it
+	# always or raise SystemExit.
+	def confirm(self, prompt: str) -> tuple[bool, bool]:
 		import readline
 
 		assert self.interactive
 		n = readline.get_current_history_length()
 		while True:
 			try:
-				ret = input("%s [y/n/q] " % prompt)
+				ret = input("%s [Yes/Always/No/neVer/Quit] "
+						% prompt)
 			except EOFError:
 				print()
 				ret = None
@@ -7352,12 +7354,17 @@ class FTPOverwriteOptions(CmdLineOptions):
 				#  no new entry was added to the history.)
 				if readline.get_current_history_length() > n:
 					readline.remove_history_item(n)
+				ret = ret.lower()
 
-			if ret == 'y':
-				return True
-			elif ret == 'n':
-				return False
-			elif ret == 'q':
+			if ret in ('y', "yes"):
+				return True, False
+			elif ret in ('a', "always"):
+				return True, True
+			elif ret in ('n', "no"):
+				return False, False
+			elif ret in ('v', "never"):
+				return False, True
+			elif ret in ('q', "quit"):
 				raise SystemExit(0)
 			else:
 				prompt = prompt.lstrip()
@@ -7376,10 +7383,15 @@ class FTPOverwriteOptions(CmdLineOptions):
 				prompt += " with %r" % str(src)
 			prompt += '?'
 
-			if self.confirm(prompt):
-				return self.IfExists.OVERWRITE
+			agree, always = self.confirm(prompt)
+			if agree:
+				ret = self.IfExists.OVERWRITE
 			else:
-				return self.IfExists.SKIP
+				ret = self.IfExists.SKIP
+			if always:
+				self.if_exists = ret
+
+			return ret
 
 		if self.if_exists == self.IfExists.SKIP:
 			print(f"{prompt}, skipping.")
