@@ -3404,7 +3404,8 @@ class MetaBlob(MetaCipher): # {{{
 				self.calc_signature().sign())
 
 	# Initialize or update @self.gcs_blob.metadata.
-	def update_metadata(self) -> None:
+	# Returns whether the metadata needs to be synced.
+	def update_metadata(self) -> bool:
 		gcs_metadata = self.gcs_blob.metadata
 		if gcs_metadata is None:
 			gcs_metadata = { }
@@ -3421,13 +3422,22 @@ class MetaBlob(MetaCipher): # {{{
 					self.DataType.METADATA,
 					pickle.dumps(metadata)),
 				text=True)
-		self.gcs_blob.metadata = gcs_metadata
+
+		if self.gcs_blob.metadata != gcs_metadata:
+			self.gcs_blob.metadata = gcs_metadata
+			return True
+		else:
+			return False
 
 	# Write new metadata to @self.gcs_blob.
-	def sync_metadata(self) -> None:
-		self.user_mtime = datetime.datetime.now(datetime.timezone.utc)
-		self.update_metadata()
-		self.gcs_blob.patch()
+	def sync_metadata(self, update_mtime: bool = True) -> None:
+		if update_mtime:
+			self.user_mtime = datetime.datetime.now(
+							datetime.timezone.utc)
+
+		# Patching costs money, so avoid it if we can.
+		if self.update_metadata():
+			self.gcs_blob.patch()
 
 	# Return whether the blob should have a "signature" metadata.
 	def has_signature(self) -> bool:
