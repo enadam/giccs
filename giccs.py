@@ -26,6 +26,7 @@ import btrfs
 
 import google.cloud.storage
 import google.cloud.storage_control_v2
+import google.cloud.storage_control_v2.types
 import google.oauth2.service_account
 from google.api_core.exceptions import GoogleAPICallError
 # }}}
@@ -1065,10 +1066,13 @@ class BucketOptions(AccountOptions): # {{{
 		if not self.is_hfs:
 			return
 
+		req = google.cloud.storage_control_v2.types. \
+					CreateFolderRequest(
+						parent=self.bucket_path(),
+						folder_id=folder_id,
+						recursive=True)
 		try:
-			self.gcs_ctrl.create_folder(
-				parent=self.bucket_path(),
-				folder_id=folder_id)
+			self.gcs_ctrl.create_folder(request=req)
 		except GoogleAPICallError as ex:
 			raise FatalError from ex
 
@@ -7833,31 +7837,32 @@ class CmdFTPMkDir(CmdExec):
 		self.what = args.what
 
 	def execute(self: _CmdFTPMkDir) -> None:
-		def create(dent: VirtualGlobber.DirEnt) -> None:
-			dent.must_be_dir()
-			print("Creating %s..." % dent.path())
-
-			# @folder_id can only be None if @dent is the @RootDir
-			# (and there's no @self.args.prefix), but it can't be
-			# because @dent shouldn't exist in GCS yet.
-			folder_id = self.remote.gcs_prefix(dent)
-			assert folder_id is not None
-
-			self.create_folder(folder_id)
-			dent.commit()
-
 		# It doesn't make a lot of sense to specify a pattern for this
 		# command, but let's accept them anyway, so we behave like a
 		# real shell (ie. "mkdir */xxx" won't do what the user might
 		# expect, but it will err out instead of creating a directory
 		# named "*/xxx").
 		for path in self.remote.globs(self.what, must_exist=False):
+			# If @path is empty, leave it so, making "mkdir ''"
+			# an error.
 			if path:
 				# Make sure that self.remote.lookup()
 				# creates a directory in the end.
 				path += '/'
 
-			self.remote.lookup(path, create=create)
+			dent = self.remote.lookup(path, create=True)
+			if dent.volatile:
+				print("Creating %s..." % dent.path())
+
+				# @folder_id can only be None if @dent is the
+				# @RootDir (and there's no @self.args.prefix),
+				# but it can't be because @dent shouldn't exist
+				# in GCS yet.
+				folder_id = self.remote.gcs_prefix(dent)
+				assert folder_id is not None
+
+				self.create_folder(folder_id)
+				dent.commit()
 
 class CmdFTPRmDir(CmdExec):
 	cmd = "rmdir"
