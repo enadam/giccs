@@ -4582,29 +4582,29 @@ class VirtualGlobber(Globber): # {{{
 				dent = dent.parent
 
 		def __iter__(self) -> Iterator[Self]:
-			self.must_be_dir()
+			assert self.isdir()
 			return iter(sorted(self.children.values()))
 
 		def __contains__(self, fname: str) -> bool:
-			self.must_be_dir()
+			assert self.isdir()
 			return fname in self.children
 
 		def __getitem__(self, fname: str) -> Self:
-			self.must_be_dir()
+			assert self.isdir()
 			child = self.children.get(fname)
 			if child is None:
 				raise FileNotFoundError(self.path() / fname)
 			return child
 
 		def get(self, fname: str) -> Optional[Self]:
-			self.must_be_dir()
+			assert self.isdir()
 			return self.children.get(fname)
 
 		def add(self, child: Self) -> Self:
 			assert child.globber is self.globber
 			assert child.fname != '/'
 			assert child.parent is None
-			self.must_be_dir()
+			assert self.isdir()
 
 			if child.fname in self.children:
 				raise FileExistsError(
@@ -4616,13 +4616,13 @@ class VirtualGlobber(Globber): # {{{
 			return child
 
 		def remove(self, child: Self) -> Self:
-			self.must_be_dir()
+			assert self.isdir()
 			del self.children[child.fname]
 			child.parent = None
 			return child
 
 		def infanticide(self) -> None:
-			self.must_be_dir()
+			assert self.isdir()
 			for child in self:
 				child.parent = None
 			self.children = { }
@@ -4632,7 +4632,7 @@ class VirtualGlobber(Globber): # {{{
 			return sorted(self.children.keys())
 
 		def load_subtree(self) -> None:
-			self.must_be_dir()
+			assert self.isdir()
 
 			if not self.children_loaded():
 				# Load all our descendents at once.
@@ -4925,7 +4925,7 @@ class GCSGlobber(VirtualGlobber):
 			except FileExistsError as ex:
 				# @path must have been added implicitly
 				# for a blob.
-				self.lookup(ex.args[0]).must_be_dir()
+				assert self.lookup(ex.args[0]).isdir()
 # }}}
 
 # Utilities {{{
