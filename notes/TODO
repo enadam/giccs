@@ -25,7 +25,6 @@ caching:
 			snapshot name and uuid
 			make BackupBlob:s dynamic
 
-mv [--dir/--fname] (rename/move blob, rename folder)
 tab-completion?
 
 document max blob size (5 TiB)

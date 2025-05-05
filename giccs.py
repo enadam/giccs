@@ -1092,6 +1092,16 @@ class BucketOptions(AccountOptions): # {{{
 				name=self.folder_path(folder_id))
 		except GoogleAPICallError as ex:
 			raise FatalError from ex
+
+	def rename_folder(self, src_folder_id: str, dst_folder_id: str) \
+				-> None:
+		# This is a requirement because this is not a nice-to-have
+		# operation which we can skip silently.
+		assert self.is_hfs
+
+		self.gcs_ctrl.rename_folder(
+			name=self.folder_path(src_folder_id),
+			destination_folder_id=dst_folder_id)
 # }}}
 
 # Add --dry-run.
@@ -4568,6 +4578,12 @@ class VirtualGlobber(Globber): # {{{
 
 			return prefix / pathlib.PurePath(*reversed(parts))
 
+		# Turn this DirEnt into a directory.
+		def make_dir(self) -> None:
+			assert not self.isdir()
+			self.children = { }
+
+		# Turn this DirEnt into a top-level directory.
 		def make_root(self) -> None:
 			if self.parent is None:
 				assert self.fname == '/'
@@ -4579,6 +4595,12 @@ class VirtualGlobber(Globber): # {{{
 		# has been called for this DirEnt.
 		def children_loaded(self):
 			return "children" in self.__dict__
+
+		# Invalidate @self.children.
+		def unload_children(self):
+			assert self.isdir()
+			if self.children_loaded():
+				del self.children
 
 		def isdir(self):
 			# Need to be careful because @children is a cached
@@ -7047,7 +7069,8 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
 		return (CmdFTPTree(self), CmdFTPDir(self), CmdFTPDu(self),
-			CmdFTPMkDir(self), CmdFTPRmDir(self), CmdFTPRm(self),
+			CmdFTPMkDir(self), CmdFTPRmDir(self),
+			CmdFTPRm(self), CmdFTPMove(self),
 			CmdFTPCat(self), CmdFTPPage(self),
 			CmdFTPGet(self), CmdFTPPut(self), CmdFTPTouch(self))
 
@@ -7269,7 +7292,7 @@ class CmdFTPShell(CmdTop):
 				CmdFTPDir(self), CmdFTPPDir(self),
 				CmdFTPDu(self),
 				CmdFTPMkDir(self), CmdFTPRmDir(self),
-				CmdFTPRm(self),
+				CmdFTPRm(self), CmdFTPMove(self),
 				CmdFTPCat(self), CmdFTPPage(self),
 				CmdFTPGet(self), CmdFTPPut(self),
 				CmdFTPTouch(self))
@@ -8034,6 +8057,274 @@ class CmdFTPRm(CmdExec):
 			print("Deleted %d directories and %d file(s) of %s."
 				% (ndirs, nfiles, humanize_size(size)))
 
+class CmdFTPMove(CmdExec, FTPOverwriteOptions):
+	cmd = "mv"
+	help = "TODO"
+
+	if_exists = FTPOverwriteOptions.IfExists.ASK
+
+	src: list[str]
+	dst: str
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		self.sections["positional"].add_argument("what", nargs='+')
+		self.sections["positional"].add_argument("where")
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+
+		self.src = args.what
+		self.dst = args.where
+
+	def execute(self: _CmdFTPMove) -> None:
+		srcs = list(map(self.remote.lookup,
+				self.remote.globs(self.src)))
+		dst_top = self.remote.lookup(
+				self.remote.glob(self.dst,
+						at_least_one=True,
+						at_most_one=True,
+						must_exist=False),
+				create=True)
+
+		# @move_src_top := move @src_top inside @dst_top
+		# If False, just rename @src_top to @dst_top.
+		move_src_top = dst_top.isdir()
+		if not dst_top.isdir():
+			if len(srcs) > 1:
+				raise NotADirectoryError(dst_top.path())
+			elif not srcs[0].isdir():
+				# mv file <a-file> => OK (overwrite <a-file>)
+				# mv file <enoent> => OK (rename file)
+				pass
+			elif not dst_top.volatile:
+				# mv dir <a-file> => NOK
+				raise NotADirectoryError(dst_top.path())
+			else:	# mv dir <enoent> => OK
+				dst_top.make_dir()
+
+		# Pre-validate that none of the @srcs is a parent of another
+		# coming after it, and that @dst_top is not a descendant of
+		# @srcs.  This makes `mv src src/dir' and `mv src src/dir dst'
+		# invalid.
+		for i, src in enumerate(srcs):
+			for other in srcs[i+1:]:
+				if src == other:
+					raise UserError(
+						"%s is specified "
+						"more than once"
+						% src.path())
+				elif other.has_parent(src):
+					raise UserError(
+						"%s is a parent of %s"
+						% (src.path(), other.path()))
+
+			if src == dst_top or src.parent == dst_top:
+				# "mv <thing> <thing>" or "mv <thing> ."
+				# Just skip it.
+				srcs[i] = None
+			elif dst_top.has_parent(src):
+				raise UserError(
+					"%s is a parent of %s"
+					% (src.path(), dst_top.path()))
+		srcs = [ src for src in srcs if src is not None ]
+
+		movemap = { }
+		for src_top in srcs:
+			self.map_moves(movemap, src_top, dst_top, move_src_top)
+
+		try:
+			uncommitted = [ ]
+			for src_top in srcs:
+				self.exec_moves(movemap, uncommitted, src_top)
+		except:	# Roll back the @uncommitted changes.
+			for dent, old_user_path in uncommitted:
+				try:
+					blob = dent.obj
+					blob.user_path = old_user_path
+					blob.sync_metadata(update_mtime=False)
+				except:	# Don't let this error interrupt the
+					# rollback of the rest of the @dent:s.
+					CmdTop.print_exception()
+			raise
+		else:	# No errors, all changes must have been committed.
+			assert not uncommitted
+
+	# Walk through @src and return where to move what in @movemap,
+	# taking into account what would be overwritten and what should be
+	# skipped.
+	def map_moves(self, movemap: dict[VirtualGlobber.DirEnt,
+						VirtualGlobber.DirEnt],
+			src: DirEnt, dst: DirEnt, add_child: bool = True) \
+			-> None:
+		if src in movemap:
+			# File has already been moved through a different
+			# src_top, as in "mv <src>/<file> <src> <dst>".
+			return
+
+		if add_child:
+			child = dst.get(src.fname)
+			child_existed = child is not None
+			if child_existed:
+				dst = child
+				if src.isdir():
+					dst.must_be_dir()
+				elif dst.isdir():
+					raise IsADirectoryError(dst.path())
+			else:
+				dst = dst.add_child(src.fname,
+							children=src.isdir(),
+							volatile=True)
+		else:
+			child_existed = not dst.volatile
+
+		# If @dst is not newly created by this invocation of the
+		# function, @src must overwrite something.
+		if child_existed and not dst.isdir():
+			match self.file_exists(dst.path(), src.path()):
+				case self.IfExists.FAIL:
+					raise FileExistsError(dst.path())
+				case self.IfExists.SKIP:
+					movemap[src] = None
+					return
+				case self.IfExists.OVERWRITE:
+					pass
+
+		movemap[src] = dst
+		if src.isdir():
+			for child in src:
+				self.map_moves(movemap, child, dst)
+
+	# Actually move/copy/delete GCS blobs.
+	def move_blob(self,
+			src: VirtualGlobber.DirEnt,
+			dst: VirtualGlobber.DirEnt) -> None:
+		if self.encrypt_metadata:
+			# @src's metadata has been updated to @dst's user path
+			# by the caller.
+			if not dst.volatile:
+				# "Overwrite" @dst.  Make it certain
+				# that we don't delete the wrong blob.
+				assert dst.obj.blob_name != src.obj.blob_name
+				dst.obj.gcs_blob.delete()
+			return
+
+		blob = src.obj
+		old_gcs_blob = blob.gcs_blob
+		new_blob_name = str(self.prefix / blob.user_path)
+		generation = 0 if dst.volatile else None
+
+		if self.is_hfs:
+			# We're not creating a new GCS blob, but the
+			# object referring to it will be new.
+			blob.gcs_blob = self.bucket.move_blob(
+						old_gcs_blob,
+						new_blob_name,
+						if_generation_match=generation)
+		else:	# Try to execute copy+delete as a transaction.
+			new_gcs_blob = self.bucket.copy_blob(
+						old_gcs_blob,
+						self.bucket,
+						new_blob_name,
+						if_generation_match=generation)
+
+			try:
+				old_gcs_blob.delete(if_generation_match=generation)
+			except:
+				new_gcs_blob.delete()
+				raise
+			else:
+				blob.gcs_blob = new_gcs_blob
+
+	# Walk through @src and move the files and directories underneath
+	# around as described in the @movemap.
+	def exec_moves(self, movemap: dict[VirtualGlobber.DirEnt,
+						VirtualGlobber.DirEnt],
+			uncommitted: list[tuple[VirtualGlobber.DirEnt,
+						pathlib.PurePath]],
+			src: DirEnt, move_blobs: bool = True) -> None:
+		dst = movemap[src]
+		if dst is None:
+			# @dst exists and the user chose to skip it during
+			# map_moves().
+			print("Skipping %s." % src.path())
+			return
+
+		if not src.isdir():
+			print("Moving %s to %s..." % (src.path(), dst.path()))
+
+			blob = src.obj
+			old_user_path = blob.user_path
+			new_user_path = dst.path(full_path=True) \
+						.relative_to(RootDir)
+
+			# First update the metadata, which can be rolled back
+			# by the top-level caller.
+			uncommitted.append((src, old_user_path))
+			blob.user_path = new_user_path
+			blob.sync_metadata(update_mtime=False)
+
+			if not move_blobs:
+				# One of our callers will take care of it.
+				return
+			self.move_blob(src, dst)
+
+			# We're out of the danger zone.
+			uncommitted.pop()
+			dst.commit(blob)
+			src.parent.remove(src)
+			return
+
+		# src.isdir()
+		assert not src.is_tld()
+		move_folders = move_blobs \
+				and not self.encrypt_metadata \
+				and self.is_hfs \
+				and dst.volatile
+
+		if move_folders:
+			# This is important because we'll clear the list
+			# if we succeed.
+			assert not uncommitted
+
+			# The parent of the @dst folder must exist.
+			if dst.parent.volatile:
+				folder_id = self.remote.gcs_prefix(dst.parent)
+				assert folder_id is not None
+				self.create_folder(folder_id)
+				dst.parent.commit()
+
+		for child in src:
+			self.exec_moves(movemap, uncommitted, child,
+				move_blobs=move_blobs and not move_folders)
+
+		if move_folders:
+			print("Moving %s/ to %s/..."
+				% (src.path(), dst.path()))
+			self.rename_folder(
+				self.remote.gcs_prefix(src),
+				self.remote.gcs_prefix(dst))
+
+			for dent, _ in uncommitted:
+				movemap[dent].commit(dent.obj)
+			uncommitted.clear()
+
+			# Renaming the folder invalidated all GCS Blob objects
+			# underneath because their names have changed.  It will
+			# be cheaper to reload the subtree later than reloading
+			# all the descendants individually.
+			dst.unload_children()
+
+		dst.commit()
+		if self.remote.cwd is src:
+			self.remote.cwd = dst
+
+		if move_folders or (move_blobs and not src.children):
+			if not move_folders:
+				self.delete_folder(self.remote.gcs_prefix(src))
+			src.parent.remove(src)
+
 class CmdFTPCat(CmdExec):
 	cmd = "cat"
 	help = "TODO"
@@ -8748,6 +9039,7 @@ class _CmdFTPDu(CmdFTP, CmdFTPDu): pass
 class _CmdFTPMkDir(CmdFTP, CmdFTPMkDir): pass
 class _CmdFTPRmDir(CmdFTP, CmdFTPRmDir): pass
 class _CmdFTPRm(CmdFTP, CmdFTPRm): pass
+class _CmdFTPMove(CmdFTP, CmdFTPMove): pass
 class _CmdFTPGet(CmdFTP, CmdFTPGet): pass
 class _CmdFTPPut(CmdFTP, CmdFTPPut): pass
 class _CmdFTPTouch(CmdFTP, CmdFTPTouch): pass
