@@ -7339,6 +7339,25 @@ class FTPOverwriteOptions(CmdLineOptions):
 			else:
 				prompt = prompt.lstrip()
 
+	# Return OVERWRITE, SKIP or FAIL, or raise SystemExit.
+	def file_exists(self,
+			dst: pathlib.PurePath,
+			src: Optional[pathlib.PurePath] = None) -> IfExists:
+		if self.if_exists == self.IfExists.ASK:
+			prompt = "%r exists, overwrite" % str(dst)
+			if src is not None:
+				prompt += " with %r" % str(src)
+			prompt += '?'
+
+			if self.confirm(prompt):
+				return self.IfExists.OVERWRITE
+			else:
+				return self.IfExists.SKIP
+
+		if self.if_exists == self.IfExists.SKIP:
+			print("%r exists, skipping." % str(dst))
+		return self.if_exists
+
 class CmdFTPHelp(CmdExec):
 	cmd = "help"
 	help = "TODO"
@@ -8158,23 +8177,6 @@ class CmdFTPGet(CmdExec, FTPOverwriteOptions):
 		cmd_ftp_get(self)
 
 	# Returns:
-	# * True:	skip the file
-	# * False:	overwrite the file
-	# * SystemExit:	abort the operation
-	# * Exception:	fail the operation
-	def skip_file(self, path: pathlib.PurePath) -> bool:
-		if self.if_exists == self.IfExists.OVERWRITE:
-			return False
-		elif self.if_exists == self.IfExists.SKIP:
-			print("%r exists, skipping." % str(path))
-			return True
-		elif self.if_exists == self.IfExists.FAIL:
-			raise
-		elif self.if_exists == self.IfExists.ASK:
-			return not self.confirm(
-				"%r exists, overwrite?" % str(path))
-
-	# Returns:
 	# * file object
 	# * None:	skip the file
 	# * SystemExit:	abort the operation
@@ -8184,8 +8186,11 @@ class CmdFTPGet(CmdExec, FTPOverwriteOptions):
 			try:
 				return open(dst, "xb")
 			except FileExistsError:
-				if self.skip_file(dst):
-					return None
+				match self.file_exists(dst):
+					case self.IfExists.FAIL:
+						raise
+					case self.IfExists.SKIP:
+						return None
 
 		if self.overwrite == self.Overwrite.IN_PLACE:
 			return open(dst, "wb")
@@ -8431,6 +8436,8 @@ def try_to_upload(self: _CmdFTPPut|_CmdFTPTouch,
 	else:
 		sep = ""
 
+	# We can't use FTPOverwriteOptions.file_exists() because
+	# of the custom prompt.
 	overwrite = (self.if_exists == self.IfExists.OVERWRITE)
 	if not dst.volatile and not overwrite:
 		# @dst exists, should we overwrite it?
