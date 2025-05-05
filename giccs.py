@@ -8889,6 +8889,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 
 	aborted = False
 	nfiles = nbytes = duration = 0
+	remote_was_volatile = remote.volatile
 	for src_path, src_mode in local:
 		if stat.S_ISREG(src_mode):
 			dst_path = remote.path()
@@ -8909,7 +8910,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 		# @src_path is a directory.
 		src_top = pathlib.PurePath(src_path)
 		dst_top = remote.path()
-		if not remote.volatile \
+		if not remote_was_volatile \
 				and not self.re_baseless.search(src_path):
 			# put foo bar -> upload foo/* under bar/foo/*
 			# Otherwise upload foo/* under bar/*.
