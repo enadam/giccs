@@ -744,7 +744,9 @@ class CmdTop(CmdLineCommand): # {{{
 	# Can be overridden by subclasses.
 	class ArgumentParser(argparse.ArgumentParser): pass
 
-	@functools.cached_property
+	@classmethod
+	@property
+	@functools.cache
 	def debug(self) -> bool:
 		debug = os.environ.get("GICCS_DEBUG")
 		if debug is None:
@@ -754,6 +756,17 @@ class CmdTop(CmdLineCommand): # {{{
 			return int(debug) > 0
 		except ValueError:
 			return debug.lower() in ("true", "yes", "on")
+
+	@classmethod
+	def print_exception(cls):
+		if cls.debug:
+			# Print the backtrace when debugging.
+			import traceback
+			traceback.print_exc()
+		else:
+			ex = sys.exception()
+			print("%s: %s" % (type(ex).__name__, ex),
+				file=sys.stderr)
 
 	def parse(self, cmdline: Optional[Sequence[str]] = None) -> CmdExec:
 		parser = self.ArgumentParser(
@@ -796,14 +809,8 @@ class CmdTop(CmdLineCommand): # {{{
 		except (FatalError, UserError,
 				Globber.MatchError,
 				FileNotFoundError, FileExistsError,
-				NotADirectoryError, IsADirectoryError) as ex:
-			if self.debug:
-				# Print the backtrace when debugging.
-				import traceback
-				traceback.print_exc()
-			else:
-				print("%s: %s" % (type(ex).__name__, ex),
-					file=sys.stderr)
+				NotADirectoryError, IsADirectoryError):
+			self.print_exception()
 			return False
 		else:
 			return True
