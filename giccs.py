@@ -7162,7 +7162,21 @@ class FTPClient:
 		finally:
 			self.remote.rollback()
 
-class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
+class ExitFTPOnFailureOption(CmdLineOptions):
+	exit_on_failure: bool
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["operation"]
+		section.add_enable_flag("--exit-on-failure")
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.exit_on_failure = args.exit_on_failure
+
+class CmdFTP(CmdExec, ExitFTPOnFailureOption,
+		CommonOptions, DownloadBlobOptions,
 		DecompressionOptions, CompressionOptions,
 		FTPClient):
 	cmd = "ftp"
@@ -7239,6 +7253,9 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 			except KeyboardInterrupt:
 				error = True
 			except CmdFTPExit.ExitFTP:
+				break
+
+			if error and self.exit_on_failure:
 				break
 
 		if error:
@@ -7439,7 +7456,7 @@ class CmdFTPExit(CmdExec):
 	def execute(self):
 		raise self.ExitFTP
 
-class CmdFTPRun(CmdExec, FTPClient):
+class CmdFTPRun(CmdExec, ExitFTPOnFailureOption, FTPClient):
 	cmd = "run"
 	help = "TODO"
 
@@ -7463,6 +7480,9 @@ class CmdFTPRun(CmdExec, FTPClient):
 				error = True
 				break
 			except CmdFTPExit.ExitFTP:
+				break
+
+			if error and self.exit_on_failure:
 				break
 
 		if error:
