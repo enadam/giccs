@@ -6994,85 +6994,7 @@ class FTPClient:
 	# designations.
 	re_baseless = re.compile(r"(^(/|\.|\.\.)|/(\.|\.\.))/*$")
 
-	@functools.cached_property
-	def local(self) -> Globber:
-		assert isinstance(self, CmdFTP)
-		return Globber()
-
-	@functools.cached_property
-	def remote(self) -> GCSGlobber:
-		assert isinstance(self, CmdFTP)
-
-		remote = GCSGlobber(self)
-		if self.chdir is not None:
-			remote.chdir(self.chdir)
-		elif self.chroot is not None:
-			remote.chroot(self.chroot)
-		return remote
-
-	# Right-justify the @col:th column in @rows, or delete it.
-	def rjust_column(self, rows: Sequence[list[Optional[str]]], col: int,
-				min_width: Optional[int] = None) -> None:
-		width = None
-		for row in rows:
-			if row[col] is not None:
-				width = max(width or 0, len(row[col]))
-
-		if width is not None and min_width is not None:
-			width = max(width, min_width)
-
-		for row in rows:
-			if width is None:
-				del row[col]
-			elif row[col] is not None:
-				row[col] = row[col].rjust(width)
-			elif col < len(row) - 1:
-				row[col] = ' ' * width
-			else:
-				del row[col]
-
-class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
-		DecompressionOptions, CompressionOptions,
-		FTPClient):
-	cmd = "ftp"
-	help = "TODO"
-
-	load_all_blobs:	bool = False # XXX unfinished (dynamic discovery)
-	chdir:		Optional[str] = None
-	chroot:		Optional[str] = None
-
-	def declare_arguments(self) -> None:
-		super().declare_arguments()
-
-		section = self.sections["bucket"]
-		section.add_enable_flag_no_dflt("--load-all-blobs")
-
-		section = self.sections["operation"]
-		mutex = section.add_mutually_exclusive_group()
-		mutex.add_argument("--chdir")
-		mutex.add_argument("--chroot")
-
-	def post_validate(self, args: argparse.Namespace) -> None:
-		super().post_validate(args)
-
-		self.merge_options_from_ini(args, "load_all_blobs", tpe=bool)
-		if self.encrypt_metadata:
-			# Blob names aren't arranged hierarchically,
-			# we can't load them incrementally.
-			self.load_all_blobs = True
-		elif args.load_all_blobs is not None:
-			self.load_all_blobs = args.load_all_blobs
-
-		self.chdir = args.chdir
-		self.chroot = args.chroot
-
-	@functools.cached_property
-	def subcommands(self) -> Sequence[CmdLineCommand]:
-		return (CmdFTPTree(self), CmdFTPDir(self), CmdFTPDu(self),
-			CmdFTPMkDir(self), CmdFTPRmDir(self),
-			CmdFTPRm(self), CmdFTPMove(self),
-			CmdFTPCat(self), CmdFTPPage(self),
-			CmdFTPGet(self), CmdFTPPut(self), CmdFTPTouch(self))
+	re_shell = re.compile(r"^\s*!(.*)")
 
 	# Like shlex.split(), split a line of input into tokens,
 	# paying attention to quotation and escaping.
@@ -7180,13 +7102,116 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 		if token is not None:
 			yield token
 
+	@functools.cached_property
+	def local(self) -> Globber:
+		return Globber()
+
+	@functools.cached_property
+	def remote(self) -> GCSGlobber:
+		# @self or one of its parents must be a CmdFTP.
+		remote = GCSGlobber(self)
+		if self.chdir is not None:
+			remote.chdir(self.chdir)
+		elif self.chroot is not None:
+			remote.chroot(self.chroot)
+		return remote
+
+	# Right-justify the @col:th column in @rows, or delete it.
+	def rjust_column(self, rows: Sequence[list[Optional[str]]], col: int,
+				min_width: Optional[int] = None) -> None:
+		width = None
+		for row in rows:
+			if row[col] is not None:
+				width = max(width or 0, len(row[col]))
+
+		if width is not None and min_width is not None:
+			width = max(width, min_width)
+
+		for row in rows:
+			if width is None:
+				del row[col]
+			elif row[col] is not None:
+				row[col] = row[col].rjust(width)
+			elif col < len(row) - 1:
+				row[col] = ' ' * width
+			else:
+				del row[col]
+
+	def execute_cmdline(self, line: str) -> bool:
+		if (m := self.re_shell.match(line)) is not None:
+			ret = subprocess.run(m.group(1), shell=True)
+			return ret.returncode == 0
+
+		try:
+			cmdline = list(self.split(line))
+		except ValueError as ex:
+			print(f"Syntax error: {ex}", file=sys.stderr)
+			return False
+
+		if not cmdline:
+			return True
+		if cmdline[0].startswith('-'):
+			print(f"Invalid command.", file=sys.stderr)
+			return False
+
+		try:
+			return CmdFTPShell(self).run(cmdline)
+		except SystemExit as ex:
+			# argparse.parse_args() exited.
+			return ex.code == 0
+		finally:
+			self.remote.rollback()
+
+class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
+		DecompressionOptions, CompressionOptions,
+		FTPClient):
+	cmd = "ftp"
+	help = "TODO"
+
+	load_all_blobs:	bool = False # XXX unfinished (dynamic discovery)
+	chdir:		Optional[str] = None
+	chroot:		Optional[str] = None
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+
+		section = self.sections["bucket"]
+		section.add_enable_flag_no_dflt("--load-all-blobs")
+
+		section = self.sections["operation"]
+		mutex = section.add_mutually_exclusive_group()
+		mutex.add_argument("--chdir")
+		mutex.add_argument("--chroot")
+
+	def post_validate(self, args: argparse.Namespace) -> None:
+		super().post_validate(args)
+
+		self.merge_options_from_ini(args, "load_all_blobs", tpe=bool)
+		if self.encrypt_metadata:
+			# Blob names aren't arranged hierarchically,
+			# we can't load them incrementally.
+			self.load_all_blobs = True
+		elif args.load_all_blobs is not None:
+			self.load_all_blobs = args.load_all_blobs
+
+		self.chdir = args.chdir
+		self.chroot = args.chroot
+
+	@functools.cached_property
+	def subcommands(self) -> Sequence[CmdLineCommand]:
+		return (CmdFTPRun(self),
+			CmdFTPTree(self), CmdFTPDir(self), CmdFTPDu(self),
+			CmdFTPMkDir(self), CmdFTPRmDir(self),
+			CmdFTPRm(self), CmdFTPMove(self),
+			CmdFTPCat(self), CmdFTPPage(self),
+			CmdFTPGet(self), CmdFTPPut(self), CmdFTPTouch(self))
+
 	def execute(self) -> None:
 		if self.interactive:
 			import readline
 			print("Operating on", self.bucket_with_prefix())
 
 		error = False
-		re_shell = re.compile(r"^\s*!(.*)")
 		while True:
 			# Setting the environment variable may leak memory,
 			# so only do that if @error has changed.
@@ -7209,36 +7234,12 @@ class CmdFTP(CmdExec, CommonOptions, DownloadBlobOptions,
 					print()
 				break
 
-			if (m := re_shell.match(line)) is not None:
-				ret = subprocess.run(m.group(1), shell=True)
-				error = ret.returncode != 0
-				continue
-
 			try:
-				cmdline = list(self.split(line))
-			except ValueError as ex:
-				print(f"Syntax error: {ex}", file=sys.stderr)
-				error = True
-				continue
-
-			if not cmdline:
-				continue
-			if cmdline[0].startswith('-'):
-				print(f"Invalid command.", file=sys.stderr)
-				error = True
-				continue
-
-			try:
-				error = not CmdFTPShell(self).run(cmdline)
-			except SystemExit as ex:
-				# argparse.parse_args() exited.
-				error = ex.code != 0
+				error = not self.execute_cmdline(line)
 			except KeyboardInterrupt:
 				error = True
 			except CmdFTPExit.ExitFTP:
 				break
-			finally:
-				self.remote.rollback()
 
 		if error:
 			sys.exit(1)
@@ -7437,6 +7438,35 @@ class CmdFTPExit(CmdExec):
 
 	def execute(self):
 		raise self.ExitFTP
+
+class CmdFTPRun(CmdExec, FTPClient):
+	cmd = "run"
+	help = "TODO"
+
+	commands: list[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["positional"].add_argument("cmd", nargs='+')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.commands = args.cmd
+
+	def execute(self) -> None:
+		error = False
+		for cmd in self.commands:
+			try:
+				error = not self.execute_cmdline(cmd)
+			except KeyboardInterrupt:
+				# The error message has already been printed.
+				error = True
+				break
+			except CmdFTPExit.ExitFTP:
+				break
+
+		if error:
+			sys.exit(1)
 
 class CmdFTPEcho(CmdExec):
 	cmd = "echo"
