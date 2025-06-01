@@ -8278,9 +8278,14 @@ class CmdFTPPDir(CmdFTPDir):
 						stdin=subprocess.PIPE,
 						text=True)
 		self.output = pager.stdin
-		super().execute()
-		pager.stdin.close()
-		pager.wait()
+		try:
+			super().execute()
+		except:
+			print("Oops!", file=pager.stdin)
+			raise
+		finally:
+			pager.stdin.close()
+			pager.wait()
 
 class CmdFTPDu(CmdExec):
 	cmd = "du"
@@ -8873,10 +8878,11 @@ class CmdFTPPage(CmdFTPCat):
 			pager = subprocess.Popen(
 				("sensible-pager",), env=env,
 				stdin=subprocess.PIPE)
-			self.cat(src, pager.stdin)
-
-			pager.stdin.close()
-			pager.wait()
+			try:
+				self.cat(src, pager.stdin)
+			finally:
+				pager.stdin.close()
+				pager.wait()
 
 class CmdFTPGet(CmdExec, FTPOverwriteOptions):
 	cmd = "get"
