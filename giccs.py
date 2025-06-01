@@ -15,7 +15,7 @@ import subprocess, multiprocessing
 import pathlib, glob2
 import time, datetime
 import re, bisect, uuid
-import base64, binascii
+import base64, binascii, pickle
 import random, secrets
 import hashlib, hmac
 import argparse, configparser, shlex
@@ -142,6 +142,28 @@ class SecurityError(FatalError): pass
 
 # System is in an unexpected state.
 class ConsistencyError(FatalError): pass
+# }}}
+
+# A pickle.Unpickler which won't call abitrary functions to restore objects.
+class SafeUnpickler(pickle.Unpickler): # {{{
+	import builtins
+
+	# The only types produced by MetaBlob.save_metadatum().
+	# pickle will actually not call find_class() for these types
+	# (nor for bool for example), but let's play by the rules.
+	safe_types = ("int", "float", "str", "bytes")
+
+	def find_class(self, module: str, tpe: str) -> Callable:
+		if module == "builtins" and tpe in self.safe_types:
+			return getattr(self.builtins, tpe)
+
+		# Since we shouldn't have pickled an object of other types,
+		# this could be a sign of tampering.
+		raise SecurityError(f"Unexpected {module}.{tpe} in pickle")
+
+	@classmethod
+	def loads(cls, dump: bytes) -> Any:
+		return cls(io.BytesIO(dump)).load()
 # }}}
 
 # Command line parsing {{{
@@ -3261,8 +3283,6 @@ class MetaBlob(MetaCipher): # {{{
 
 	# Decrypt and decode @self.gcs_blob.metadata["metadata"].
 	def init_encrypted_metadata(self) -> dict[str, Any]:
-		import pickle
-
 		assert self.args.encrypt_metadata
 		metadata = self.decrypt(self.DataType.METADATA,
 					self.load_metadatum(
@@ -3271,11 +3291,12 @@ class MetaBlob(MetaCipher): # {{{
 
 		try:	# @metadata has been authenticated, so it's safe
 			# to unpickle it.
-			metadata = pickle.loads(metadata)
-		except pickle.PickleError as ex:
+			metadata = SafeUnpickler.loads(metadata)
+		except (pickle.PickleError, SecurityError) as ex:
 			raise SecurityError(
-				"%s[%s]: couldn't decode metadata"
-				% (self.blob_name, "metadata")) from ex
+				"%s[%s]: couldn't decode metadata: %s"
+				% (self.blob_name, "metadata", ex.args[0])) \
+				from ex
 
 		if not isinstance(metadata, dict):
 			raise SecurityError(
@@ -3425,7 +3446,6 @@ class MetaBlob(MetaCipher): # {{{
 
 		if self.args.encrypt_metadata:
 			# Save all @metadata in a pickle.
-			import pickle
 			self.save_metadatum(
 				gcs_metadata, "metadata",
 				self.encrypt(
@@ -5088,7 +5108,6 @@ def humanize_duration(duration: float) -> str:
 def woulda(args: DryRunOptions, verb: str) -> str:
 	return f"Would have {verb}" if args.is_dry_run() else verb.capitalize()
 # }}}
-
 
 # Blob-related functions {{{
 # Transfer data from @inp to @out as fast as possible, optionally writing
