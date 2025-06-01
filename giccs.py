@@ -4389,15 +4389,16 @@ class Globber(glob2.Globber): # {{{
 	class MatchError(Exception): pass
 
 	# List of globbing metacharacters.
-	GLOBBING = ('?', '*', '[', ']')
+	GLOBBING = ('?', '*', '[', ']', '~')
 
 	# The GLOBBING characters may be escaped like this in patterns.
 	escaped = re.compile(r"\\(.)")
 
-	def has_magic(self, pattern: str) -> bool:
+	@classmethod
+	def has_magic(cls, pattern: str) -> bool:
 		# Remove the escaped metacharacters from the @pattern
 		# to make glob2.has_magic() more accurate.
-		return glob2.has_magic(self.escaped.sub("", pattern))
+		return glob2.has_magic(cls.escaped.sub("", pattern))
 
 	def must_exist(self, path: str) -> None:
 		os.stat(path)
@@ -6996,112 +6997,6 @@ class FTPClient:
 
 	re_shell = re.compile(r"^\s*!(.*)")
 
-	# Like shlex.split(), split a line of input into tokens,
-	# paying attention to quotation and escaping.
-	def split(self, s: str) -> Iterable[str]:
-		token = None
-		quoted = None
-		escaped = False
-		environ = environ_delimited = None
-		for c in s:
-			if environ is not None:
-				assert not escaped
-
-				isalnum = re.match(r'\w', c)
-				if isalnum:
-					environ += c
-				elif not environ and c == '{':
-					assert not environ_delimited
-					environ_delimited = True
-				elif environ_delimited and c != '}':
-					raise ValueError(
-						"%s: illegal character in "
-						"environment variable name"
-						% repr(c))
-				elif not environ:
-					raise ValueError(
-						"Empty environment variable "
-						"name")
-				else:
-					val = os.environ.get(environ)
-					if val is None:
-						raise ValueError(
-							f"{environ}: no such "
-							"environment variable")
-
-					if token is None:
-						token = val
-					else:
-						token += val
-					environ = None
-
-				if isalnum or environ_delimited:
-					continue
-
-			if escaped:
-				assert token is not None
-				if c == '\\' or c in Globber.GLOBBING:
-					token += rf'\{c}'
-				else:
-					token += c
-				escaped = False
-			elif c == '$' and quoted != "'":
-				environ = ""
-				environ_delimited = False
-			elif quoted is not None:
-				assert token is not None
-				if c == quoted:
-					quoted = None
-				elif c == '\\':
-					escaped = True
-				elif c in Globber.GLOBBING:
-					token += rf'\{c}'
-				else:
-					token += c
-			elif c == '#':
-				break
-			elif c.isspace():
-				if token is not None:
-					yield token
-					token = None
-			else:
-				if token is None:
-					token = ""
-				if c == '\\':
-					escaped = True
-				elif c in ('"', "'"):
-					quoted = c
-				else:
-					token += c
-
-		if escaped:
-			raise ValueError("Dangling escape character")
-		elif quoted is not None:
-			raise ValueError("Unclosed quotation")
-
-		if environ is not None:
-			if environ_delimited:
-				raise ValueError(
-					f"{environ}: unfinished environment "
-					"variable name")
-			elif not environ:
-				raise ValueError(
-					"Empty environment variable name")
-
-			val = os.environ.get(environ)
-			if val is None:
-				raise ValueError(
-					f"{environ}: no such environment "
-					"variable")
-
-			if token is None:
-				token = val
-			else:
-				token += val
-
-		if token is not None:
-			yield token
-
 	@functools.cached_property
 	def local(self) -> Globber:
 		return Globber()
@@ -7143,7 +7038,7 @@ class FTPClient:
 			return ret.returncode == 0
 
 		try:
-			cmdline = list(self.split(line))
+			cmdline = list(Readline.split(line))
 		except ValueError as ex:
 			print(f"Syntax error: {ex}", file=sys.stderr)
 			return False
@@ -7174,6 +7069,490 @@ class ExitFTPOnFailureOption(CmdLineOptions):
 	def pre_validate(self, args: argparse.Namespace) -> None:
 		super().pre_validate(args)
 		self.exit_on_failure = args.exit_on_failure
+
+# This class sets up readline hooks that provide context-sensitive completion.
+class Readline:
+	# Raised by split3().
+	class ParseError(Exception): pass
+
+	# The readline module itself, which is only loaded in the constructor
+	# to avoid doing so if this class is not needed.
+	readline: types.ModuleType
+
+	# The width of the terminal.
+	term_width: int
+
+	# The sources where possible completions are obtained from.
+	local: Globber
+	remote: VirtualGlobber
+	commands: Sequence[str]
+
+	# The prompt which getline() was called with.  Used to redisplay it
+	# after the list of completions are shown.
+	prompt: str
+
+	# The contents of the readline buffer when <TAB> is pressed for the
+	# first time.
+	linebuf: str
+
+	# The cursor position at the same time (assuming no non-displaying
+	# characters in @linebuf).
+	cursor: int
+
+	# The index in @linebuf where the token to be completed starts.
+	# The preceding portion of @linebuf is returned to readline verbatim.
+	token_start: int
+
+	# List of possible completions returned by the completer() based on
+	# the @commands, @local_matches and @remote_matches.  It's either a
+	# list of commands or file names starting with the token to be
+	# completed (foo<TAB> => [ "food", "fool", "foot" ]) or a list of
+	# concatenated file names matching the token as glob (bar*r<TAB> =>
+	# [ "barber bartender", "barometer barrier" ]) where the first item
+	# is from the @local_matches and the second from the @remote_matches.
+	completions: list[str]
+
+	# List of paths mathing the token to be completed from the @local and
+	# @remote Globber:s created by the completer() and used by display().
+	local_matches: list[str]
+	remote_matches: list[str]
+
+	# All paths returned to readline are quoted with this function to be
+	# space- and metacharacter-clean, so the output of readline can be
+	# reparsed with split() correctly.
+	quote = staticmethod(shlex.quote)
+
+	# readline silently suppresses exceptions raised by hooks, which makes
+	# debugging more difficult.  This decorator prints them transparently.
+	@staticmethod
+	def catch(fun):
+		def wrap(*args):
+			try:
+				return fun(*args)
+			except:
+				import traceback
+				traceback.print_exc()
+				raise
+
+		return wrap
+
+	# Parse @s into a sequence of tokens, taking quotation and escaping
+	# into account and expanding $ENVIRONMENT_VARIABLE references.  Yields
+	# tuples of (token, start_index, end_index+1) and raises a ParseError
+	# if the syntax doesn't check out.
+	@classmethod
+	def split3(cls, s: str, unknown_env_ok: bool = False) \
+			-> Iterable[tuple[Optional[str], int, int]]:
+		quoted = None
+		escaped = False
+		token = start = None
+		environ = environ_delimited = None
+		for i, c in enumerate(s):
+			if environ is not None:
+				# We're parsing an environment variable
+				# reference.
+				assert not escaped
+
+				# isalnum() matches too many weird characters.
+				isalnum = c.isalpha() or re.match("[0-9_]", c)
+				if isalnum:
+					# @environ is not finished.
+					environ += c
+				elif not environ and c == '{':
+					# It's a ${ENV}.
+					assert not environ_delimited
+					environ_delimited = True
+				elif environ_delimited and c != '}':
+					# Non-word character in ${...}.
+					raise cls.ParseError(
+						"%s: invalid character in "
+						"environment variable name"
+						% repr(c))
+				elif not environ:
+					# It's literally ${}.
+					raise cls.ParseError(
+						"Empty environment variable "
+						"name")
+				else:	# @environ is complete now, look it up
+					# and add it to the current @token.
+					val = os.environ.get(environ)
+					if val is None and not unknown_env_ok:
+						raise cls.ParseError(
+							f"{environ}: no such "
+							"environment variable")
+					elif val is None:
+						# Invalidate the @token.
+						token = None
+
+					if token is not None:
+						token += val
+					environ = None
+
+				if isalnum or environ_delimited:
+					continue
+
+			if escaped:
+				# @c is escaped.
+				assert start is not None
+				if token is None:
+					pass
+				elif c == '\\' or c in Globber.GLOBBING:
+					token += rf'\{c}'
+				else:
+					token += c
+				escaped = False
+			elif c == '$' and quoted != "'":
+				# Start of an environment variable.  Like in
+				# the shell, we may be in "double quotes".
+				environ = ""
+				environ_delimited = False
+				if start is None:
+					start = i
+					token = ""
+			elif quoted is not None:
+				# This part of the @token is being quoted.
+				assert start is not None
+				if c == quoted:
+					# End of quotation.
+					quoted = None
+				elif c == '\\':
+					escaped = True
+				elif token is None:
+					# @token has been invalidated.
+					pass
+				elif c in Globber.GLOBBING:
+					token += rf'\{c}'
+				else:
+					token += c
+			elif c == '#':
+				# Start of comment, ignore everything beyond.
+				break
+			elif c.isspace():
+				# Inter-token whitespace.
+				if start is not None:
+					yield (token, start, i)
+					token = start = None
+			else:	# Non-quoted, escaped etc. character.
+				if start is None:
+					start = i
+					token = ""
+
+				if c == '\\':
+					escaped = True
+				elif c in ('"', "'"):
+					quoted = c
+				elif token is not None:
+					token += c
+
+		if escaped:
+			raise cls.ParseError("Dangling escape character")
+		elif quoted is not None:
+			raise cls.ParseError("Unclosed quotation")
+
+		if environ is not None:
+			# We were parsing $ENV at the end of the input string.
+			if environ_delimited:
+				raise cls.ParseError(
+					f"{environ}: unfinished environment "
+					"variable name")
+			elif not environ:
+				raise cls.ParseError(
+					"Empty environment variable name")
+
+			val = os.environ.get(environ)
+			if val is None and not unknown_env_ok:
+				raise cls.ParseError(
+					f"{environ}: no such environment "
+					"variable")
+			elif val is None:
+				token = None
+			if token is not None:
+				token += val
+
+		if start is not None:
+			yield (token, start, i+1)
+
+	# Same as split3(), but omits the indices.
+	@classmethod
+	def split(cls, s: str) -> Iterable[str]:
+		yield from (token for token, _, _ in cls.split3(s))
+
+	# Called by collect_completions() to complete "<command> <TAB>".
+	def complete_dirlist(self) -> None:
+		self.local_matches += (
+			fname for fname
+			in self.local.listdir('.')
+			if not fname.startswith('.')
+		)
+		self.completions += map(self.quote, self.local_matches)
+
+		self.remote_matches += (
+			fname for fname
+			in self.remote.listdir('.')
+			if not fname.startswith('.')
+		)
+		self.completions += map(self.quote, self.remote_matches)
+
+	# Called by collect_completions() to complete "<command> foo<TAB>".
+	def complete_prefix(self, prefix: str) -> None:
+		prefix += '*'
+
+		self.local_matches += self.local.glob(
+			os.path.expanduser(prefix), at_least_one=False)
+		self.completions += map(self.quote, self.local_matches)
+
+		self.remote_matches += self.remote.glob(
+			prefix, at_least_one=False)
+		self.completions += map(self.quote, self.remote_matches)
+
+	# Called by collect_completions() to complete "<command> foo*<TAB>".
+	def complete_glob(self, pattern: str) -> None:
+		self.local_matches += self.local.glob(
+			os.path.expanduser(pattern), at_least_one=False)
+		if self.local_matches:
+			self.completions.append(' '.join(
+				map(self.quote, self.local_matches)))
+
+		self.remote_matches += self.remote.glob(
+			pattern, at_least_one=False)
+		if self.remote_matches:
+			self.completions.append(' '.join(
+				map(self.quote, self.remote_matches)))
+
+	# Parse the current readline buffer and come up with possible
+	# completions depending on the cursor position.
+	def collect_completions(self) -> None:
+		self.completions = [ ]
+		self.local_matches = [ ]
+		self.remote_matches = [ ]
+
+		self.cursor = self.readline.get_endidx()
+		self.linebuf = self.readline.get_line_buffer()
+
+		# Find the @token to be completed.  Skip over unknown
+		# environment variables, the user may correct them later.
+		first_token = True
+		tokens = iter(self.split3(self.linebuf, unknown_env_ok=True))
+		while True:
+			try:
+				token, start, end = next(tokens)
+			except StopIteration:
+				break
+			except self.ParseError:
+				return
+
+			if end < self.cursor:
+				# The cursor is past this token.
+				first_token = False
+				continue
+			elif end > self.cursor:
+				if self.cursor < start:
+					# The cursor is between tokens.
+					break
+
+				# The cursor must reside within the @token.
+				assert start <= self.cursor < end
+
+				# By setting the skip-completed-text option
+				# we could complete it, but if the completion
+				# doesn't have the prefix of what is in the
+				# @linebuf (eg. they are quoted differently),
+				# readline doesn't know how much to delete
+				# from the buffer, messing it up.  So just
+				# don't complete in this case.
+				return
+
+			if token is None:
+				# @token is an unknown environment variable
+				# reference.
+				return
+			elif not token:
+				# Don't complete ''.
+				return
+
+			if first_token:
+				self.completions = [
+					cmd for cmd in self.commands
+					if cmd.startswith(token)
+				]
+			elif Globber.has_magic(token):
+				# @token has globbing metacharacters.
+				# <TAB> will cycle between the concatenated
+				# list of files matched by @self.local
+				# and @self.remote.
+				self.complete_glob(token)
+			else:
+				self.complete_prefix(token)
+
+			self.token_start = start
+			return
+
+		# The cursor is either between tokens or is beyond
+		# the last token of @linebuf.
+		if first_token:
+			# There were no tokens at all.
+			self.completions = self.commands
+		else:	# Offer all non-hidden files in the current directory.
+			self.complete_dirlist()
+		self.token_start = self.cursor
+
+	# The readline completer hook.  This seems to be called when
+	# the user presses <TAB> for the first time with @state == 0,
+	# then with incrementing @state until we return None.
+	@catch
+	def completer(self, text: str, state: int) -> Optional[str]:
+		if not state:
+			# Gather @self.completions.
+			self.collect_completions()
+
+		if state < len(self.completions):
+			return self.linebuf[:self.token_start] \
+					+ self.completions[state]
+		else:
+			return None
+
+	# Display a list of @matches in a table with vertically aligned rows.
+	def display_table(self, matches: Sequence[str]) -> None:
+		# As is the default in readline, display the @matches
+		# in column-major order.  Find the minimum number of rows
+		# in which we can display everything and maintain a minimal
+		# distance of two spaces between columns.
+		nrows = 1
+		columns = [ ]
+		widths = [ ]
+		while True:
+			for i in range(0, len(matches), nrows):
+				column = matches[i:i+nrows]
+				columns.append(column)
+				widths.append(max(map(len, column)))
+				if sum(widths) + 2*(len(columns) - 1) > self.term_width:
+					# It's too wide, try with more rows.
+					break
+			else:	# Found the right @nrows.
+				break
+
+			if nrows >= len(matches):
+				# We can't add more rows.
+				break
+
+			nrows += 1
+			columns.clear()
+			widths.clear()
+
+		if nrows == 1:
+			# All @matches fit in a single row.  Try to make
+			# the columns the same width (@maxwidth).
+			ncols = len(columns)
+			maxwidth = max(widths)
+			if maxwidth*ncols + 2*(ncols - 1) <= self.term_width:
+				widths = (maxwidth,) * ncols
+
+		# Print the table.
+		for row in range(nrows):
+			line = [ ]
+			for column, width in zip(columns, widths):
+				if row < len(column):
+					line.append(column[row].ljust(width))
+				else:
+					break
+			print("  ".join(line).rstrip())
+
+	# The function readline calls to display a list of possible
+	# completions when there are more than one of them.  This list
+	# is gathered by self.completer() and we don't use any of the
+	# passed arguments.
+	@catch
+	def display(self, substitution: str, matches: list[str],
+			longest: int) -> None:
+		print()
+
+		if not self.local_matches and not self.remote_matches:
+			print()
+			print("Available commands:")
+			self.display_table(self.completions)
+
+		if self.local_matches:
+			matches = [ ]
+			for match in self.local_matches:
+				is_dir = self.local.isdir(match)
+				match = pathlib.PurePath(match).name
+				if is_dir:
+					match += '/'
+				matches.append(self.quote(match))
+
+			print()
+			print("Local files:")
+			self.display_table(matches)
+
+		if self.remote_matches:
+			matches = [ ]
+			for match in self.remote_matches:
+				dent = self.remote.lookup(match)
+				match = dent.fname
+				if dent.isdir():
+					match += '/'
+				matches.append(self.quote(match))
+
+			print()
+			print("Remote files:")
+			self.display_table(matches)
+
+		# Redisplay the prompt.  readline.redisplay() should do this,
+		# but it doesn't, I suppose because the library thinks there's
+		# nothing to redraw, and we'd need rl_forced_update_display()
+		# to force it.  After printing @self.linebuf move the cursor
+		# back where it was with backspaces.
+		print()
+		print(self.prompt,
+			self.linebuf,
+			'\b' * (len(self.linebuf) - self.cursor),
+			sep="", end="")
+		sys.stdout.flush()
+
+	def __init__(self, commands: Sequence[str],
+			local: Globber, remote: VirtualGlobber,
+			inputrc: Optional[str] = None):
+		import readline
+		self.readline = readline
+
+		if inputrc is None:
+			readline.parse_and_bind("tab: menu-complete")
+			readline.parse_and_bind("set show-all-if-ambiguous on")
+			readline.parse_and_bind("\"ÿ\": backward-kill-word")
+		else:
+			readline.read_init_file(inputrc)
+
+		# Tell readline not to try to tokenize the input itself.
+		readline.set_completer_delims('')
+		readline.set_completer(self.completer)
+		readline.set_completion_display_matches_hook(self.display)
+
+		self.local = local
+		self.remote = remote
+		self.commands = commands
+
+		# Use $COLUMNS if it's different from the terminal width.
+		# Otherwise keep @self.term_width up-to-date with SIGWINCH.
+		self.update_term_width()
+		try:
+			columns = int(os.environ["COLUMNS"])
+		except (KeyError, ValueError):
+			columns = None
+		if columns is None or columns == self.term_width:
+			import signal
+			signal.signal(signal.SIGWINCH, self.update_term_width)
+		else:
+			self.term_width = columns
+
+	# The SIGWINCH handler.
+	def update_term_width(self, signum=None, frame=None) -> None:
+		import termios
+		_, self.term_width = termios.tcgetwinsize(sys.stdout.fileno())
+
+	# The main entry point of the class.
+	def getline(self, prompt: str) -> Iterator[str]:
+		self.prompt = prompt
+		return input(prompt)
 
 class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 		CommonOptions, DownloadBlobOptions,
@@ -7222,8 +7601,22 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 
 	def execute(self) -> None:
 		if self.interactive:
-			import readline
 			print("Operating on", self.bucket_with_prefix())
+
+			try:
+				inputrc = self.ini.get(self.config_section, "inputrc")
+			except (configparser.NoSectionError, configparser.NoOptionError):
+				inputrc = None
+			else:
+				inputrc = os.path.expanduser(inputrc)
+
+			commands = [ ]
+			for subcommand in CmdFTPShell().subcommands:
+				commands += subcommand.aliases()
+			readline = Readline(commands, self.local, self.remote,
+						inputrc)
+		else:
+			readline = None
 
 		error = False
 		while True:
@@ -7234,8 +7627,8 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 				os.environ["STATUS"] = error_str
 
 			try:
-				if self.interactive:
-					line = input(
+				if readline is not None:
+					line = readline.getline(
 						"%s> "
 						% self.remote.cwd.path())
 				else:
