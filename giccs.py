@@ -7595,8 +7595,13 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 	cmd = "ftp"
 	help = "TODO"
 
+	# The directory to change to remotely before executing commands.
 	chdir:		Optional[str] = None
 	chroot:		Optional[str] = None
+
+	# File descriptor of the local working directory before executing
+	# commands.  None if it hasn't been changed.
+	orig_cwd:	Optional[int] = None
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
@@ -7670,6 +7675,19 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 
 		if error:
 			sys.exit(1)
+
+	def lchdir(self, path: str) -> None:
+		if self.orig_cwd is None:
+			# Save it for lopen().
+			self.orig_cwd = os.open(".", 0)
+		os.chdir(path)
+
+	# Open a file relative to @self.orig_cwd.
+	def lopen(self, *args, **kw) -> Union[TextIO, BinaryIO]:
+		def opener(path: str, flags: int):
+			return os.open(path, flags,
+					mode=0o666, dir_fd=self.orig_cwd)
+		return open(*args, **kw, opener=opener)
 
 # Execute the appropriate subcommand in the FTP shell.
 class CmdFTPShell(CmdTop):
@@ -7951,7 +7969,8 @@ class CmdFTPLChDir(CmdExec):
 
 	def execute(self):
 		try:
-			os.chdir(self.local.glob(os.path.expanduser(self.dst),
+			self.parent.lchdir(
+				self.local.glob(os.path.expanduser(self.dst),
 							at_least_one=True,
 							at_most_one=True))
 		except OSError as ex:
