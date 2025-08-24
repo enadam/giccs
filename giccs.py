@@ -7595,15 +7595,11 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 	cmd = "ftp"
 	help = "TODO"
 
-	load_all_blobs:	bool = False # XXX unfinished (dynamic discovery)
 	chdir:		Optional[str] = None
 	chroot:		Optional[str] = None
 
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
-
-		section = self.sections["bucket"]
-		section.add_enable_flag_no_dflt("--load-all-blobs")
 
 		section = self.sections["operation"]
 		mutex = section.add_mutually_exclusive_group()
@@ -7612,14 +7608,6 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 
 	def post_validate(self, args: argparse.Namespace) -> None:
 		super().post_validate(args)
-
-		self.merge_options_from_ini(args, "load_all_blobs", tpe=bool)
-		if self.encrypt_metadata:
-			# Blob names aren't arranged hierarchically,
-			# we can't load them incrementally.
-			self.load_all_blobs = True
-		elif args.load_all_blobs is not None:
-			self.load_all_blobs = args.load_all_blobs
 
 		self.chdir = args.chdir
 		self.chroot = args.chroot
