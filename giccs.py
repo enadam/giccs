@@ -4489,8 +4489,8 @@ class VirtualGlobber(Globber): # {{{
 	class DirEnt:
 		globber: VirtualGlobber
 
-		# '/' if the entry is the original VirtualGlobber.root,
-		# or a single path component.
+		# '/' if the entry is VirtualGlobber.rootest, otherwise
+		# a single path component.
 		fname: str
 
 		# None if the entry is the original VirtualGlobber.root,
@@ -4792,6 +4792,8 @@ class VirtualGlobber(Globber): # {{{
 				child, parent = parent, parent.parent
 			parent.remove(child)
 
+	# @rootest is the original root, @root is the current one.
+	rootest:	DirEnt
 	root:		DirEnt
 	cwd:		DirEnt
 
@@ -4800,7 +4802,7 @@ class VirtualGlobber(Globber): # {{{
 
 	def __init__(self, files: Iterable[Any] = ()):
 		self.volatiles = set()
-		self.cwd = self.root = self.DirEnt.mkroot(self)
+		self.cwd = self.root = self.rootest = self.DirEnt.mkroot(self)
 		for file in files:
 			self.add_file(pathlib.PurePath(str(file)), file)
 
@@ -4970,8 +4972,7 @@ class GCSGlobber(VirtualGlobber):
 			# We're expected to be called only once,
 			# to load all the blobs directly under the
 			# GCS prefix.
-			assert dent == self.root
-			assert dent.fname == '/'
+			assert dent == self.rootest
 
 		# Trim @root_path from @blob.user_path in case we've
 		# changed root directory.
