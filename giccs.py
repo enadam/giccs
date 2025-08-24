@@ -7550,7 +7550,11 @@ class Readline:
 			readline.parse_and_bind("set show-all-if-ambiguous on")
 			readline.parse_and_bind("\"ÿ\": backward-kill-word")
 		else:
-			readline.read_init_file(inputrc)
+			try:
+				readline.read_init_file(inputrc)
+			except OSError as ex:
+				ex.filename = str(inputrc)
+				raise
 
 		# Tell readline not to try to tokenize the input itself.
 		readline.set_completer_delims('')
