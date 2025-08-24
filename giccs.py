@@ -220,6 +220,17 @@ class ConfigParser(configparser.ConfigParser): # {{{
 
 	def as_dict(self, section: str) -> dict[str, str]:
 		return dict(self.items(section))
+
+	# Return the value of @key as a pathlib.Path, expanding $ENV variable
+	# and ~home directory references.
+	def get_fname(self, section: str, key: str) -> Optional[pathlib.Path]:
+		try:
+			value = self.get(section, key)
+		except (configparser.NoSectionError, configparser.NoOptionError):
+			return None
+		else:
+			return pathlib.Path(
+				os.path.expanduser(os.path.expandvars(value)))
 # }}}
 
 # Represents the command line options of a single subcommand.
@@ -7530,7 +7541,7 @@ class Readline:
 
 	def __init__(self, commands: Sequence[str],
 			local: Globber, remote: VirtualGlobber,
-			inputrc: Optional[str] = None):
+			inputrc: Optional[pathlib.Path] = None):
 		import readline
 		self.readline = readline
 
@@ -7622,18 +7633,13 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 		if self.interactive:
 			print("Operating on", self.bucket_with_prefix())
 
-			try:
-				inputrc = self.ini.get(self.config_section, "inputrc")
-			except (configparser.NoSectionError, configparser.NoOptionError):
-				inputrc = None
-			else:
-				inputrc = os.path.expanduser(inputrc)
-
 			commands = [ ]
 			for subcommand in CmdFTPShell().subcommands:
 				commands += subcommand.aliases()
 			readline = Readline(commands, self.local, self.remote,
-						inputrc)
+						self.ini.get_fname(
+							self.config_section,
+							"inputrc"))
 		else:
 			readline = None
 
