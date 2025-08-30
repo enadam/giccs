@@ -770,6 +770,10 @@ class CmdExec(CmdLineCommand): # {{{
 	def execute(self) -> None:
 		# Subclasses must implement it.
 		raise NotImplementedError
+
+	def done(self, cmd: Self) -> None:
+		if self.parent is not None:
+			self.parent.done(cmd)
 # }}}
 
 # An entry point to the command line parser tree.
@@ -834,8 +838,10 @@ class CmdTop(CmdLineCommand): # {{{
 		return cmd
 
 	def run(self, cmdline: Optional[Sequence[str]] = None) -> bool:
+		cmd = None
 		try:
-			self.parse(cmdline).execute()
+			cmd = self.parse(cmdline)
+			cmd.execute()
 		except KeyboardInterrupt:
 			print("Interrupted.", file=sys.stderr)
 			raise
@@ -847,6 +853,9 @@ class CmdTop(CmdLineCommand): # {{{
 			return False
 		else:
 			return True
+		finally:
+			if cmd is not None:
+				cmd.done(cmd)
 # }}}
 
 # Add --config and --section.  The config is actually loaded by CmdLineOptions.
