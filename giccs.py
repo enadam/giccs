@@ -5557,7 +5557,16 @@ def download_blob(args: DownloadBlobOptions, blob: MetaBlob,
 				hashing=blob.blob_hash)
 
 	try:	# The actual download.
-		blob.gcs_blob.download_to_file(dst, **args.get_retry_flags())
+		if args.encrypt or blob.blob_hash is not None:
+			# We have enough integrity protection
+			# by AEAD or hashing.
+			checksum = None
+		else:
+			checksum = "md5"
+
+		blob.gcs_blob.download_to_file(dst,
+			checksum=checksum,
+			**args.get_retry_flags())
 		dst.final_progress()
 	except GoogleAPICallError as ex:
 		raise FatalError from ex
