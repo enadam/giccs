@@ -4494,6 +4494,8 @@ class Globber(glob2.Globber): # {{{
 
 # A virtual file system.
 class VirtualGlobber(Globber): # {{{
+	DirCache = list[tuple[str, Union[bytes, "DirCache"]]]
+
 	@dataclasses.dataclass
 	class DirEnt:
 		globber: VirtualGlobber
@@ -4815,10 +4817,17 @@ class VirtualGlobber(Globber): # {{{
 	# Uncommitted entries created by the currently executing command.
 	volatiles:	set[DirEnt]
 
-	def __init__(self, files: Iterable[DirEnt.Object] = ()):
+	def __init__(self, files: Iterable[DirEnt.Object] = (),
+			dircache: Optional[DirCache] = None):
 		self.volatiles = set()
-		self.cwd = self.root = self.rootest = \
-			self.DirEnt.mkdir(self, '/', children={ })
+
+		if dircache is None:
+			self.rootest = self.DirEnt.mkdir(self, '/')
+		else:
+			self.rootest = self.DirEnt.mkdir(self, '/',
+								children={ })
+			self.load_dircache(self.rootest, dircache)
+		self.cwd = self.root = self.rootest
 
 		for file in files:
 			self.add_file(pathlib.PurePath(str(file)), file)
@@ -4835,6 +4844,36 @@ class VirtualGlobber(Globber): # {{{
 			parent = child
 
 		return parent.add_child(path.name, children=is_dir, obj=obj)
+
+	def load_dircache(self, dent: DirEnt, dircache: DirCache) -> None:
+		for fname, obj in dircache:
+			if isinstance(obj, str):
+				dent.add_child(fname, obj=obj)
+			elif isinstance(obj, bytes):
+				dent.add_child(fname, obj=uuid.UUID(bytes=obj))
+			else:
+				self.load_dircache(
+					dent.add_child(fname, children=True),
+					obj)
+
+	def make_dircache(self, dent: Optional[DirEnt] = None) -> DirCache:
+		if dent is None:
+			dent = self.rootest
+
+		dircache  = [ ]
+		for child in dent:
+			if child.isdir():
+				obj = self.make_dircache(child)
+			elif isinstance(child.obj, str):
+				obj = child.obj
+			elif isinstance(child.obj, uuid.UUID):
+				obj = child.obj.bytes
+			elif child.blob.args.encrypt_metadata:
+				obj = child.blob.blob_uuid.bytes
+			else:
+				obj = str(child.blob.user_path)
+			dircache.append((child.fname, obj))
+		return dircache
 
 	# Called by DirEnt.blob().
 	def load_blob(self, blob_name: Union[str, uuid.UUID]) -> MetaBlob:
@@ -4954,13 +4993,27 @@ class VirtualGlobber(Globber): # {{{
 class GCSGlobber(VirtualGlobber):
 	args: EncryptedBucketOptions
 
-	def __init__(self, args: EncryptedBucketOptions):
-		super().__init__()
+	def __init__(self, args: EncryptedBucketOptions,
+			dircache: VirtualGlobber.DirCache):
+		super().__init__(dircache=dircache)
 		self.args = args
 
 	# Return a prefix that matches all blobs under @dent.
 	def gcs_prefix(self, dent: VirtualGlobber.DirEnt) -> Optional[str]:
 		return self.args.with_prefix(dent.path(full_path=True))
+
+	def load_blob(self, blob_name: Union[str, uuid.UUID]) -> MetaBlob:
+		gcs_blob = self.args.bucket.get_blob(
+			str(self.args.prefix / str(blob_name)))
+		if gcs_blob is None:
+			# Could have been deleted.
+			raise FileNotFoundError
+
+		# The caller DirEnt must have been restored from dircache,
+		# so this @blob must be a valid MetaBlob.
+		blob = MetaBlob.create_best_from_gcs(self.args, gcs_blob)
+		assert blob is not None
+		return blob
 
 	def load_children(self, dent: VirtualGlobber.DirEnt) -> None:
 		if self.args.encrypt_metadata:
@@ -7057,7 +7110,7 @@ class FTPClient:
 	@functools.cached_property
 	def remote(self) -> GCSGlobber:
 		# @self or one of its parents must be a CmdFTP.
-		remote = GCSGlobber(self)
+		remote = GCSGlobber(self, self.load_dircache())
 		if self.chdir is not None:
 			remote.chdir(self.chdir)
 		elif self.chroot is not None:
@@ -7626,8 +7679,13 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 	# commands.  None if it hasn't been changed.
 	orig_cwd:	Optional[int] = None
 
+	dircache_path:	Optional[pathlib.Path] = None
+
 	def declare_arguments(self) -> None:
 		super().declare_arguments()
+
+		section = self.sections["bucket"]
+		section.add_argument("--dircache")
 
 		section = self.sections["operation"]
 		mutex = section.add_mutually_exclusive_group()
@@ -7639,6 +7697,13 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 
 		self.chdir = args.chdir
 		self.chroot = args.chroot
+
+		if args.dircache is not None:
+			self.dircache_path = pathlib.Path(args.dircache)
+		else:
+			self.dircache_path = self.ini.get_fname(
+							self.config_section,
+							"dircache")
 
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
@@ -7711,6 +7776,31 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 			return os.open(path, flags,
 					mode=0o666, dir_fd=self.orig_cwd)
 		return open(*args, **kw, opener=opener)
+
+	def load_dircache(self) -> Optional[VirtualGlobber.DirCache]:
+		if self.dircache_path is None:
+			return None
+
+		try:
+			dircache = self.lopen(self.dircache_path, "rb")
+		except FileNotFoundError:
+			return None
+		else:
+			return SafeUnpickler(dircache).load()
+
+	def done(self, cmd: CmdExec):
+		# Only proceed if we're finished with the entire FTP session.
+		if cmd is not self and isinstance(cmd.parent, CmdFTPShell):
+			super().done(cmd)
+			return
+
+		if self.dircache_path is None:
+			super().done(cmd)
+			return
+
+		pickle.dump(self.remote.make_dircache(),
+				self.lopen(self.dircache_path, "wb"))
+		super().done(cmd)
 
 # Execute the appropriate subcommand in the FTP shell.
 class CmdFTPShell(CmdTop):
