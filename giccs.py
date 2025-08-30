@@ -4512,28 +4512,27 @@ class VirtualGlobber(Globber): # {{{
 		# removed from the tree.
 		volatile: bool = False
 
-		# Any associated object, eg. a MetaBlob.
-		obj: Any = None
-
-		@classmethod
-		def mkroot(cls, globber: VirtualGlobber, obj: Any = None) \
-				-> Self:
-			return cls(globber, '/', obj=obj)
+		# If this DirEnt is a file, @obj is either:
+		# * the MetaBlob pointed to by this DirEnt
+		# * or the UUID of that MetaBlob
+		# * or the MetaBlob's user_path if the blob is not encrypted
+		#   (thus doesn't have an UUID).
+		Object = Union[str, uuid.UUID, MetaBlob]
+		obj: Optional[Object] = None
 
 		@classmethod
 		def mkdir(cls, globber: VirtualGlobber, fname: str,
 				children: Optional[dict[str, Self]] = None,
-				obj: Any = None, volatile: bool = False) \
-				-> Self:
-			self = cls(globber, fname, obj=obj, volatile=volatile)
+				volatile: bool = False) -> Self:
+			self = cls(globber, fname, volatile=volatile)
 			if children is not None:
 				self.children = children
 			return self
 
 		@classmethod
 		def mkfile(cls, globber: VirtualGlobber, fname: str,
-				obj: Any = None, volatile: bool = False) \
-				-> Self:
+				obj: Optional[Object] = None,
+				volatile: bool = False) -> Self:
 			self = cls(globber, fname, obj=obj, volatile=volatile)
 
 			# Prevents the children() method from ever being called
@@ -4561,6 +4560,13 @@ class VirtualGlobber(Globber): # {{{
 				delattr(self, "children")
 				raise
 			return self.children
+
+		@property
+		def blob(self) -> MetaBlob:
+			assert not self.isdir()
+			if not isinstance(self.obj, MetaBlob):
+				self.obj = self.globber.load_blob(self.obj)
+			return self.obj
 
 		# For sorted() in __iter__().
 		def __lt__(self, other: Self) -> bool:
@@ -4722,8 +4728,8 @@ class VirtualGlobber(Globber): # {{{
 		def add_child(self, fname: str,
 				children: Union[bool, None, dict[str, Self]]
 						= False,
-				obj: Any = None, volatile: bool = False) \
-				-> Self:
+				obj: Optional[Object] = None,
+				volatile: bool = False) -> Self:
 			if children is False:
 				child = self.mkfile(
 						self.globber, fname,
@@ -4734,7 +4740,7 @@ class VirtualGlobber(Globber): # {{{
 				child = self.mkdir(
 						self.globber, fname,
 						children=children,
-						obj=obj, volatile=volatile)
+						volatile=volatile)
 			return self.add(child)
 
 		def ls(self) -> Iterable[str]:
@@ -4772,7 +4778,7 @@ class VirtualGlobber(Globber): # {{{
 				yield self
 
 		# Make the entry and its ancestors non-volatile.
-		def commit(self, obj: Any = None) -> None:
+		def commit(self, obj: Optional[Object] = None) -> None:
 			if obj is not None:
 				self.obj = obj
 
@@ -4809,13 +4815,16 @@ class VirtualGlobber(Globber): # {{{
 	# Uncommitted entries created by the currently executing command.
 	volatiles:	set[DirEnt]
 
-	def __init__(self, files: Iterable[Any] = ()):
+	def __init__(self, files: Iterable[DirEnt.Object] = ()):
 		self.volatiles = set()
-		self.cwd = self.root = self.rootest = self.DirEnt.mkroot(self)
+		self.cwd = self.root = self.rootest = \
+			self.DirEnt.mkdir(self, '/', children={ })
+
 		for file in files:
 			self.add_file(pathlib.PurePath(str(file)), file)
 
-	def add_file(self, path: pathlib.PurePath, obj: Any = None,
+	def add_file(self, path: pathlib.PurePath,
+			obj: Optional[DirEnt.Object] = None,
 			is_dir: bool = False) -> DirEnt:
 		parent = self.root
 		start = 1 if path.is_absolute() else 0
@@ -4826,6 +4835,10 @@ class VirtualGlobber(Globber): # {{{
 			parent = child
 
 		return parent.add_child(path.name, children=is_dir, obj=obj)
+
+	# Called by DirEnt.blob().
+	def load_blob(self, blob_name: Union[str, uuid.UUID]) -> MetaBlob:
+		raise NotImplementedError
 
 	# Called by DirEnt.children().
 	def load_children(self, dent: DirEnt) -> None:
@@ -8226,25 +8239,22 @@ class CmdFTPDir(CmdExec):
 			line = [ ]
 			lines.append(line)
 
-			if dent.obj is not None:
-				t = dent.obj.gcs_blob.time_created \
-					if self.ctime \
-					else dent.obj.user_mtime
-				line.append(time.strftime(
-						"%Y-%m-%d %H:%M:%S",
-						time.localtime(t.timestamp())))
-			else:
-				line.append(None)
-
 			if dent.isdir():
 				ndirs += 1
+				line.append(None)
 				line.append("<DIR>")
 				line.append(None)
 			else:
 				nfiles += 1
-				size = SizeAccumulator(dent.obj)
+				size = SizeAccumulator(dent.blob)
 				total_size.add(size)
 
+				t = dent.blob.gcs_blob.time_created \
+					if self.ctime \
+					else dent.blob.user_mtime
+				line.append(time.strftime(
+						"%Y-%m-%d %H:%M:%S",
+						time.localtime(t.timestamp())))
 				line.append(size.blob_size(with_exact=True))
 				line.append(size.user_size(with_exact=True))
 
@@ -8357,10 +8367,8 @@ class CmdFTPDu(CmdExec):
 				total_files += n
 				total_size.add(size)
 			return total_files, total_size
-		elif dent.obj is not None:
-			return (1, SizeAccumulator(dent.obj))
 		else:
-			return (1, SizeAccumulator())
+			return (1, SizeAccumulator(dent.blob))
 
 	def execute(self: _CmdFTPDu) -> None:
 		if self.what:
@@ -8530,9 +8538,8 @@ class CmdFTPRm(CmdExec):
 						self.delete_folder(folder_id)
 						ndirs += 1
 					else:
-						assert dent.obj is not None
-						dent.obj.gcs_blob.delete()
-						size += dent.obj.gcs_blob.size
+						dent.blob.gcs_blob.delete()
+						size += dent.blob.gcs_blob.size
 						nfiles += 1
 				except:	# Remove the @deleted DirEnt:s
 					# from the tree.
@@ -8651,9 +8658,9 @@ class CmdFTPMove(CmdExec, FTPOverwriteOptions):
 		except:	# Roll back the @uncommitted changes.
 			for dent, old_user_path in uncommitted:
 				try:
-					blob = dent.obj
-					blob.user_path = old_user_path
-					blob.sync_metadata(update_mtime=False)
+					dent.blob.user_path = old_user_path
+					dent.blob.sync_metadata(
+							update_mtime=False)
 				except:	# Don't let this error interrupt the
 					# rollback of the rest of the @dent:s.
 					CmdTop.print_exception()
@@ -8716,11 +8723,11 @@ class CmdFTPMove(CmdExec, FTPOverwriteOptions):
 			if not dst.volatile:
 				# "Overwrite" @dst.  Make it certain
 				# that we don't delete the wrong blob.
-				assert dst.obj.blob_name != src.obj.blob_name
-				dst.obj.gcs_blob.delete()
+				assert dst.blob.blob_name != src.blob.blob_name
+				dst.blob.gcs_blob.delete()
 			return
 
-		blob = src.obj
+		blob = src.blob
 		old_gcs_blob = blob.gcs_blob
 		new_blob_name = str(self.prefix / blob.user_path)
 		generation = 0 if dst.volatile else None
@@ -8764,7 +8771,7 @@ class CmdFTPMove(CmdExec, FTPOverwriteOptions):
 		if not src.isdir():
 			print("Moving %s to %s..." % (src.path(), dst.path()))
 
-			blob = src.obj
+			blob = src.blob
 			old_user_path = blob.user_path
 			new_user_path = dst.path(full_path=True) \
 						.relative_to(RootDir)
@@ -8868,7 +8875,7 @@ class CmdFTPCat(CmdExec):
 		if self.head is None:
 			# Send all of @src to @output.
 			assert output is not None
-			download_blob(self, src.obj, pipeline_stdout=output)
+			download_blob(self, src.blob, pipeline_stdout=output)
 			return
 
 		# Add cat(maxbytes=self.head) to the download Pipeline.
@@ -8881,7 +8888,7 @@ class CmdFTPCat(CmdExec):
 		# Use the pipe created above to determine whether
 		# this is the case.
 		try:
-			download_blob(self, src.obj, command=cmd,
+			download_blob(self, src.blob, command=cmd,
 					pipeline_stdout=output)
 		except FatalError as ex:
 			isok = False
@@ -9129,7 +9136,7 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 				print(f"{msg}...", end="", flush=True)
 				started = time.monotonic()
 				nbytes += download_blob(self,
-						src_dent.obj,
+						src_dent.blob,
 						pipeline_stdout=dst)
 				duration += time.monotonic() - started
 				nfiles += 1
@@ -9148,7 +9155,7 @@ def cmd_ftp_get(self: _CmdFTPGet) -> None:
 				# Set @dst's mtime to the blob's.
 				os.utime(dst.fileno(), times=(
 					time.time(),
-					src_dent.obj.user_mtime.timestamp()))
+					src_dent.blob.user_mtime.timestamp()))
 
 			# Handle write errors before beginning the next cycle.
 			try:
@@ -9297,8 +9304,7 @@ def upload_file(self: _CmdFTPPut|_CmdFTPTouch,
 		full_dst /= dst_path.relative_to(RootDir)
 		blob = MetaBlob(self, full_dst.relative_to(RootDir))
 	else:
-		blob = dst_dent.obj
-		assert blob is not None
+		blob = dst_dent.blob
 
 	# Reopen @src_path every time we try, in order to read from the
 	# beginning (it might not be seekable).
@@ -9348,8 +9354,7 @@ def cmd_ftp_put(self: _CmdFTPPut) -> None:
 
 		if not remote.volatile:
 			# Replace the existing blob if we're overwriting.
-			assert remote.obj is not None
-			blob = remote.obj
+			blob = remote.blob
 		else:
 			blob = MetaBlob(self,
 				remote.path(full_path=True).relative_to(RootDir))
@@ -9530,7 +9535,7 @@ class CmdFTPTouch(FTPOverwriteOptions, CmdExec):
 						f"Creating {path}...")
 			else:	# This will update the mtime.
 				print(f"Touching {path}...")
-				dent.obj.sync_metadata()
+				dent.blob.sync_metadata()
 
 class _CmdFTPChDir(CmdFTP, CmdFTPChDir): pass
 class _CmdFTPPwd(CmdFTP, CmdFTPPwd): pass
