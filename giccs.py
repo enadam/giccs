@@ -3735,7 +3735,11 @@ class BackupBlob(MetaBlob): # {{{
 #   * If the @expected_gross is known beforehand, ensure that GCS returns
 #     exactly as much data to us, no more or less.
 #   * Add padding to the transferred data when uploading and verify it when
-#     downloading.
+#     downloading.  This makes it harder to infer anything from the uploaded
+#     blob's size.
+#   * When uploading ensure that write() times are ever increasing, never
+#     decreasing.  This way the server cannot tell when we're sending more
+#     or less compressible data for example.
 #   * Calculate the hash of the transferred data and verify it against the
 #     @expected_hash at the end.
 class Progressometer: # {{{
@@ -4713,8 +4717,10 @@ class VirtualGlobber(Globber): # {{{
 
 		def remove(self, child: Self) -> Self:
 			assert self.isdir()
+
 			del self.children[child.fname]
 			child.parent = None
+
 			return child
 
 		def infanticide(self) -> None:
@@ -4966,7 +4972,6 @@ class VirtualGlobber(Globber): # {{{
 			# @self.cwd is not under the new root.
 			self.cwd = dent
 		self.root = dent
-
 		dent.make_root()
 
 	def listdir(self, path: str) -> list[str]:
@@ -5482,7 +5487,7 @@ def upload_blob(args: UploadBlobOptions, blob: MetaBlob,
 	return src.transferred_gross
 
 # Read blob.external_header_st from the standard input and verify that it
-# belogs to @blob, then either exec(@then_exec) or forward the remaining
+# belongs to @blob, then either exec(@then_exec) or forward the remaining
 # stdin to stdout.
 def verify_external_encryption_header(blob: MetaBlob,
 		then_exec: Optional[Sequence[str]] = None) -> None:
@@ -8772,7 +8777,8 @@ class CmdFTPMove(CmdExec, FTPOverwriteOptions):
 	# skipped.
 	def map_moves(self, movemap: dict[VirtualGlobber.DirEnt,
 						VirtualGlobber.DirEnt],
-			src: DirEnt, dst: DirEnt, add_child: bool = True) \
+			src: VirtualGlobber.DirEnt, dst: VirtualGlobber.DirEnt,
+			add_child: bool = True) \
 			-> None:
 		if src in movemap:
 			# File has already been moved through a different
@@ -8859,7 +8865,8 @@ class CmdFTPMove(CmdExec, FTPOverwriteOptions):
 						VirtualGlobber.DirEnt],
 			uncommitted: list[tuple[VirtualGlobber.DirEnt,
 						pathlib.PurePath]],
-			src: DirEnt, move_blobs: bool = True) -> None:
+			src: VirtualGlobber.DirEnt, move_blobs: bool = True) \
+			-> None:
 		dst = movemap[src]
 		if dst is None:
 			# @dst exists and the user chose to skip it during
