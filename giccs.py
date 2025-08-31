@@ -1628,7 +1628,8 @@ class EncryptionOptions(CmdLineOptions): # {{{
 		super().post_validate(args)
 
 		self.merge_options_from_ini(args, "volume")
-		self.volume = args.volume
+		if args.volume is not None:
+			self.volume = args.volume
 
 		self.merge_options_from_ini(args,
 			("encryption_command", "decryption_command"),
@@ -1757,16 +1758,11 @@ class EncryptionOptions(CmdLineOptions): # {{{
 				"integrity-protection requires encryption")
 
 class EncryptedBucketOptions(EncryptionOptions, BucketOptions):
-	# Initialize @self.volume if it hasn't been set explicitly.
-	@property
-	def bucket(self) -> google.cloud.storage.Bucket:
-		bucket = super().bucket
-
-		if self.volume is None:
-			self.volume = str(pathlib.PurePath(bucket.name)
-						/ self.prefix)
-
-		return bucket
+	# This must be a property, so EncryptionOptions can override it
+	# if the volume is set explicitly.
+	@functools.cached_property
+	def volume(self) -> str:
+		return str(pathlib.PurePath(self.bucket.name) / self.prefix)
 
 	def create_folder(self, folder_id: str) -> None:
 		if not self.encrypt_metadata:
@@ -7787,29 +7783,69 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 					mode=0o666, dir_fd=self.orig_cwd)
 		return open(*args, **kw, opener=opener)
 
+	def dircache_cipher(self) -> MetaCipher:
+		# We need an UUID for the MetaCipher.  We could use just UUID0,
+		# but it's a good chance to safeguard against using the wrong
+		# dircache for a volume, so let's derive the UUID from that.
+		hasher = hashlib.blake2b(digest_size=len(UUID0.bytes))
+		hasher.update(self.volume.encode())
+		dircache_uuid = uuid.UUID(bytes=hasher.digest())
+
+		return MetaCipher(self, dircache_uuid)
+
 	def load_dircache(self) -> Optional[VirtualGlobber.DirCache]:
 		if self.dircache_path is None:
 			return None
 
 		try:
-			dircache = self.lopen(self.dircache_path, "rb")
+			dircache_file = self.lopen(self.dircache_path, "rb")
 		except FileNotFoundError:
 			return None
-		else:
-			return SafeUnpickler(dircache).load()
+
+		if self.encrypt:
+			dircache = self.dircache_cipher().decrypt(
+					MetaCipher.DataType.PAYLOAD,
+					dircache_file.read())
+			dircache_file = io.BytesIO(dircache)
+
+		import lzma
+		return SafeUnpickler(lzma.LZMAFile(dircache_file, 'r')).load()
+
+	def dump_dircache(self) -> None:
+		if self.dircache_path is None:
+			return
+
+		dircache_file = self.lopen(self.dircache_path, "wb")
+		try:
+			import lzma
+
+			dircache = self.remote.make_dircache()
+			if self.encrypt:
+				dircache = pickle.dumps(dircache)
+				dircache = lzma.compress(dircache)
+				dircache = self.dircache_cipher().encrypt(
+						MetaCipher.DataType.PAYLOAD,
+						dircache)
+				dircache_file.write(dircache)
+			else:	# This might be a bit more efficient because
+				# we don't have to keep the whole pickle and
+				# compressed stream in memory.
+				dircache_file = lzma.LZMAFile(
+							dircache_file, 'w')
+				pickle.dump(dircache, dircache_file)
+		except:	# Don't leave an unfinished @dircache_file behind.
+			try:
+				os.unlink(self.dircache_path,
+						dir_fd=self.orig_cwd)
+			except:
+				pass
+			raise
 
 	def done(self, cmd: CmdExec):
-		# Only proceed if we're finished with the entire FTP session.
-		if cmd is not self and isinstance(cmd.parent, CmdFTPShell):
-			super().done(cmd)
-			return
-
-		if self.dircache_path is None:
-			super().done(cmd)
-			return
-
-		pickle.dump(self.remote.make_dircache(),
-				self.lopen(self.dircache_path, "wb"))
+		# Only dump the cache if we're finished with the entire
+		# FTP session.
+		if cmd is self or not isinstance(cmd.parent, CmdFTPShell):
+			self.dump_dircache()
 		super().done(cmd)
 
 # Execute the appropriate subcommand in the FTP shell.
