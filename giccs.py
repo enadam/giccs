@@ -4823,8 +4823,7 @@ class VirtualGlobber(Globber): # {{{
 	# Uncommitted entries created by the currently executing command.
 	volatiles:	set[DirEnt]
 
-	def __init__(self, files: Iterable[DirEnt.Object] = (),
-			dircache: Optional[DirCache] = None):
+	def __init__(self, dircache: Optional[DirCache] = None):
 		self.volatiles = set()
 
 		if dircache is None:
@@ -4834,9 +4833,6 @@ class VirtualGlobber(Globber): # {{{
 								children={ })
 			self.load_dircache(self.rootest, dircache)
 		self.cwd = self.root = self.rootest
-
-		for file in files:
-			self.add_file(pathlib.PurePath(str(file)), file)
 
 	def add_file(self, path: pathlib.PurePath,
 			obj: Optional[DirEnt.Object] = None,
