@@ -4494,7 +4494,7 @@ class Globber(glob2.Globber): # {{{
 
 # A virtual file system.
 class VirtualGlobber(Globber): # {{{
-	DirCache = list[tuple[str, Union[bytes, "DirCache"]]]
+	DirCache = Union[None, list[tuple[str, Union[bytes, "DirCache"]]]]
 
 	@dataclasses.dataclass
 	class DirEnt:
@@ -4819,7 +4819,7 @@ class VirtualGlobber(Globber): # {{{
 	# Uncommitted entries created by the currently executing command.
 	volatiles:	set[DirEnt]
 
-	def __init__(self, dircache: Optional[DirCache] = None):
+	def __init__(self, dircache: DirCache = None):
 		self.volatiles = set()
 
 		if dircache is None:
@@ -4849,14 +4849,19 @@ class VirtualGlobber(Globber): # {{{
 				dent.add_child(fname, obj=obj)
 			elif isinstance(obj, bytes):
 				dent.add_child(fname, obj=uuid.UUID(bytes=obj))
-			else:
+			elif obj is not None:
 				self.load_dircache(
 					dent.add_child(fname, children=True),
 					obj)
+			else:	# Directory will load on-demand.
+				dent.add_child(fname, children=None)
 
 	def make_dircache(self, dent: Optional[DirEnt] = None) -> DirCache:
 		if dent is None:
 			dent = self.rootest
+
+		if not dent.children_loaded():
+			return None
 
 		dircache  = [ ]
 		for child in dent:
@@ -7793,7 +7798,7 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 
 		return MetaCipher(self, dircache_uuid)
 
-	def load_dircache(self) -> Optional[VirtualGlobber.DirCache]:
+	def load_dircache(self) -> VirtualGlobber.DirCache:
 		if self.dircache_path is None:
 			return None
 
