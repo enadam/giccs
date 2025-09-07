@@ -4561,6 +4561,10 @@ class VirtualGlobber(Globber): # {{{
 				# the next time.
 				delattr(self, "children")
 				raise
+			else:	# If load_children() didn't add anything,
+				# now at least we know that we don't have
+				# any children.
+				self.globber.mark_dirty()
 			return self.children
 
 		@property
@@ -4631,6 +4635,7 @@ class VirtualGlobber(Globber): # {{{
 		def make_dir(self) -> None:
 			assert not self.isdir()
 			self.children = { }
+			self.globber.mark_dirty()
 
 		# Turn this DirEnt into a top-level directory.
 		def make_root(self) -> None:
@@ -4709,6 +4714,7 @@ class VirtualGlobber(Globber): # {{{
 			self.children[child.fname] = child
 			child.parent = self
 
+			self.globber.mark_dirty()
 			return child
 
 		def remove(self, child: Self) -> Self:
@@ -4717,6 +4723,7 @@ class VirtualGlobber(Globber): # {{{
 			del self.children[child.fname]
 			child.parent = None
 
+			self.globber.mark_dirty()
 			return child
 
 		def infanticide(self) -> None:
@@ -4724,6 +4731,7 @@ class VirtualGlobber(Globber): # {{{
 			for child in self:
 				child.parent = None
 			self.children = { }
+			self.globber.mark_dirty()
 
 		# children=False: add a file
 		# children=True:  add a directory, children = { }
@@ -4758,6 +4766,7 @@ class VirtualGlobber(Globber): # {{{
 				# Load all our descendents at once.
 				self.children = { }
 				self.globber.load_subtree(self)
+				self.globber.mark_dirty()
 				return
 
 			# Make sure all our descendents are loaded as well.
@@ -4819,6 +4828,9 @@ class VirtualGlobber(Globber): # {{{
 	# Uncommitted entries created by the currently executing command.
 	volatiles:	set[DirEnt]
 
+	# Has the directory hierarchy changed?
+	dirty:		bool
+
 	def __init__(self, dircache: DirCache = None):
 		self.volatiles = set()
 
@@ -4829,6 +4841,9 @@ class VirtualGlobber(Globber): # {{{
 								children={ })
 			self.load_dircache(self.rootest, dircache)
 		self.cwd = self.root = self.rootest
+
+		# Reset this after @dircache has been loaded.
+		self.dirty = False
 
 	def add_file(self, path: pathlib.PurePath,
 			obj: Optional[DirEnt.Object] = None,
@@ -4877,6 +4892,9 @@ class VirtualGlobber(Globber): # {{{
 				obj = str(child.blob.user_path)
 			dircache.append((child.fname, obj))
 		return dircache
+
+	def mark_dirty(self, val: bool = True) -> None:
+		self.dirty = val
 
 	# Called by DirEnt.blob().
 	def load_blob(self, blob_name: Union[str, uuid.UUID]) -> MetaBlob:
@@ -7820,6 +7838,9 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 		if self.dircache_path is None:
 			return
 
+		if not self.remote.dirty:
+			return
+
 		dircache = self.remote.make_dircache()
 		if dircache is None:
 			try:
@@ -7827,6 +7848,7 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 						dir_fd=self.orig_cwd)
 			except FileNotFoundError:
 				pass
+			self.remote.mark_dirty(False)
 			return
 
 		dircache_file = self.lopen(self.dircache_path, "wb")
@@ -7853,6 +7875,8 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 			except:
 				pass
 			raise
+		else:
+			self.remote.mark_dirty(False)
 
 	def done(self, cmd: CmdExec):
 		# Only dump the cache if we're finished with the entire
