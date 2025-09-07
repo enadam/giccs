@@ -7727,12 +7727,13 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 		self.chdir = args.chdir
 		self.chroot = args.chroot
 
-		if args.dircache is not None:
-			self.dircache_path = pathlib.Path(args.dircache)
-		else:
+		# --dircache '' disables the cache temporarily.
+		if args.dircache is None:
 			self.dircache_path = self.ini.get_fname(
 							self.config_section,
 							"dircache")
+		elif args.dircache:
+			self.dircache_path = pathlib.Path(args.dircache)
 
 	@functools.cached_property
 	def subcommands(self) -> Sequence[CmdLineCommand]:
