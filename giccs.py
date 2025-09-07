@@ -7820,11 +7820,19 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 		if self.dircache_path is None:
 			return
 
+		dircache = self.remote.make_dircache()
+		if dircache is None:
+			try:
+				os.unlink(self.dircache_path,
+						dir_fd=self.orig_cwd)
+			except FileNotFoundError:
+				pass
+			return
+
 		dircache_file = self.lopen(self.dircache_path, "wb")
 		try:
 			import lzma
 
-			dircache = self.remote.make_dircache()
 			if self.encrypt:
 				dircache = pickle.dumps(dircache)
 				dircache = lzma.compress(dircache)
