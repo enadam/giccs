@@ -7835,24 +7835,38 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 		import lzma
 		return SafeUnpickler(lzma.LZMAFile(dircache_file, 'r')).load()
 
-	def dump_dircache(self) -> None:
-		if self.dircache_path is None:
-			return
-
-		if not self.remote.dirty:
-			return
+	def dump_dircache(self, fname: Optional[str] = None,
+				force: bool = False) -> None:
+		# Always @force if @fname is not None because we have no idea
+		# what's in the file.
+		if fname is None:
+			if self.dircache_path is None:
+				return
+			if not self.remote.dirty and not force:
+				return
 
 		dircache = self.remote.make_dircache()
 		if dircache is None:
 			try:
-				os.unlink(self.dircache_path,
-						dir_fd=self.orig_cwd)
+				if fname is not None:
+					os.unlink(fname)
+				else:
+					os.unlink(self.dircache_path,
+							dir_fd=self.orig_cwd)
 			except FileNotFoundError:
 				pass
-			self.remote.mark_dirty(False)
+			if fname is None or self.dircache_path is None:
+				# We can't unmark the dirtiness if we've dumped
+				# to an alternative file, because we'll need to
+				# update @self.dircache_path eventually.
+				self.remote.mark_dirty(False)
 			return
 
-		dircache_file = self.lopen(self.dircache_path, "wb")
+		if fname is not None:
+			dircache_file = open(fname, "wb")
+		else:
+			dircache_file = self.lopen(self.dircache_path, "wb")
+
 		try:
 			import lzma
 
@@ -7871,19 +7885,27 @@ class CmdFTP(CmdExec, ExitFTPOnFailureOption,
 				pickle.dump(dircache, dircache_file)
 		except:	# Don't leave an unfinished @dircache_file behind.
 			try:
-				os.unlink(self.dircache_path,
-						dir_fd=self.orig_cwd)
+				if fname is not None:
+					os.unlink(fname)
+				else:
+					os.unlink(self.dircache_path,
+							dir_fd=self.orig_cwd)
 			except:
 				pass
 			raise
 		else:
-			self.remote.mark_dirty(False)
+			if fname is None or self.dircache_path is None:
+				# See above.
+				self.remote.mark_dirty(False)
 
 	def done(self, cmd: CmdExec):
 		# Only dump the cache if we're finished with the entire
 		# FTP session.
 		if cmd is self or not isinstance(cmd.parent, CmdFTPShell):
-			self.dump_dircache()
+			try:
+				self.dump_dircache()
+			except Exception:
+				CmdTop.print_exception()
 		super().done(cmd)
 
 # Execute the appropriate subcommand in the FTP shell.
@@ -7928,6 +7950,7 @@ class CmdFTPShell(CmdTop):
 	def subcommands(self) -> Sequence[CmdLineCommand]:
 		subcommands = (CmdFTPHelp(self), CmdFTPExit(self),
 				CmdFTPEcho(self), CmdFTPSetEnv(self),
+				CmdFTPDirCache(self),
 				CmdFTPLChDir(self), CmdFTPLPwd(self),
 				CmdFTPChDir(self), CmdFTPPwd(self),
 				CmdFTPPushD(self), CmdFTPPopD(self),
@@ -8149,6 +8172,38 @@ class CmdFTPSetEnv(CmdExec):
 
 	def execute(self):
 		os.environ[self.name] = self.value
+
+class CmdFTPDirCacheDump(CmdExec):
+	cmd = "dump"
+	help = "TODO"
+
+	force: bool
+	fname: Optional[str]
+
+	def declare_arguments(self) -> None:
+		super().declare_arguments()
+		self.sections["operation"].add_enable_flag("--force", "-f")
+		self.sections["positional"].add_argument("fname", nargs='?')
+
+	def pre_validate(self, args: argparse.Namespace) -> None:
+		super().pre_validate(args)
+		self.force = args.force
+		self.fname = args.fname
+
+	def execute(self):
+		try:
+			self.parent.dump_dircache(self.fname, self.force)
+		except OSError as ex:
+			raise UserError from ex
+
+class CmdFTPDirCache(CmdLineCommand):
+	cmd = "dircache"
+	help = "TODO"
+
+	@functools.cached_property
+	def subcommands(self) -> Sequence[CmdLineCommand]:
+		return (CmdFTPDirCacheDump(self),)
+
 
 class CmdFTPLChDir(CmdExec):
 	cmd = "lcd"
