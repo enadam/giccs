@@ -4556,7 +4556,8 @@ class VirtualGlobber(Globber): # {{{
 			# Set the property to avoid infinite recursion.
 			self.children = { }
 			try:
-				self.globber.load_children(self)
+				self.globber.load_subtree(
+					self, recursive=False)
 			except:	# Retry when the property is read
 				# the next time.
 				delattr(self, "children")
@@ -4645,8 +4646,8 @@ class VirtualGlobber(Globber): # {{{
 				self.parent = self.parent.path(full_path=True)
 			self.volatile = False
 
-		# Whether @self.globber.load_children() or load_subtree()
-		# has been called for this DirEnt.
+		# Whether @self.globber.load_subtree() has been called
+		# for this DirEnt.
 		def children_loaded(self):
 			return "children" in self.__dict__
 
@@ -4900,13 +4901,9 @@ class VirtualGlobber(Globber): # {{{
 	def load_blob(self, blob_name: Union[str, uuid.UUID]) -> MetaBlob:
 		raise NotImplementedError
 
-	# Called by DirEnt.children().
-	def load_children(self, dent: DirEnt) -> None:
-		pass
-
 	# Called by DirEnt.scan().
-	def load_subtree(self, dent: DirEnt) -> None:
-		self.load_children(dent)
+	def load_subtree(self, dent: DirEnt, recursive: bool = True) -> None:
+		pass
 
 	def lookup(self, path: Union[str, pathlib.PurePath],
 			create: Union[bool, Callable[[DirEnt], None]] = False
@@ -5035,13 +5032,7 @@ class GCSGlobber(VirtualGlobber):
 		assert blob is not None
 		return blob
 
-	def load_children(self, dent: VirtualGlobber.DirEnt) -> None:
-		if self.args.encrypt_metadata:
-			# Reconstruct the whole hierarchy from the files
-			# directly under @dent.
-			self.load_subtree(dent)
-			return
-
+	def do_load_children(self, dent: VirtualGlobber.DirEnt) -> None:
 		lst = self.args.bucket.list_blobs(
 				prefix=self.gcs_prefix(dent),
 				delimiter='/',
@@ -5062,13 +5053,7 @@ class GCSGlobber(VirtualGlobber):
 			dent.add_child(pathlib.PurePath(prefix).name,
 					children=None)
 
-	def load_subtree(self, dent: VirtualGlobber.DirEnt) -> None:
-		if self.args.encrypt_metadata:
-			# We're expected to be called only once,
-			# to load all the blobs directly under the
-			# GCS prefix.
-			assert dent == self.rootest
-
+	def do_load_subtree(self, dent: VirtualGlobber.DirEnt) -> None:
 		# Trim @root_path from @blob.user_path in case we've
 		# changed root directory.
 		root_path = self.root.path(full_path=True).relative_to(RootDir)
@@ -5104,6 +5089,19 @@ class GCSGlobber(VirtualGlobber):
 				# @path must have been added implicitly
 				# for a blob.
 				assert self.lookup(ex.args[0]).isdir()
+
+	def load_subtree(self, dent: VirtualGlobber.DirEnt,
+				recursive: bool = True) -> None:
+		if self.args.encrypt_metadata:
+			# We're expected to be called only once, to load
+			# all the blobs directly under the GCS prefix.
+			assert dent == self.rootest
+			recursive = True
+
+		if recursive:
+			self.do_load_subtree(dent)
+		else:
+			self.do_load_children(dent)
 # }}}
 
 # Utilities {{{
